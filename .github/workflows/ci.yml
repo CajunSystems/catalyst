@@ -1,0 +1,74 @@
+name: CI
+
+on:
+  push:
+    branches: ["**"]
+  pull_request:
+    branches: [main]
+  workflow_dispatch:
+
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+
+jobs:
+  build:
+    name: Build & test (JDK 21)
+    runs-on: ubuntu-latest
+    env:
+      GUMBO_VERSION: "0.2.0"
+    steps:
+      - name: Checkout Catalyst
+        uses: actions/checkout@v4
+
+      - name: Set up JDK 21
+        uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: "21"
+          cache: maven
+
+      # Catalyst depends on com.cajunsystems:gumbo. The intended source is JitPack, but to keep CI
+      # deterministic (and independent of JitPack availability / egress policy) we build the pinned
+      # Gumbo release tag and install it into the local Maven repo before building Catalyst.
+      - name: Install Gumbo ${{ env.GUMBO_VERSION }} into local Maven repo
+        run: |
+          set -euo pipefail
+          if [ -d "$HOME/.m2/repository/com/cajunsystems/gumbo/${GUMBO_VERSION}" ]; then
+            echo "Gumbo ${GUMBO_VERSION} already cached in ~/.m2 — skipping build."
+          else
+            git clone --depth 1 --branch "${GUMBO_VERSION}" https://github.com/CajunSystems/gumbo.git /tmp/gumbo
+            mvn -B --no-transfer-progress -f /tmp/gumbo/pom.xml install -DskipTests
+          fi
+
+      - name: Build and test
+        run: mvn -B --no-transfer-progress install
+
+      # The literal M0 exit criterion (spec §11): kill -9 mid-task across two separate JVMs, resume,
+      # finish with zero duplicate model calls. CI is the source of truth that each phase still holds.
+      - name: M0 exit demo (kill -9 → resume across two processes)
+        run: |
+          set -uo pipefail
+          mvn -B --no-transfer-progress -q -pl catalyst-api \
+            org.apache.maven.plugins:maven-dependency-plugin:3.6.1:build-classpath \
+            -Dmdep.outputFile=target/cp.txt
+          CP="catalyst-api/target/classes:$(cat catalyst-api/target/cp.txt)"
+          DIR="$(mktemp -d)"
+
+          echo "--- process 1: record then kill -9 (exit 137) ---"
+          rc=0
+          java -cp "$CP" com.cajunsystems.catalyst.api.Demo "$DIR" record || rc=$?
+          echo "record exit code: $rc"
+          if [ "$rc" -ne 137 ]; then echo "FAIL: record did not simulate kill -9 (exit $rc)"; exit 1; fi
+
+          echo "--- process 2: resume ---"
+          OUT="$(java -cp "$CP" com.cajunsystems.catalyst.api.Demo "$DIR" resume)"
+          echo "$OUT"
+          echo "$OUT" | grep -q "result: SUMMARY|FINAL" \
+            || { echo "FAIL: unexpected result (resume did not complete correctly)"; exit 1; }
+          echo "$OUT" | grep -q "model calls THIS run: 1" \
+            || { echo "FAIL: resume made a duplicate model call"; exit 1; }
+          echo "M0 exit criterion holds: resumed with zero duplicate model calls."

@@ -1,5 +1,7 @@
 # Catalyst
 
+[![CI](https://github.com/CajunSystems/catalyst/actions/workflows/ci.yml/badge.svg)](https://github.com/CajunSystems/catalyst/actions/workflows/ci.yml)
+
 **The Durable AI Execution Runtime for the JVM.**
 
 Catalyst lets you build AI-powered systems that are reliable, resumable, replayable, and
