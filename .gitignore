@@ -1,3 +1,15 @@
+# Maven build output
+target/
+
+# Local Catalyst logs / demo data
+catalyst-log/
+/tmp/catalyst-demo/
+
+# IDE
+.idea/
+*.iml
+.vscode/
+
 # Compiled class file
 *.class
 
