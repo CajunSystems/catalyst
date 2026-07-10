@@ -25,6 +25,7 @@ import java.time.Instant;
 import java.util.List;
 import java.util.Optional;
 import java.util.concurrent.CompletableFuture;
+import java.util.concurrent.ConcurrentHashMap;
 import java.util.concurrent.ExecutorService;
 import java.util.concurrent.Executors;
 
@@ -45,6 +46,13 @@ public final class CatalystRuntime implements AutoCloseable {
     private final PayloadCodec payloads;
     private final String nodeId;
     private final ExecutorService executor;
+
+    /**
+     * Attempts currently running in this process, keyed by execution. Guards against scheduling a
+     * second concurrent attempt for the same execution (which would interleave events and corrupt the
+     * stream): a re-submission of a still-running execution attaches to the in-flight attempt instead.
+     */
+    private final ConcurrentHashMap<ExecutionId, CompletableFuture<?>> inFlight = new ConcurrentHashMap<>();
 
     private enum Mode { FRESH, RESUME, REPLAY_TERMINAL }
 
@@ -78,6 +86,12 @@ public final class CatalystRuntime implements AutoCloseable {
             Optional<ExecutionId> existing = log.findByKey(key.get());
             if (existing.isPresent()) {
                 id = existing.get();
+                // If an attempt for this execution is already running in this process, attach to it
+                // rather than scheduling a duplicate attempt that would corrupt the event stream.
+                CompletableFuture<?> running = inFlight.get(id);
+                if (running != null) {
+                    return new FutureExecutionHandle<>(id, cast(running));
+                }
                 ExecutionState state = Reducer.fold(id, log.read(id));
                 mode = state.isTerminal() ? Mode.REPLAY_TERMINAL : Mode.RESUME;
             } else {
@@ -95,8 +109,15 @@ public final class CatalystRuntime implements AutoCloseable {
         final ExecutionId execId = id;
         final Mode runMode = mode;
         CompletableFuture<R> future = new CompletableFuture<>();
+        inFlight.put(execId, future);
+        future.whenComplete((r, t) -> inFlight.remove(execId, future));
         executor.execute(() -> runAttempt(task, execId, taskType, opts, runMode, future));
         return new FutureExecutionHandle<>(execId, future);
+    }
+
+    @SuppressWarnings("unchecked")
+    private static <R> CompletableFuture<R> cast(CompletableFuture<?> future) {
+        return (CompletableFuture<R>) future;
     }
 
     public <R> ExecutionHandle<R> execute(Task<R> task) {

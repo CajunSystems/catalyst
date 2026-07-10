@@ -41,6 +41,8 @@ public final class GumboEventLog implements EventLog {
     private final SharedLogService service;
     private final EventLogSerializer serializer;
     private final Map<ExecutionId, TypedLogView<CatalystEvent>> views = new ConcurrentHashMap<>();
+    /** Cache of the last seq (Gumbo localId) per execution, so latestSeq is O(1) after an append. */
+    private final Map<ExecutionId, Long> lastSeq = new ConcurrentHashMap<>();
     private final LogView indexView;
 
     private GumboEventLog(SharedLogService service) {
@@ -77,7 +79,9 @@ public final class GumboEventLog implements EventLog {
 
     @Override
     public long append(ExecutionId executionId, CatalystEvent event) {
-        return viewFor(executionId).append(event).join().localId();
+        long seq = viewFor(executionId).append(event).join().localId();
+        lastSeq.merge(executionId, seq, Math::max);
+        return seq;
     }
 
     @Override
@@ -92,9 +96,14 @@ public final class GumboEventLog implements EventLog {
 
     @Override
     public long latestSeq(ExecutionId executionId) {
+        Long cached = lastSeq.get(executionId);
+        if (cached != null) return cached;
+        // Cold path (e.g. right after reopen, before any append): scan once and cache.
         List<LogEntry> entries = viewFor(executionId).rawView().readAll().join();
         if (entries.isEmpty()) return -1;
-        return entries.get(entries.size() - 1).localId();
+        long seq = entries.get(entries.size() - 1).localId();
+        lastSeq.merge(executionId, seq, Math::max);
+        return seq;
     }
 
     @Override

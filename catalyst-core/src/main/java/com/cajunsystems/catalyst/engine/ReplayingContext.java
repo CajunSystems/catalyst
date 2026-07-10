@@ -206,6 +206,7 @@ public final class ReplayingContext implements Context {
     public <T> T effect(String label, Supplier<T> supplier) {
         Optional<EffectRecorded> recorded = pollExpected(EffectRecorded.class, "effect " + label);
         if (recorded.isPresent()) {
+            requireIdentity("effect", recorded.get().label(), label);
             return (T) payloads.fromTree(recorded.get().value());
         }
         requireAppendable("effect " + label);
@@ -226,6 +227,7 @@ public final class ReplayingContext implements Context {
         public void put(String key, Object value) {
             Optional<MemoryWritten> recorded = pollExpected(MemoryWritten.class, "memory put " + key);
             if (recorded.isPresent()) {
+                requireIdentity("memory put", recorded.get().key(), key);
                 memoryState.put(recorded.get().key(), recorded.get().value());
                 return;
             }
@@ -241,6 +243,7 @@ public final class ReplayingContext implements Context {
             Optional<MemoryRead> recorded = pollExpected(MemoryRead.class, "memory get " + key);
             JsonNode value;
             if (recorded.isPresent()) {
+                requireIdentity("memory get", recorded.get().key(), key);
                 value = recorded.get().value();
             } else {
                 requireAppendable("memory get " + key);
@@ -287,6 +290,19 @@ public final class ReplayingContext implements Context {
         throw new ReplayDivergenceException("Replay divergence at " + what
                 + ": next recorded boundary is " + head.getClass().getSimpleName()
                 + " but task produced a " + type.getSimpleName());
+    }
+
+    /**
+     * Validates that a substituted boundary's identity (effect label, memory key) matches what the
+     * task asked for, so reordering two same-type boundaries surfaces as a divergence rather than a
+     * silently wrong substitution. Tool calls are not identity-checked here because
+     * {@code ToolCompleted} does not carry the tool name; M1's canonical request hashing covers that.
+     */
+    private static void requireIdentity(String what, String recorded, String actual) {
+        if (!recorded.equals(actual)) {
+            throw new ReplayDivergenceException("Replay divergence at " + what
+                    + ": recorded identity '" + recorded + "' but task asked for '" + actual + "'");
+        }
     }
 
     private void requireAppendable(String what) {
