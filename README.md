@@ -43,10 +43,13 @@ log) provides durability.
 - **Typed timeline + token/cost accounting (M1)** — `runtime.inspect(id).timelineView()` folds the
   log into model/tool call counts, token usage, latency, and cost. Cost is priced by a pluggable
   `CostModel` (e.g. `CostModel.perMillionTokens(in, out)`).
+- **Real providers via LangChain4j (M1)** — `LangChain4jModel.of(chatModel)` wraps any LangChain4j
+  `ChatModel`, which buys OpenAI, Anthropic, Gemini, Ollama and local models. Catalyst keeps no
+  provider HTTP client of its own; the completion flows through `ctx.model()` and is recorded and
+  replayed like any other.
 
 Deferred to later milestones (schema slots already reserved so no breaking change is needed):
-the LangChain4j model adapter and real providers (M1 follow-up), `BRANCH` mode + branch/diff (M2),
-`WAITING`/signal APIs, snapshots and blob store (v0.2).
+`BRANCH` mode + branch/diff (M2), `WAITING`/signal APIs, snapshots and blob store (v0.2).
 
 ## Module layout
 
@@ -57,6 +60,7 @@ the LangChain4j model adapter and real providers (M1 follow-up), `BRANCH` mode +
 | `catalyst-runtime` | `CatalystRuntime`, virtual-thread scheduler, lifecycle, idempotency, in-memory `EventLog` |
 | `catalyst-gumbo` | `GumboEventLog`: durable `EventLog` over the Gumbo shared log |
 | `catalyst-tools` | `ClockTool`, `CalculatorTool` |
+| `catalyst-langchain4j` | `LangChain4jModel`: adapts any LangChain4j `ChatModel` to Catalyst's `Model` |
 | `catalyst-api` | Thin facade: `Catalyst.embedded(path)`, builders, `Serializers` |
 
 Coordinates: `com.cajunsystems:catalyst-*`. Root package `com.cajunsystems.catalyst`. Java 21.
@@ -144,10 +148,22 @@ String result = runtime.execute(task, ExecutionOptions.withKey("doc:42")).result
 
 Re-submitting the same key resumes/attaches to the existing execution instead of starting a new one.
 
+Plug in a real provider by wrapping any LangChain4j `ChatModel` (add `catalyst-langchain4j` and a
+LangChain4j provider such as `langchain4j-open-ai`):
+
+```java
+ChatModel chat = OpenAiChatModel.builder().apiKey(key).modelName("gpt-4o").build();
+CatalystRuntime runtime = Catalyst.builder()
+        .log(GumboEventLog.at(Path.of("./catalyst-log")))
+        .model(LangChain4jModel.of(chat))
+        .costModel(CostModel.perMillionTokens(2.50, 10.00))
+        .build();
+```
+
 ## Specification
 
 The full v0.1 design lives in the project spec (Catalyst v0.1 Specification). This repository
-currently implements the **M0** milestone of that spec.
+implements the **M0** and **M1** milestones of that spec.
 
 ## License
 

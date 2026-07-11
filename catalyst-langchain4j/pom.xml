@@ -1,0 +1,32 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<project xmlns="http://maven.apache.org/POM/4.0.0"
+         xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance"
+         xsi:schemaLocation="http://maven.apache.org/POM/4.0.0 http://maven.apache.org/xsd/maven-4.0.0.xsd">
+    <modelVersion>4.0.0</modelVersion>
+
+    <parent>
+        <groupId>com.cajunsystems</groupId>
+        <artifactId>catalyst-parent</artifactId>
+        <version>0.1.0-SNAPSHOT</version>
+    </parent>
+
+    <artifactId>catalyst-langchain4j</artifactId>
+    <name>Catalyst LangChain4j</name>
+    <description>Adapter: wrap any LangChain4j ChatModel as a Catalyst Model (spec §2).</description>
+
+    <dependencies>
+        <dependency>
+            <groupId>com.cajunsystems</groupId>
+            <artifactId>catalyst-core</artifactId>
+        </dependency>
+        <!--
+          Only langchain4j-core (the model API) is needed. A concrete provider
+          (langchain4j-open-ai, -anthropic, -ollama, …) is supplied by the application; Catalyst
+          never maintains provider HTTP clients.
+        -->
+        <dependency>
+            <groupId>dev.langchain4j</groupId>
+            <artifactId>langchain4j-core</artifactId>
+        </dependency>
+    </dependencies>
+</project>

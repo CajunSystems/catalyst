@@ -28,6 +28,9 @@ intended source, but if `jitpack.io` is blocked, install Gumbo locally first:
 - `catalyst-gumbo` — `GumboEventLog`: one Gumbo `LogTag` per execution; Gumbo `localId` == Catalyst
   `seq`; durable KV for the idempotency index.
 - `catalyst-tools`, `catalyst-api` — built-in tools and the `Catalyst` facade.
+- `catalyst-langchain4j` — `LangChain4jModel`: wraps any LangChain4j `ChatModel` (real providers).
+  Depends only on `langchain4j-core`; the app supplies the provider. Tested offline with a fake
+  `ChatModel` (override `doChat`).
 
 ## Key invariants
 

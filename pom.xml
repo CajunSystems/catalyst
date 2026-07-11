@@ -18,6 +18,7 @@
         <module>catalyst-runtime</module>
         <module>catalyst-gumbo</module>
         <module>catalyst-tools</module>
+        <module>catalyst-langchain4j</module>
         <module>catalyst-api</module>
     </modules>
 
@@ -29,6 +30,7 @@
         <jackson.version>2.17.2</jackson.version>
         <slf4j.version>2.0.12</slf4j.version>
         <gumbo.version>0.2.0</gumbo.version>
+        <langchain4j.version>1.8.0</langchain4j.version>
 
         <junit.version>5.10.2</junit.version>
         <assertj.version>3.25.3</assertj.version>
@@ -89,6 +91,11 @@
                 <groupId>org.slf4j</groupId>
                 <artifactId>slf4j-simple</artifactId>
                 <version>${slf4j.version}</version>
+            </dependency>
+            <dependency>
+                <groupId>dev.langchain4j</groupId>
+                <artifactId>langchain4j-core</artifactId>
+                <version>${langchain4j.version}</version>
             </dependency>
             <dependency>
                 <groupId>com.cajunsystems</groupId>
