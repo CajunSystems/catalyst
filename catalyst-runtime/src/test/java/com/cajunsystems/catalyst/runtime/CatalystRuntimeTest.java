@@ -2,6 +2,7 @@ package com.cajunsystems.catalyst.runtime;
 
 import com.cajunsystems.catalyst.ExecutionId;
 import com.cajunsystems.catalyst.ExecutionOptions;
+import com.cajunsystems.catalyst.Status;
 import com.cajunsystems.catalyst.Task;
 import com.cajunsystems.catalyst.Tool;
 import com.cajunsystems.catalyst.engine.InDoubtException;
@@ -147,6 +148,42 @@ class CatalystRuntimeTest {
         try (CatalystRuntime runtime = CatalystRuntime.builder().log(log).build()) {
             ExecutionHandle<String> handle = runtime.execute(divergent, ExecutionOptions.withKey("k"));
             assertThatThrownBy(handle::result).isInstanceOf(NonDeterministicReplayException.class);
+        }
+    }
+
+    @Test
+    void pauseAndCancelAreNoOpsOnTerminalExecution() {
+        MockModel model = MockModel.alwaysReturn("pong");
+        try (CatalystRuntime runtime = CatalystRuntime.builder()
+                .log(EventLogs.inMemory()).model(model).build()) {
+
+            ExecutionHandle<String> handle = runtime.execute(ONE_SHOT, ExecutionOptions.withKey("k"));
+            assertThat(handle.result()).isEqualTo("pong");
+            int eventsWhenDone = runtime.log().read(handle.id()).size();
+
+            runtime.pause(handle.id());   // must not reopen the completed execution
+            runtime.cancel(handle.id());
+
+            assertThat(runtime.inspect(handle.id()).status()).isEqualTo(Status.COMPLETED);
+            assertThat(runtime.log().read(handle.id())).hasSize(eventsWhenDone);
+
+            // Re-submitting the key still substitutes cleanly — no duplicate model call.
+            assertThat(runtime.execute(ONE_SHOT, ExecutionOptions.withKey("k")).result()).isEqualTo("pong");
+            assertThat(model.callCount()).isEqualTo(1);
+        }
+    }
+
+    @Test
+    void memoryGetRejectsWrongType() {
+        Task<String> storeThenMisread = ctx -> {
+            ctx.memory().put("n", 42); // an Integer
+            return ctx.memory().get("n", String.class).orElse("none"); // asks for a String
+        };
+        try (CatalystRuntime runtime = CatalystRuntime.builder().log(EventLogs.inMemory()).build()) {
+            ExecutionHandle<String> handle = runtime.execute(storeThenMisread, ExecutionOptions.withKey("k"));
+            assertThatThrownBy(handle::result)
+                    .isInstanceOf(ClassCastException.class)
+                    .hasMessageContaining("holds a");
         }
     }
 

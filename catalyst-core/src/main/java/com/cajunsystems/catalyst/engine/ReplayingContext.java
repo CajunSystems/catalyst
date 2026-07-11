@@ -301,7 +301,6 @@ public final class ReplayingContext implements Context {
         }
 
         @Override
-        @SuppressWarnings("unchecked")
         public <T> Optional<T> get(String key, Class<T> type) {
             Optional<Boundary> recorded = pollExpected(MemoryRead.class, "memory get " + key);
             JsonNode value;
@@ -315,7 +314,14 @@ public final class ReplayingContext implements Context {
                 append(new MemoryRead(now(), key, value));
             }
             if (value == null || value.isNull()) return Optional.empty();
-            return Optional.of((T) payloads.fromTree(value));
+            Object reconstructed = payloads.fromTree(value);
+            // Honour the caller's requested type: fail here with a clear message rather than deferring
+            // a confusing ClassCastException to the call site downstream.
+            if (!type.isInstance(reconstructed)) {
+                throw new ClassCastException("Memory key '" + key + "' holds a "
+                        + reconstructed.getClass().getName() + " but was requested as " + type.getName());
+            }
+            return Optional.of(type.cast(reconstructed));
         }
 
         @Override

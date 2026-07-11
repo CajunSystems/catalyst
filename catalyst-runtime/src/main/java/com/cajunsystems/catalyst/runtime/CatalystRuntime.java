@@ -161,12 +161,23 @@ public final class CatalystRuntime implements AutoCloseable {
      * @throws NonDeterministicReplayException if the task diverges from the recorded run
      */
     public <R> ExecutionState replay(ExecutionId id, Task<R> task) {
+        return replay(id, task, ExecutionOptions.none());
+    }
+
+    /**
+     * As {@link #replay(ExecutionId, Task)}, but with the task input variables the original execution
+     * ran with. Vars are not stored in the log (only their {@code argsHash} is), so a task that
+     * branches on {@code ctx.var(...)} must be replayed with the same {@code opts} it was executed
+     * with; otherwise it takes a different path and (correctly) trips
+     * {@link NonDeterministicReplayException}.
+     */
+    public <R> ExecutionState replay(ExecutionId id, Task<R> task, ExecutionOptions opts) {
         List<SequencedEvent> recorded = log.read(id);
         ExecutionState state = Reducer.fold(id, recorded);
         ExecutionInfo info = new ExecutionInfo(id, state.attempt(),
-                state.taskType() != null ? state.taskType() : task.getClass().getName(), Map.of());
+                state.taskType() != null ? state.taskType() : task.getClass().getName(), opts.metadata());
         Logger logger = LoggerFactory.getLogger("catalyst.replay." + id.value());
-        ReplayingContext ctx = new ReplayingContext(id, log, defaultModel, info, Map.of(),
+        ReplayingContext ctx = new ReplayingContext(id, log, defaultModel, info, opts.vars(),
                 eventMapper, payloads, inDoubtPolicy, costModel, clock, logger, recorded, /* appendEnabled */ false);
         try {
             task.execute(ctx);
@@ -190,15 +201,19 @@ public final class CatalystRuntime implements AutoCloseable {
                         + "execute(task, ExecutionOptions.withKey(key)). Standalone resume(id) needs a task registry.");
     }
 
+    /** Pauses an execution. A no-op on an already-terminal execution (never reopens a closed log). */
     public void pause(ExecutionId id) {
+        if (inspect(id).isTerminal()) return;
         log.append(id, new CatalystEvent.ExecutionPaused(now(), "paused by request"));
     }
 
     /**
-     * Requests cancellation. Note: the v0 event schema (spec §5) has no dedicated cancellation event,
-     * so M0 records this as a failure marked "cancelled" (open question §13). Folds to FAILED.
+     * Requests cancellation. A no-op on an already-terminal execution. Note: the v0 event schema
+     * (spec §5) has no dedicated cancellation event, so M0 records this as a failure marked
+     * "cancelled" (open question §13). Folds to FAILED.
      */
     public void cancel(ExecutionId id) {
+        if (inspect(id).isTerminal()) return;
         log.append(id, new CatalystEvent.ExecutionFailed(now(), "cancelled by request", log.latestSeq(id)));
     }
 

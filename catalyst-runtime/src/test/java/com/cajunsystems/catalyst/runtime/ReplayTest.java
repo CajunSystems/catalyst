@@ -58,6 +58,35 @@ class ReplayTest {
     }
 
     @Test
+    void replayHonoursTaskInputVariables() {
+        // A task whose prompt depends on ctx.var("prompt"); the value is not stored in the log.
+        Task<String> varTask = ctx -> {
+            String p = ctx.var("prompt");
+            String prompt = p != null ? p : "MISSING";
+            return ctx.model().complete(
+                    CompletionRequest.of(Prompt.builder().user(prompt).build())).message();
+        };
+        MockModel model = MockModel.alwaysReturn("pong");
+        try (CatalystRuntime runtime = CatalystRuntime.builder()
+                .log(EventLogs.inMemory()).model(model).build()) {
+
+            ExecutionOptions opts = ExecutionOptions.withKey("k").var("prompt", "hello");
+            ExecutionHandle<String> handle = runtime.execute(varTask, opts);
+            handle.result();
+            int callsAfterRecord = model.callCount();
+
+            // Replaying WITH the original vars reproduces the recorded path — zero external calls.
+            ExecutionState ok = runtime.replay(handle.id(), varTask, opts);
+            assertThat(ok.status()).isEqualTo(Status.COMPLETED);
+            assertThat(model.callCount()).isEqualTo(callsAfterRecord);
+
+            // Replaying WITHOUT vars takes the "MISSING" branch → a real divergence, not a false one.
+            assertThatThrownBy(() -> runtime.replay(handle.id(), varTask))
+                    .isInstanceOf(NonDeterministicReplayException.class);
+        }
+    }
+
+    @Test
     void costModelFoldsIntoExecution() {
         MockModel model = MockModel.scripted("answer"); // reports token usage
         try (CatalystRuntime runtime = CatalystRuntime.builder()
