@@ -282,19 +282,32 @@ public final class CatalystRuntime implements AutoCloseable {
         return Trajectory.of(childId, childState.status(), forkSteps, combined);
     }
 
-    /** Pauses an execution. A no-op on an already-terminal execution (never reopens a closed log). */
-    public void pause(ExecutionId id) {
-        if (inspect(id).isTerminal()) return;
+    /**
+     * Pauses an execution. A no-op on an already-terminal execution (never reopens a closed log).
+     * {@code synchronized} + the in-flight guard avoid a race: an execution running in this process
+     * appends its own events on a worker thread, so injecting a pause event concurrently could land
+     * after {@code ExecutionCompleted}. Refuse while it is in flight here. (v0.1 has no live
+     * pause/cancel of a running task — that lands with the reserved WAITING/signal APIs in v1.)
+     */
+    public synchronized void pause(ExecutionId id) {
+        if (inspect(id).isTerminal()) return;      // terminal (incl. just-completed) → no-op
+        if (inFlight.containsKey(id)) {
+            throw new IllegalStateException("Cannot pause an execution running in this process: " + id);
+        }
         log.append(id, new CatalystEvent.ExecutionPaused(now(), "paused by request"));
     }
 
     /**
-     * Requests cancellation. A no-op on an already-terminal execution. Note: the v0 event schema
-     * (spec §5) has no dedicated cancellation event, so M0 records this as a failure marked
-     * "cancelled" (open question §13). Folds to FAILED.
+     * Requests cancellation. A no-op on an already-terminal execution, and refused while the
+     * execution is in flight in this process (see {@link #pause}). Note: the v0 event schema (spec §5)
+     * has no dedicated cancellation event, so this records a failure marked "cancelled" (open
+     * question §13). Folds to FAILED.
      */
-    public void cancel(ExecutionId id) {
-        if (inspect(id).isTerminal()) return;
+    public synchronized void cancel(ExecutionId id) {
+        if (inspect(id).isTerminal()) return;      // terminal (incl. just-completed) → no-op
+        if (inFlight.containsKey(id)) {
+            throw new IllegalStateException("Cannot cancel an execution running in this process: " + id);
+        }
         log.append(id, new CatalystEvent.ExecutionFailed(now(), "cancelled by request", log.latestSeq(id)));
     }
 

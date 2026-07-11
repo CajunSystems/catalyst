@@ -13,9 +13,14 @@ import com.cajunsystems.catalyst.events.CatalystEvent;
 import com.cajunsystems.catalyst.model.Completion;
 import com.cajunsystems.catalyst.model.CompletionRequest;
 import com.cajunsystems.catalyst.model.Prompt;
+import com.cajunsystems.catalyst.ReplayMode;
+import com.cajunsystems.catalyst.engine.InDoubtPolicy;
 import com.cajunsystems.catalyst.model.Role;
 import com.cajunsystems.catalyst.mock.MockModel;
+import com.fasterxml.jackson.databind.node.NullNode;
 import org.junit.jupiter.api.Test;
+
+import java.time.Instant;
 
 import static org.assertj.core.api.Assertions.assertThat;
 
@@ -114,6 +119,34 @@ class BranchTest {
             assertThat(model.callCount()).isEqualTo(2); // 1 original + 1 live call in the branch
             assertThat(runtime.log().read(fork.id()).get(0).event())
                     .isInstanceOf(CatalystEvent.ExecutionBranched.class);
+        }
+    }
+
+    @Test
+    void forkClearsInDoubtStateSoLaterToolsRunLive() {
+        // A log that crashed mid-tool: it ends with a dangling ToolRequested (in-doubt).
+        InMemoryEventLog log = new InMemoryEventLog();
+        ExecutionId id = ExecutionId.random();
+        Instant t = Instant.now();
+        log.putKey("k", id);
+        log.append(id, new CatalystEvent.ExecutionCreated(t, "T", "h", "cfg", "k"));
+        log.append(id, new CatalystEvent.ExecutionStarted(t, 1, "n"));
+        log.append(id, new CatalystEvent.CompletionRequested(t, "HASH_OF_SAY_A"));
+        log.append(id, new CatalystEvent.CompletionReceived(t, NullNode.getInstance(), 0, 0, 0, 0.0, "stop"));
+        log.append(id, new CatalystEvent.ToolRequested(t, "oldtool", NullNode.getInstance())); // dangling
+
+        // Under BRANCH, the task's divergent prompt forks; the later tool must run live — not be
+        // mis-routed into in-doubt handling for the stale dangling tool.
+        Task<String> task = ctx -> {
+            ctx.model().complete(CompletionRequest.of(Prompt.builder().user("say B").build())); // diverges → fork
+            return ctx.call(LOOKUP, new Query("x"));
+        };
+        try (CatalystRuntime runtime = CatalystRuntime.builder()
+                .log(log).model(MockModel.alwaysReturn("live"))
+                .replayMode(ReplayMode.BRANCH).inDoubtPolicy(InDoubtPolicy.FAIL).build()) {
+
+            ExecutionHandle<String> handle = runtime.execute(task, ExecutionOptions.withKey("k"));
+            assertThat(handle.result()).isEqualTo("ACTIVE"); // LOOKUP ran live after the fork
         }
     }
 }

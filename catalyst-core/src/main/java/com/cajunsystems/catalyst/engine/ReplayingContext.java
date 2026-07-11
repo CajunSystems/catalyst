@@ -419,7 +419,8 @@ public final class ReplayingContext implements Context {
         if (appendEnabled && branchSpec == null) {
             append(new ExecutionBranched(now(), null, seq, "divergence"));
         }
-        boundaries.clear(); // everything after the fork runs live
+        boundaries.clear();  // everything after the fork runs live
+        danglingTool = null; // the fork supersedes any in-doubt tool from the recorded tail
     }
 
     private void requireAppendable(String what) {

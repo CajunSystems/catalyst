@@ -188,6 +188,31 @@ class CatalystRuntimeTest {
     }
 
     @Test
+    void pauseIsRefusedWhileRunningButNoOpOnceTerminal() throws Exception {
+        MockModel model = MockModel.alwaysReturn("pong");
+        CountDownLatch release = new CountDownLatch(1);
+        Task<String> slow = ctx -> {
+            String r = ctx.model().complete(CompletionRequest.of(Prompt.builder().user("hi").build())).message();
+            try { release.await(); } catch (InterruptedException e) { Thread.currentThread().interrupt(); }
+            return r;
+        };
+        try (CatalystRuntime runtime = CatalystRuntime.builder()
+                .log(EventLogs.inMemory()).model(model).build()) {
+
+            ExecutionHandle<String> handle = runtime.execute(slow, ExecutionOptions.withKey("k"));
+            // While the task is in flight, pausing must be refused rather than racing the event stream.
+            assertThatThrownBy(() -> runtime.pause(handle.id())).isInstanceOf(IllegalStateException.class);
+
+            release.countDown();
+            assertThat(handle.result()).isEqualTo("pong");
+
+            // Once terminal it is a clean no-op.
+            runtime.pause(handle.id());
+            assertThat(runtime.inspect(handle.id()).status()).isEqualTo(Status.COMPLETED);
+        }
+    }
+
+    @Test
     void serializerFactoryProducesUsableMapper() {
         assertThat(EventJson.newMapper()).isNotNull();
     }
