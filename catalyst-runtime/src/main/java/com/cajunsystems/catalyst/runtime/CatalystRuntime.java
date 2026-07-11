@@ -5,9 +5,11 @@ import com.cajunsystems.catalyst.ExecutionInfo;
 import com.cajunsystems.catalyst.ExecutionOptions;
 import com.cajunsystems.catalyst.ReplayMode;
 import com.cajunsystems.catalyst.Task;
+import com.cajunsystems.catalyst.engine.CostModel;
 import com.cajunsystems.catalyst.engine.ExecutionPausedSignal;
 import com.cajunsystems.catalyst.engine.ExecutionState;
 import com.cajunsystems.catalyst.engine.InDoubtPolicy;
+import com.cajunsystems.catalyst.engine.NonDeterministicReplayException;
 import com.cajunsystems.catalyst.engine.PayloadCodec;
 import com.cajunsystems.catalyst.engine.Reducer;
 import com.cajunsystems.catalyst.engine.ReplayingContext;
@@ -23,6 +25,7 @@ import org.slf4j.LoggerFactory;
 import java.time.Clock;
 import java.time.Instant;
 import java.util.List;
+import java.util.Map;
 import java.util.Optional;
 import java.util.concurrent.CompletableFuture;
 import java.util.concurrent.ConcurrentHashMap;
@@ -42,6 +45,7 @@ public final class CatalystRuntime implements AutoCloseable {
     private final Clock clock;
     private final ReplayMode replayMode;
     private final InDoubtPolicy inDoubtPolicy;
+    private final CostModel costModel;
     private final ObjectMapper eventMapper;
     private final PayloadCodec payloads;
     private final String nodeId;
@@ -62,6 +66,7 @@ public final class CatalystRuntime implements AutoCloseable {
         this.clock = b.clock;
         this.replayMode = b.replayMode;
         this.inDoubtPolicy = b.inDoubtPolicy;
+        this.costModel = b.costModel;
         this.eventMapper = b.eventMapper;
         this.payloads = new PayloadCodec();
         this.nodeId = b.nodeId;
@@ -139,10 +144,37 @@ public final class CatalystRuntime implements AutoCloseable {
     }
 
     /**
-     * Exact re-fold of an execution's events (spec §7). M0 returns the folded state; M1 layers on
-     * strict substitution with zero external calls.
+     * Exact re-fold of an execution's events (spec §7): a pure function of the log, zero external
+     * calls. Use {@link #replay(ExecutionId, Task)} to also re-run the task and verify determinism.
      */
     public ExecutionState replay(ExecutionId id) {
+        return inspect(id);
+    }
+
+    /**
+     * Exact replay with substitution (spec §7): re-runs {@code task} against the recorded log with
+     * every boundary substituted and <strong>zero external calls</strong> (any attempt to execute a
+     * boundary not covered by the log fails). Under {@link ReplayMode#STRICT} a boundary whose
+     * canonical hash/identity differs from the record raises {@link NonDeterministicReplayException}.
+     * Appends nothing; returns the folded {@link ExecutionState}.
+     *
+     * @throws NonDeterministicReplayException if the task diverges from the recorded run
+     */
+    public <R> ExecutionState replay(ExecutionId id, Task<R> task) {
+        List<SequencedEvent> recorded = log.read(id);
+        ExecutionState state = Reducer.fold(id, recorded);
+        ExecutionInfo info = new ExecutionInfo(id, state.attempt(),
+                state.taskType() != null ? state.taskType() : task.getClass().getName(), Map.of());
+        Logger logger = LoggerFactory.getLogger("catalyst.replay." + id.value());
+        ReplayingContext ctx = new ReplayingContext(id, log, defaultModel, info, Map.of(),
+                eventMapper, payloads, inDoubtPolicy, costModel, clock, logger, recorded, /* appendEnabled */ false);
+        try {
+            task.execute(ctx);
+        } catch (RuntimeException e) {
+            throw e; // includes NonDeterministicReplayException
+        } catch (Exception e) {
+            throw new RuntimeException("Replay of " + id + " failed", e);
+        }
         return inspect(id);
     }
 
@@ -200,7 +232,7 @@ public final class CatalystRuntime implements AutoCloseable {
         Logger logger = LoggerFactory.getLogger("catalyst.exec." + id.value());
 
         ReplayingContext ctx = new ReplayingContext(id, log, defaultModel, info, opts.vars(),
-                eventMapper, payloads, inDoubtPolicy, clock, logger, recorded, appendEnabled);
+                eventMapper, payloads, inDoubtPolicy, costModel, clock, logger, recorded, appendEnabled);
 
         try {
             R result = task.execute(ctx);
@@ -237,6 +269,7 @@ public final class CatalystRuntime implements AutoCloseable {
         private Clock clock = Clock.systemUTC();
         private ReplayMode replayMode = ReplayMode.STRICT;
         private InDoubtPolicy inDoubtPolicy = InDoubtPolicy.FAIL;
+        private CostModel costModel = CostModel.free();
         private ObjectMapper eventMapper = EventJson.shared();
         private String nodeId = "node-0";
 
@@ -262,6 +295,12 @@ public final class CatalystRuntime implements AutoCloseable {
 
         public Builder inDoubtPolicy(InDoubtPolicy inDoubtPolicy) {
             this.inDoubtPolicy = inDoubtPolicy;
+            return this;
+        }
+
+        /** Prices completions so cost folds into the execution (default {@link CostModel#free()}). */
+        public Builder costModel(CostModel costModel) {
+            this.costModel = costModel;
             return this;
         }
 

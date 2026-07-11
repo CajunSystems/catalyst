@@ -16,13 +16,13 @@ usage, and cost are folds over events, not a separate instrumentation layer.
 Built on the [CajunSystems](https://github.com/CajunSystems) stack: **Gumbo** (a shared, append-only
 log) provides durability.
 
-> **Status: M0 — Execute + record + resume.** This is the first milestone of the
-> [v0.1 spec](#specification). It delivers the durable foundation; M1 (replay + inspect) and
-> M2 (branch + diff) build on it. See [Milestones](#milestones).
+> **Status: M1 — Replay + inspect** (on top of M0: execute + record + resume). Strict,
+> self-verifying replay with canonical hashing, plus a typed token/cost timeline. M2 (branch + diff)
+> is next. See [Milestones](#milestones).
 
 ---
 
-## What works today (M0)
+## What works today (M0 + M1)
 
 - **`Task` / `Context` API** — a task is a unit of AI work; everything it needs (model, tools,
   memory, effects) comes from the `Context` passed to `execute`.
@@ -35,10 +35,18 @@ log) provides durability.
 - **`MockModel`** (deterministic, for tests/demos) and built-in **`ClockTool`** / **`CalculatorTool`**.
 - **In-doubt tool policy** — a tool call caught mid-flight by a crash is surfaced via a pluggable
   `InDoubtPolicy` (`RETRY` / `FAIL` / `ASK`) instead of being silently re-executed.
+- **Strict, self-verifying replay (M1)** — `runtime.replay(id, task)` re-runs a recorded execution
+  with every boundary substituted and **zero external calls**. Each boundary is checked against the
+  log's canonical request hash / tool-input hash / effect label / memory key; a mismatch under
+  `ReplayMode.STRICT` throws `NonDeterministicReplayException(seq, expected, actual)`, catching
+  nondeterministic task code.
+- **Typed timeline + token/cost accounting (M1)** — `runtime.inspect(id).timelineView()` folds the
+  log into model/tool call counts, token usage, latency, and cost. Cost is priced by a pluggable
+  `CostModel` (e.g. `CostModel.perMillionTokens(in, out)`).
 
 Deferred to later milestones (schema slots already reserved so no breaking change is needed):
-strict replay with canonical-hash mismatch detection (M1), the LangChain4j model adapter and real
-providers (M1), branch/diff (M2), `WAITING`/signal APIs, snapshots and blob store (v0.2).
+the LangChain4j model adapter and real providers (M1 follow-up), `BRANCH` mode + branch/diff (M2),
+`WAITING`/signal APIs, snapshots and blob store (v0.2).
 
 ## Module layout
 
@@ -99,6 +107,23 @@ java -cp "$CP" com.cajunsystems.catalyst.api.Demo /tmp/catalyst-demo resume
 ```
 
 The same scenario is asserted automatically in `M0ResumeAcceptanceTest`.
+
+## The M1 exit demo (strict replay)
+
+`Demo replay` records a complete execution, then replays it with substitution and shows divergence
+detection:
+
+```bash
+java -cp "$CP" com.cajunsystems.catalyst.api.Demo replay
+```
+
+```
+[replay] timeline: 2 model call(s), 15 tokens, $0.000069
+[replay] replayed -> COMPLETED; external calls during replay: 0
+[replay] divergence correctly detected at seq 4
+```
+
+Asserted automatically in `M1ReplayAcceptanceTest`.
 
 ## A taste of the API
 

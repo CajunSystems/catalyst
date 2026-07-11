@@ -6,7 +6,7 @@ import com.cajunsystems.catalyst.Task;
 import com.cajunsystems.catalyst.Tool;
 import com.cajunsystems.catalyst.engine.InDoubtException;
 import com.cajunsystems.catalyst.engine.InDoubtPolicy;
-import com.cajunsystems.catalyst.engine.ReplayDivergenceException;
+import com.cajunsystems.catalyst.engine.NonDeterministicReplayException;
 import com.cajunsystems.catalyst.events.CatalystEvent;
 import com.cajunsystems.catalyst.events.EventJson;
 import com.cajunsystems.catalyst.model.CompletionRequest;
@@ -146,7 +146,7 @@ class CatalystRuntimeTest {
         Task<String> divergent = ctx -> ctx.effect("different-label", () -> "x");
         try (CatalystRuntime runtime = CatalystRuntime.builder().log(log).build()) {
             ExecutionHandle<String> handle = runtime.execute(divergent, ExecutionOptions.withKey("k"));
-            assertThatThrownBy(handle::result).isInstanceOf(ReplayDivergenceException.class);
+            assertThatThrownBy(handle::result).isInstanceOf(NonDeterministicReplayException.class);
         }
     }
 

@@ -39,4 +39,9 @@ public record ExecutionState(
     public List<TimelineStep> trajectory() {
         return timeline;
     }
+
+    /** The aggregated timeline view: model/tool counts, token usage, cost and latency roll-ups. */
+    public Timeline timelineView() {
+        return Timeline.from(this);
+    }
 }

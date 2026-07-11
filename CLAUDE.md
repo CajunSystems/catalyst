@@ -1,7 +1,9 @@
 # Catalyst — notes for Claude
 
 Catalyst is a **durable AI execution runtime for the JVM** (Java 21, Maven multi-module). This repo
-currently implements the **M0** milestone: *execute + record + resume*.
+implements **M0** (*execute + record + resume*) and **M1** (*replay + inspect*): strict,
+self-verifying replay with canonical hashing (`NonDeterministicReplayException`), `replay(id, task)`,
+and a typed token/cost timeline (`ExecutionState.timelineView()`, pluggable `CostModel`).
 
 ## Build & test
 
@@ -34,7 +36,11 @@ intended source, but if `jitpack.io` is blocked, install Gumbo locally first:
 - `seq` is dense and per-execution; it lives on `SequencedEvent`, not on the event itself.
 - Determinism contract: task code between boundaries must be deterministic (Temporal-style).
 
-## The M0 acceptance test
+## Acceptance tests / exit demos (keep green if you touch the engine)
 
-`catalyst-api` → `M0ResumeAcceptanceTest` and the runnable `Demo` prove: crash after step 1, resume,
-finish with zero duplicate model calls. If you touch the engine, keep these green.
+- **M0** — `catalyst-api` → `M0ResumeAcceptanceTest` + `Demo record|resume`: crash after step 1,
+  resume, finish with zero duplicate model calls.
+- **M1** — `M1ReplayAcceptanceTest` + `Demo replay`: replay a recorded execution with zero external
+  calls, canonical hashes verified, and a divergent replay raising `NonDeterministicReplayException`.
+
+CI (`.github/workflows/ci.yml`) runs both exit demos as gates — it is the source of truth per phase.

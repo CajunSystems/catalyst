@@ -33,6 +33,15 @@ public final class Hashing {
         return sha256(sj.toString());
     }
 
+    /**
+     * A stable hash of a JSON payload (e.g. a tool's canonical input). Uses the node's compact JSON
+     * rendering; callers on both the record and replay sides serialize with the same mapper, so the
+     * rendering — and therefore the hash — matches.
+     */
+    public static String canonicalJsonHash(com.fasterxml.jackson.databind.JsonNode node) {
+        return sha256(node == null ? "null" : node.toString());
+    }
+
     /** A stable hash of an arbitrary string payload (e.g. a canonical prompt rendering). */
     public static String sha256(String value) {
         try {

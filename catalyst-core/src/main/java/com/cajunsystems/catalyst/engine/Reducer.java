@@ -33,6 +33,7 @@ public final class Reducer {
         com.fasterxml.jackson.databind.JsonNode result = null;
         String error = null;
         long lastSeq = -1;
+        int lastToolStepIndex = -1;
         List<TimelineStep> timeline = new ArrayList<>();
 
         for (SequencedEvent se : events) {
@@ -68,11 +69,23 @@ public final class Reducer {
                     totalLatencyMillis += cr.latencyMillis();
                     timeline.add(new TimelineStep(se.seq(), TimelineStep.Kind.MODEL, cr.finishReason(), cr.at(), cr.latencyMillis(), cr.completion()));
                 }
-                case ToolRequested tr ->
-                        timeline.add(new TimelineStep(se.seq(), TimelineStep.Kind.TOOL, tr.toolName(), tr.at(), 0, tr.input()));
+                case ToolRequested tr -> {
+                    timeline.add(new TimelineStep(se.seq(), TimelineStep.Kind.TOOL, tr.toolName(), tr.at(), 0, tr.input()));
+                    lastToolStepIndex = timeline.size() - 1;
+                }
                 case ToolCompleted tc -> {
                     totalLatencyMillis += tc.latencyMillis();
-                    timeline.add(new TimelineStep(se.seq(), TimelineStep.Kind.TOOL, tc.error() == null ? "ok" : "error", tc.at(), tc.latencyMillis(), tc.output()));
+                    // Fold the completion into the single TOOL step for its request (one step per call).
+                    if (lastToolStepIndex >= 0) {
+                        TimelineStep req = timeline.get(lastToolStepIndex);
+                        timeline.set(lastToolStepIndex, new TimelineStep(req.seq(), TimelineStep.Kind.TOOL,
+                                req.label(), req.at(), tc.latencyMillis(),
+                                tc.error() == null ? tc.output() : null));
+                        lastToolStepIndex = -1;
+                    } else {
+                        timeline.add(new TimelineStep(se.seq(), TimelineStep.Kind.TOOL,
+                                tc.error() == null ? "ok" : "error", tc.at(), tc.latencyMillis(), tc.output()));
+                    }
                 }
                 case EffectRecorded ef ->
                         timeline.add(new TimelineStep(se.seq(), TimelineStep.Kind.EFFECT, ef.label(), ef.at(), 0, ef.value()));

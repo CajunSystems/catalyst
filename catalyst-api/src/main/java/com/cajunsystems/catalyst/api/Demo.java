@@ -4,10 +4,12 @@ import com.cajunsystems.catalyst.ExecutionId;
 import com.cajunsystems.catalyst.ExecutionInfo;
 import com.cajunsystems.catalyst.ExecutionOptions;
 import com.cajunsystems.catalyst.Task;
+import com.cajunsystems.catalyst.engine.CostModel;
 import com.cajunsystems.catalyst.engine.ExecutionState;
 import com.cajunsystems.catalyst.engine.InDoubtPolicy;
 import com.cajunsystems.catalyst.engine.PayloadCodec;
 import com.cajunsystems.catalyst.engine.ReplayingContext;
+import com.cajunsystems.catalyst.engine.Timeline;
 import com.cajunsystems.catalyst.events.CatalystEvent;
 import com.cajunsystems.catalyst.events.EventJson;
 import com.cajunsystems.catalyst.gumbo.GumboEventLog;
@@ -60,11 +62,52 @@ public final class Demo {
             Runtime.getRuntime().halt(137); // abrupt death: no completion event, no graceful close
         } else if (args.length >= 2 && args[1].equals("resume")) {
             resume(Path.of(args[0]));
+        } else if (args.length >= 1 && args[0].equals("replay")) {
+            replayDemo(Files.createTempDirectory("catalyst-replay-"));
         } else {
             Path dir = Files.createTempDirectory("catalyst-demo-");
             System.out.println("No args: running record + resume in-process under " + dir);
             record(dir);
             resume(dir);
+        }
+    }
+
+    /**
+     * The M1 exit demo: record a complete execution, then replay it with substitution — zero
+     * external calls, hashes verified — and show that a divergent task is caught.
+     */
+    private static void replayDemo(Path dir) {
+        MockModel model = summarizerModel();
+        try (CatalystRuntime runtime = Catalyst.builder()
+                .log(GumboEventLog.at(dir))
+                .model(model)
+                .costModel(CostModel.perMillionTokens(3.0, 15.0)) // priced so cost folds in
+                .build()) {
+
+            ExecutionId id = runtime.execute(TWO_STEP, ExecutionOptions.withKey(KEY)).id();
+            runtime.execute(TWO_STEP, ExecutionOptions.withKey(KEY)).result(); // ensure completed
+            int callsAfterRecord = model.callCount();
+            Timeline t = runtime.inspect(id).timelineView();
+            System.out.println("[replay] recorded execution " + id.value());
+            System.out.println("[replay] timeline: " + t.modelCalls() + " model call(s), "
+                    + t.totalTokens() + " tokens, $" + String.format("%.6f", t.totalCostUsd()));
+
+            // Exact replay with substitution — must make no new model calls.
+            ExecutionState replayed = runtime.replay(id, TWO_STEP);
+            int externalCalls = model.callCount() - callsAfterRecord;
+            System.out.println("[replay] replayed -> " + replayed.status()
+                    + "; external calls during replay: " + externalCalls);
+            if (externalCalls != 0) throw new AssertionError("replay made " + externalCalls + " external calls");
+
+            // A divergent task (different prompt) must be rejected.
+            Task<String> divergent = ctx ->
+                    ctx.model().complete(CompletionRequest.of(Prompt.builder().user("a DIFFERENT prompt").build())).message();
+            try {
+                runtime.replay(id, divergent);
+                throw new AssertionError("divergent replay was not detected");
+            } catch (com.cajunsystems.catalyst.engine.NonDeterministicReplayException e) {
+                System.out.println("[replay] divergence correctly detected at seq " + e.seq());
+            }
         }
     }
 
@@ -80,8 +123,8 @@ public final class Demo {
 
             ExecutionInfo info = new ExecutionInfo(id, 1, "TwoStep", Map.of());
             ReplayingContext ctx = new ReplayingContext(id, log, model, info, Map.of(),
-                    EventJson.shared(), new PayloadCodec(), InDoubtPolicy.FAIL, Clock.systemUTC(),
-                    LoggerFactory.getLogger("demo.record"), log.read(id), true);
+                    EventJson.shared(), new PayloadCodec(), InDoubtPolicy.FAIL, CostModel.free(),
+                    Clock.systemUTC(), LoggerFactory.getLogger("demo.record"), log.read(id), true);
             String summary = ctx.model().complete(STEP1).message();
             System.out.println("[record] execution " + id.value());
             System.out.println("[record] step 1 result: " + summary + " (model calls this run: " + model.callCount() + ")");
@@ -115,7 +158,11 @@ public final class Demo {
             String last = req.prompt().messages().stream()
                     .filter(m -> m.role() == com.cajunsystems.catalyst.model.Role.USER)
                     .reduce((a, b) -> b).map(Message::content).orElse("");
-            return Completion.ofText(last.contains("summarize") ? "SUMMARY" : "FINAL");
+            String text = last.contains("summarize") ? "SUMMARY" : "FINAL";
+            long promptTokens = req.prompt().messages().stream()
+                    .mapToLong(m -> Math.max(1, m.content().length() / 4)).sum();
+            var usage = new com.cajunsystems.catalyst.model.Usage(promptTokens, Math.max(1, text.length() / 4));
+            return new Completion(text, java.util.List.of(), usage, "stop");
         }).build();
     }
 

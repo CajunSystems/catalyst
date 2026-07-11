@@ -5,6 +5,7 @@ import com.cajunsystems.catalyst.ExecutionInfo;
 import com.cajunsystems.catalyst.ExecutionOptions;
 import com.cajunsystems.catalyst.Status;
 import com.cajunsystems.catalyst.Task;
+import com.cajunsystems.catalyst.engine.CostModel;
 import com.cajunsystems.catalyst.engine.ExecutionState;
 import com.cajunsystems.catalyst.engine.InDoubtPolicy;
 import com.cajunsystems.catalyst.engine.PayloadCodec;
@@ -62,8 +63,8 @@ class M0ResumeAcceptanceTest {
 
             ExecutionInfo info = new ExecutionInfo(id, 1, "TwoStep", Map.of());
             ReplayingContext ctx = new ReplayingContext(id, log, model, info, Map.of(),
-                    EventJson.shared(), new PayloadCodec(), InDoubtPolicy.FAIL, Clock.systemUTC(),
-                    LoggerFactory.getLogger("phase1"), log.read(id), true);
+                    EventJson.shared(), new PayloadCodec(), InDoubtPolicy.FAIL, CostModel.free(),
+                    Clock.systemUTC(), LoggerFactory.getLogger("phase1"), log.read(id), true);
 
             String summary = ctx.model().complete(STEP1).message(); // genuinely records step 1 to disk
             assertThat(summary).isEqualTo("SUMMARY");
