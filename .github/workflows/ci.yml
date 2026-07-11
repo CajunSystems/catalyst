@@ -88,3 +88,19 @@ jobs:
           echo "$OUT" | grep -q "divergence correctly detected" \
             || { echo "FAIL: nondeterministic replay was not detected"; exit 1; }
           echo "M1 exit criterion holds: exact replay, zero external calls, divergence detected."
+
+      # The M2 exit criterion (spec §11): rerun a recorded execution with a different model from
+      # step N and print the step-by-step diff.
+      - name: M2 exit demo (branch with a different model + diff)
+        run: |
+          set -uo pipefail
+          CP="catalyst-api/target/classes:$(cat catalyst-api/target/cp.txt)"
+
+          echo "--- branch a recorded execution with a swapped model ---"
+          OUT="$(java -cp "$CP" com.cajunsystems.catalyst.api.Demo branch)"
+          echo "$OUT"
+          echo "$OUT" | grep -q "1 step(s) changed" \
+            || { echo "FAIL: branch diff did not report the expected change"; exit 1; }
+          echo "$OUT" | grep -q "MODEL  CHANGED" \
+            || { echo "FAIL: branch diff did not mark the model step changed"; exit 1; }
+          echo "M2 exit criterion holds: branch with a swapped model produced a step-by-step diff."

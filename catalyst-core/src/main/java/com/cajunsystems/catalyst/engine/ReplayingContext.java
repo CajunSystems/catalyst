@@ -5,6 +5,7 @@ import com.cajunsystems.catalyst.Deterministic;
 import com.cajunsystems.catalyst.ExecutionId;
 import com.cajunsystems.catalyst.ExecutionInfo;
 import com.cajunsystems.catalyst.Memory;
+import com.cajunsystems.catalyst.ReplayMode;
 import com.cajunsystems.catalyst.Tool;
 import com.cajunsystems.catalyst.events.CatalystEvent;
 import com.cajunsystems.catalyst.events.CatalystEvent.*;
@@ -29,17 +30,22 @@ import java.util.function.Supplier;
 
 /**
  * The {@link Context} implementation that drives record + substitute — the heart of Catalyst's
- * durability, resume and replay (spec §6). It is seeded with the events already in the log for this
- * execution. For each recorded boundary the task re-produces, the matching result is
+ * durability, resume, replay and branching (spec §6, §7). It is seeded with the events already in the
+ * log for this execution. For each recorded boundary the task re-produces, the matching result is
  * <em>substituted</em> from the log with no side effect; once the task runs past the end of the log,
  * boundaries <em>execute live</em> and are appended. This is why a resumed execution makes zero
  * duplicate model or tool calls.
  *
- * <p><strong>Strict replay (M1).</strong> Substitution is not blind: each recorded boundary carries
- * the canonical hash/identity of the request that produced it (a model request hash, a tool
- * name + input hash, an effect label, a memory key). When the task replays, the boundary it
- * produces is checked against the recorded one; a mismatch under {@link com.cajunsystems.catalyst.ReplayMode#STRICT}
- * raises {@link NonDeterministicReplayException}, catching nondeterministic task code.
+ * <p><strong>Strict replay (M1).</strong> Substitution is checked: each recorded boundary carries the
+ * canonical hash/identity of the request that produced it (model request hash, tool name + input
+ * hash, effect label, memory key). A mismatch under {@link ReplayMode#STRICT} raises
+ * {@link NonDeterministicReplayException}, catching nondeterministic task code.
+ *
+ * <p><strong>Branching (M2).</strong> Under {@link ReplayMode#BRANCH} — or when a {@link BranchSpec}
+ * is present — a mismatch is not an error: the context {@code fork()}s (appends
+ * {@code ExecutionBranched} and switches to live execution from that point). A {@code BranchSpec}
+ * additionally forces a cutover at {@code atSeq} and can substitute counterfactual tool results
+ * during the replayed prefix. This is how {@code runtime.branch(id, seq)} explores alternatives.
  *
  * <p>Not thread-safe by itself: a single execution attempt runs on one virtual thread.
  */
@@ -48,8 +54,7 @@ public final class ReplayingContext implements Context {
     /**
      * A recorded, result-bearing boundary paired with the canonical identity/hash of the request
      * that produced it. {@code hash} is the model request hash or the tool input hash;
-     * {@code identity} is the tool name, effect label, or memory key. Either may be {@code null}
-     * for older records or boundaries where it does not apply.
+     * {@code identity} is the tool name, effect label, or memory key. Either may be {@code null}.
      */
     private record Boundary(long seq, CatalystEvent event, String identity, String hash) {}
 
@@ -62,6 +67,8 @@ public final class ReplayingContext implements Context {
     private final PayloadCodec payloads;
     private final InDoubtPolicy inDoubtPolicy;
     private final CostModel costModel;
+    private final ReplayMode replayMode;
+    private final BranchSpec branchSpec; // nullable: present only when driving a branch
     private final Clock clock;
     private final Logger logger;
     private final boolean appendEnabled;
@@ -71,6 +78,8 @@ public final class ReplayingContext implements Context {
     /** A trailing {@code ToolRequested} with no completion: a tool that was in flight at crash. */
     private ToolRequested danglingTool;
     private long danglingToolSeq = -1;
+    /** True once this run has forked off the recorded history (BRANCH mode). */
+    private boolean branched;
     /** Working-memory state rebuilt from recorded {@code MemoryWritten} events. */
     private final Map<String, JsonNode> memoryState = new HashMap<>();
 
@@ -78,7 +87,8 @@ public final class ReplayingContext implements Context {
 
     public ReplayingContext(ExecutionId id, EventLog log, Model realModel, ExecutionInfo info,
                             Map<String, Object> vars, ObjectMapper eventMapper, PayloadCodec payloads,
-                            InDoubtPolicy inDoubtPolicy, CostModel costModel, Clock clock, Logger logger,
+                            InDoubtPolicy inDoubtPolicy, CostModel costModel, ReplayMode replayMode,
+                            BranchSpec branchSpec, Clock clock, Logger logger,
                             List<SequencedEvent> recorded, boolean appendEnabled) {
         this.id = id;
         this.log = log;
@@ -89,6 +99,8 @@ public final class ReplayingContext implements Context {
         this.payloads = payloads;
         this.inDoubtPolicy = inDoubtPolicy;
         this.costModel = costModel == null ? CostModel.free() : costModel;
+        this.replayMode = replayMode == null ? ReplayMode.STRICT : replayMode;
+        this.branchSpec = branchSpec;
         this.clock = clock;
         this.logger = logger;
         this.appendEnabled = appendEnabled;
@@ -153,15 +165,15 @@ public final class ReplayingContext implements Context {
         if (recorded.isPresent()) {
             Boundary b = recorded.get();
             String actualHash = Hashing.canonicalRequestHash(request);
-            if (b.hash() != null && !b.hash().equals(actualHash)) {
-                throw new NonDeterministicReplayException(b.seq(),
-                        "model request " + b.hash(), "model request " + actualHash);
+            if (b.hash() == null || b.hash().equals(actualHash)) {
+                try {
+                    return eventMapper.treeToValue(((CompletionReceived) b.event()).completion(), Completion.class);
+                } catch (Exception e) {
+                    throw new IllegalStateException("Failed to substitute recorded completion", e);
+                }
             }
-            try {
-                return eventMapper.treeToValue(((CompletionReceived) b.event()).completion(), Completion.class);
-            } catch (Exception e) {
-                throw new IllegalStateException("Failed to substitute recorded completion", e);
-            }
+            // hash mismatch → STRICT throws, BRANCH forks and falls through to live
+            forkOrThrow(b.seq(), "model request " + b.hash(), "model request " + actualHash);
         }
         requireAppendable("model completion");
         if (realModel == null) {
@@ -194,22 +206,29 @@ public final class ReplayingContext implements Context {
         Optional<Boundary> recorded = pollExpected(ToolCompleted.class, "tool " + tool.name());
         if (recorded.isPresent()) {
             Boundary b = recorded.get();
-            if (b.identity() != null && !b.identity().equals(tool.name())) {
-                throw new NonDeterministicReplayException(b.seq(), "tool " + b.identity(), "tool " + tool.name());
-            }
+            boolean identityOk = b.identity() == null || b.identity().equals(tool.name());
             String actualInputHash = Hashing.canonicalJsonHash(eventMapper.valueToTree(input));
-            if (b.hash() != null && !b.hash().equals(actualInputHash)) {
-                throw new NonDeterministicReplayException(b.seq(),
-                        "tool " + tool.name() + " input " + b.hash(), "input " + actualInputHash);
+            boolean hashOk = b.hash() == null || b.hash().equals(actualInputHash);
+            if (identityOk && hashOk) {
+                // Counterfactual: a branch may swap this tool's recorded result for an alternative.
+                if (branchSpec != null && branchSpec.toolOverrides().containsKey(tool.name())) {
+                    return (O) payloads.fromTree(branchSpec.toolOverrides().get(tool.name()));
+                }
+                ToolCompleted tc = (ToolCompleted) b.event();
+                if (tc.error() != null) {
+                    throw new RuntimeException("Recorded tool '" + tool.name() + "' failed: " + tc.error());
+                }
+                if (isDeterministic(tool)) {
+                    return applyUnchecked(tool, input); // re-execute rather than deserialize (spec §4)
+                }
+                return (O) payloads.fromTree(tc.output());
             }
-            ToolCompleted tc = (ToolCompleted) b.event();
-            if (tc.error() != null) {
-                throw new RuntimeException("Recorded tool '" + tool.name() + "' failed: " + tc.error());
+            // divergence → STRICT throws, BRANCH forks and falls through to live
+            if (!identityOk) {
+                forkOrThrow(b.seq(), "tool " + b.identity(), "tool " + tool.name());
+            } else {
+                forkOrThrow(b.seq(), "tool " + tool.name() + " input " + b.hash(), "input " + actualInputHash);
             }
-            if (isDeterministic(tool)) {
-                return applyUnchecked(tool, input); // re-execute rather than deserialize (spec §4)
-            }
-            return (O) payloads.fromTree(tc.output());
         }
         if (danglingTool != null) {
             return handleInDoubt(tool, input);
@@ -265,10 +284,8 @@ public final class ReplayingContext implements Context {
     @SuppressWarnings("unchecked")
     public <T> T effect(String label, Supplier<T> supplier) {
         Optional<Boundary> recorded = pollExpected(EffectRecorded.class, "effect " + label);
-        if (recorded.isPresent()) {
-            Boundary b = recorded.get();
-            requireIdentity(b, "effect", label);
-            return (T) payloads.fromTree(((EffectRecorded) b.event()).value());
+        if (recorded.isPresent() && identityMatchesOrFork(recorded.get(), "effect", label)) {
+            return (T) payloads.fromTree(((EffectRecorded) recorded.get().event()).value());
         }
         requireAppendable("effect " + label);
         T value = supplier.get();
@@ -287,10 +304,8 @@ public final class ReplayingContext implements Context {
         @Override
         public void put(String key, Object value) {
             Optional<Boundary> recorded = pollExpected(MemoryWritten.class, "memory put " + key);
-            if (recorded.isPresent()) {
-                Boundary b = recorded.get();
-                requireIdentity(b, "memory put", key);
-                MemoryWritten mw = (MemoryWritten) b.event();
+            if (recorded.isPresent() && identityMatchesOrFork(recorded.get(), "memory put", key)) {
+                MemoryWritten mw = (MemoryWritten) recorded.get().event();
                 memoryState.put(mw.key(), mw.value());
                 return;
             }
@@ -304,10 +319,8 @@ public final class ReplayingContext implements Context {
         public <T> Optional<T> get(String key, Class<T> type) {
             Optional<Boundary> recorded = pollExpected(MemoryRead.class, "memory get " + key);
             JsonNode value;
-            if (recorded.isPresent()) {
-                Boundary b = recorded.get();
-                requireIdentity(b, "memory get", key);
-                value = ((MemoryRead) b.event()).value();
+            if (recorded.isPresent() && identityMatchesOrFork(recorded.get(), "memory get", key)) {
+                value = ((MemoryRead) recorded.get().event()).value();
             } else {
                 requireAppendable("memory get " + key);
                 value = memoryState.get(key);
@@ -352,27 +365,61 @@ public final class ReplayingContext implements Context {
 
     /**
      * Pops the next recorded boundary if it is of the expected type. An empty result means the task
-     * has run past the recorded tail (go live). A different type at the head is a structural
-     * divergence — the task produced its boundaries in a different order than recorded.
+     * has run past the recorded tail (go live) — or, in a branch, past the branch point or into a
+     * divergence, at which point it forks. A type mismatch is a structural divergence.
      */
     private Optional<Boundary> pollExpected(Class<? extends CatalystEvent> type, String what) {
         Boundary head = boundaries.peek();
         if (head == null) return Optional.empty();
+        // Forced cutover: a branch substitutes only up to atSeq, then runs live.
+        if (branchSpec != null && head.seq() > branchSpec.atSeq()) {
+            fork(head.seq());
+            return Optional.empty();
+        }
         if (type.isInstance(head.event())) {
             boundaries.poll();
             return Optional.of(head);
         }
-        throw new NonDeterministicReplayException(head.seq(),
+        // structural divergence (wrong boundary type/order) → STRICT throws, BRANCH forks (go live)
+        forkOrThrow(head.seq(),
                 head.event().getClass().getSimpleName() + " (recorded next)",
                 type.getSimpleName() + " (" + what + ")");
+        return Optional.empty();
     }
 
-    /** Validates a substituted boundary's identity (effect label, memory key) matches the request. */
-    private static void requireIdentity(Boundary b, String what, String actual) {
-        if (b.identity() != null && !b.identity().equals(actual)) {
-            throw new NonDeterministicReplayException(b.seq(),
-                    what + " " + b.identity(), what + " " + actual);
+    /** True if the boundary's identity matches; forks and returns false under BRANCH; throws under STRICT. */
+    private boolean identityMatchesOrFork(Boundary b, String what, String actual) {
+        if (b.identity() == null || b.identity().equals(actual)) return true;
+        forkOrThrow(b.seq(), what + " " + b.identity(), what + " " + actual);
+        return false; // BRANCH: fork happened, caller should go live
+    }
+
+    /**
+     * Handles a divergence between the task and the record. Under {@link ReplayMode#STRICT} this is a
+     * bug — throw. Under {@link ReplayMode#BRANCH} it is the branching mechanism — {@link #fork} and
+     * let the caller fall through to live execution.
+     */
+    private void forkOrThrow(long seq, String expected, String actual) {
+        if (replayMode == ReplayMode.BRANCH) {
+            fork(seq);
+            return;
         }
+        throw new NonDeterministicReplayException(seq, expected, actual);
+    }
+
+    /**
+     * Forks off recorded history at {@code seq}, then goes live. For auto-branch (a plain
+     * {@link ReplayMode#BRANCH} divergence with no {@link BranchSpec}) this records the
+     * {@code ExecutionBranched} marker; for an explicit {@code runtime.branch(...)} the runtime has
+     * already recorded it, so we don't double it.
+     */
+    private void fork(long seq) {
+        if (branched) return;
+        branched = true;
+        if (appendEnabled && branchSpec == null) {
+            append(new ExecutionBranched(now(), null, seq, "divergence"));
+        }
+        boundaries.clear(); // everything after the fork runs live
     }
 
     private void requireAppendable(String what) {

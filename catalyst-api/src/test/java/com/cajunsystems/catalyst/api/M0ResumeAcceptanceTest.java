@@ -64,6 +64,7 @@ class M0ResumeAcceptanceTest {
             ExecutionInfo info = new ExecutionInfo(id, 1, "TwoStep", Map.of());
             ReplayingContext ctx = new ReplayingContext(id, log, model, info, Map.of(),
                     EventJson.shared(), new PayloadCodec(), InDoubtPolicy.FAIL, CostModel.free(),
+                    com.cajunsystems.catalyst.ReplayMode.STRICT, null,
                     Clock.systemUTC(), LoggerFactory.getLogger("phase1"), log.read(id), true);
 
             String summary = ctx.model().complete(STEP1).message(); // genuinely records step 1 to disk

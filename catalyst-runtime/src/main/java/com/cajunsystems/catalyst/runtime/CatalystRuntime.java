@@ -5,6 +5,8 @@ import com.cajunsystems.catalyst.ExecutionInfo;
 import com.cajunsystems.catalyst.ExecutionOptions;
 import com.cajunsystems.catalyst.ReplayMode;
 import com.cajunsystems.catalyst.Task;
+import com.cajunsystems.catalyst.Cost;
+import com.cajunsystems.catalyst.engine.BranchSpec;
 import com.cajunsystems.catalyst.engine.CostModel;
 import com.cajunsystems.catalyst.engine.ExecutionPausedSignal;
 import com.cajunsystems.catalyst.engine.ExecutionState;
@@ -13,17 +15,22 @@ import com.cajunsystems.catalyst.engine.NonDeterministicReplayException;
 import com.cajunsystems.catalyst.engine.PayloadCodec;
 import com.cajunsystems.catalyst.engine.Reducer;
 import com.cajunsystems.catalyst.engine.ReplayingContext;
+import com.cajunsystems.catalyst.engine.TimelineStep;
+import com.cajunsystems.catalyst.engine.Trajectory;
 import com.cajunsystems.catalyst.events.CatalystEvent;
 import com.cajunsystems.catalyst.events.EventJson;
 import com.cajunsystems.catalyst.events.SequencedEvent;
 import com.cajunsystems.catalyst.log.EventLog;
 import com.cajunsystems.catalyst.model.Model;
+import com.fasterxml.jackson.databind.JsonNode;
 import com.fasterxml.jackson.databind.ObjectMapper;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 
 import java.time.Clock;
 import java.time.Instant;
+import java.util.ArrayList;
+import java.util.HashMap;
 import java.util.List;
 import java.util.Map;
 import java.util.Optional;
@@ -178,7 +185,7 @@ public final class CatalystRuntime implements AutoCloseable {
                 state.taskType() != null ? state.taskType() : task.getClass().getName(), opts.metadata());
         Logger logger = LoggerFactory.getLogger("catalyst.replay." + id.value());
         ReplayingContext ctx = new ReplayingContext(id, log, defaultModel, info, opts.vars(),
-                eventMapper, payloads, inDoubtPolicy, costModel, clock, logger, recorded, /* appendEnabled */ false);
+                eventMapper, payloads, inDoubtPolicy, costModel, replayMode, null, clock, logger, recorded, /* appendEnabled */ false);
         try {
             task.execute(ctx);
         } catch (RuntimeException e) {
@@ -199,6 +206,80 @@ public final class CatalystRuntime implements AutoCloseable {
         throw new UnsupportedOperationException(
                 "M0 resumes by re-submitting the task with the same idempotency key: "
                         + "execute(task, ExecutionOptions.withKey(key)). Standalone resume(id) needs a task registry.");
+    }
+
+    /**
+     * Forks a recorded execution at {@code atSeq} to explore an alternative (spec §7): the returned
+     * {@link BranchBuilder} lets you swap the model, substitute counterfactual tool results, or
+     * supply vars, then {@code run(task)} it forward into a new child execution and get its
+     * {@link Trajectory}.
+     */
+    public BranchBuilder branch(ExecutionId id, long atSeq) {
+        return new BranchBuilder(this, id, atSeq);
+    }
+
+    /**
+     * Runs a branch: substitute the parent's recorded prefix up to {@code atSeq} (swapping in any
+     * counterfactual tool results), fork, and run forward live with the override model. Records a
+     * new child execution beginning with {@code ExecutionBranched} and returns the fork's effective
+     * trajectory (parent prefix + child's forward steps).
+     */
+    <R> Trajectory runBranch(ExecutionId parentId, long atSeq, Model overrideModel,
+                             Map<String, Object> toolOverrideObjects, Map<String, Object> vars,
+                             String changedComponents, Task<R> task) {
+        List<SequencedEvent> parentEvents = log.read(parentId);
+        if (parentEvents.isEmpty()) {
+            throw new IllegalArgumentException("Cannot branch unknown execution: " + parentId);
+        }
+        ExecutionState parentState = Reducer.fold(parentId, parentEvents);
+
+        Map<String, JsonNode> overrides = new HashMap<>();
+        toolOverrideObjects.forEach((name, value) -> overrides.put(name, payloads.toTree(value)));
+
+        ExecutionId childId = ExecutionId.random();
+        String components = changedComponents == null || changedComponents.isBlank()
+                ? "branch@" + atSeq : changedComponents;
+        BranchSpec spec = new BranchSpec(atSeq, parentId.value(), overrides, components);
+
+        // The child log begins with the branch marker + started (the fork itself won't re-record it).
+        log.append(childId, new CatalystEvent.ExecutionBranched(now(), parentId.value(), atSeq, components));
+        log.append(childId, new CatalystEvent.ExecutionStarted(now(), 1, nodeId));
+
+        String taskType = parentState.taskType() != null ? parentState.taskType() : task.getClass().getName();
+        ExecutionInfo info = new ExecutionInfo(childId, 1, taskType, Map.of());
+        Logger logger = LoggerFactory.getLogger("catalyst.branch." + childId.value());
+        Model model = overrideModel != null ? overrideModel : defaultModel;
+
+        ReplayingContext ctx = new ReplayingContext(childId, log, model, info, vars,
+                eventMapper, payloads, inDoubtPolicy, costModel, ReplayMode.BRANCH, spec, clock, logger,
+                parentEvents, /* appendEnabled */ true);
+        try {
+            R result = task.execute(ctx);
+            log.append(childId, new CatalystEvent.ExecutionCompleted(now(), payloads.toTree(result)));
+        } catch (RuntimeException e) {
+            log.append(childId, new CatalystEvent.ExecutionFailed(now(), String.valueOf(e), log.latestSeq(childId)));
+            throw e;
+        } catch (Exception e) {
+            log.append(childId, new CatalystEvent.ExecutionFailed(now(), String.valueOf(e), log.latestSeq(childId)));
+            throw new RuntimeException("Branch of " + parentId + " failed", e);
+        }
+
+        ExecutionState childState = inspect(childId);
+        // Effective trajectory of the fork: parent prefix (seq ≤ atSeq) + the child's forward steps.
+        List<TimelineStep> forkSteps = new ArrayList<>();
+        for (TimelineStep s : parentState.trajectory()) {
+            if (s.seq() <= atSeq) forkSteps.add(s);
+        }
+        forkSteps.addAll(childState.trajectory());
+
+        List<SequencedEvent> prefix = new ArrayList<>();
+        for (SequencedEvent se : parentEvents) {
+            if (se.seq() <= atSeq) prefix.add(se);
+        }
+        Cost prefixCost = Reducer.fold(parentId, prefix).cost();
+        Cost childCost = childState.cost();
+        Cost combined = prefixCost.plus(childCost.promptTokens(), childCost.completionTokens(), childCost.usd());
+        return Trajectory.of(childId, childState.status(), forkSteps, combined);
     }
 
     /** Pauses an execution. A no-op on an already-terminal execution (never reopens a closed log). */
@@ -247,7 +328,7 @@ public final class CatalystRuntime implements AutoCloseable {
         Logger logger = LoggerFactory.getLogger("catalyst.exec." + id.value());
 
         ReplayingContext ctx = new ReplayingContext(id, log, defaultModel, info, opts.vars(),
-                eventMapper, payloads, inDoubtPolicy, costModel, clock, logger, recorded, appendEnabled);
+                eventMapper, payloads, inDoubtPolicy, costModel, replayMode, null, clock, logger, recorded, appendEnabled);
 
         try {
             R result = task.execute(ctx);

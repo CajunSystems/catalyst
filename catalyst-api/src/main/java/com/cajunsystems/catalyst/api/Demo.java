@@ -19,6 +19,7 @@ import com.cajunsystems.catalyst.model.Message;
 import com.cajunsystems.catalyst.model.Prompt;
 import com.cajunsystems.catalyst.mock.MockModel;
 import com.cajunsystems.catalyst.runtime.CatalystRuntime;
+import com.cajunsystems.catalyst.runtime.ExecutionHandle;
 import org.slf4j.LoggerFactory;
 
 import java.nio.file.Files;
@@ -64,6 +65,8 @@ public final class Demo {
             resume(Path.of(args[0]));
         } else if (args.length >= 1 && args[0].equals("replay")) {
             replayDemo(Files.createTempDirectory("catalyst-replay-"));
+        } else if (args.length >= 1 && args[0].equals("branch")) {
+            branchDemo(Files.createTempDirectory("catalyst-branch-"));
         } else {
             Path dir = Files.createTempDirectory("catalyst-demo-");
             System.out.println("No args: running record + resume in-process under " + dir);
@@ -124,6 +127,7 @@ public final class Demo {
             ExecutionInfo info = new ExecutionInfo(id, 1, "TwoStep", Map.of());
             ReplayingContext ctx = new ReplayingContext(id, log, model, info, Map.of(),
                     EventJson.shared(), new PayloadCodec(), InDoubtPolicy.FAIL, CostModel.free(),
+                    com.cajunsystems.catalyst.ReplayMode.STRICT, null,
                     Clock.systemUTC(), LoggerFactory.getLogger("demo.record"), log.read(id), true);
             String summary = ctx.model().complete(STEP1).message();
             System.out.println("[record] execution " + id.value());
@@ -149,21 +153,59 @@ public final class Demo {
     }
 
     /**
-     * A deterministic, content-based mock model: it answers from the last user message rather than a
-     * positional script, so it returns the same answer for the same request in any process — exactly
-     * the property replay relies on.
+     * The M2 exit demo: record a 2-step execution, branch after step 1 with a different model, and
+     * print the step-by-step diff between the original and the fork.
      */
-    private static MockModel summarizerModel() {
+    private static void branchDemo(java.nio.file.Path dir) {
+        try (CatalystRuntime runtime = Catalyst.builder()
+                .log(GumboEventLog.at(dir))
+                .model(answerModel("FINAL"))
+                .build()) {
+
+            ExecutionHandle<String> handle = runtime.execute(TWO_STEP, ExecutionOptions.withKey(KEY));
+            String parentResult = handle.result();
+            ExecutionId id = handle.id();
+
+            com.cajunsystems.catalyst.engine.ExecutionState parent = runtime.inspect(id);
+            long step1Seq = parent.trajectory().stream()
+                    .filter(s -> s.kind() == com.cajunsystems.catalyst.engine.TimelineStep.Kind.MODEL)
+                    .findFirst().orElseThrow().seq();
+
+            com.cajunsystems.catalyst.engine.Trajectory fork =
+                    runtime.branch(id, step1Seq).withModel(answerModel("FINAL-B")).run(TWO_STEP);
+            com.cajunsystems.catalyst.engine.TrajectoryDiff diff =
+                    com.cajunsystems.catalyst.engine.Trajectory.diff(
+                            com.cajunsystems.catalyst.engine.Trajectory.of(parent), fork);
+
+            System.out.println("[branch] parent " + id.value() + " -> " + parentResult);
+            System.out.println("[branch] fork   " + fork.id().value()
+                    + " (model swapped from step at seq " + step1Seq + ")");
+            System.out.println("[branch] diff (" + diff.changedCount() + " step(s) changed):");
+            System.out.print(diff.pretty());
+        }
+    }
+
+    /** A content-based model: "summarize" → SUMMARY, otherwise the given final text (with token usage). */
+    private static MockModel answerModel(String finalText) {
         return MockModel.builder().respond(req -> {
             String last = req.prompt().messages().stream()
                     .filter(m -> m.role() == com.cajunsystems.catalyst.model.Role.USER)
                     .reduce((a, b) -> b).map(Message::content).orElse("");
-            String text = last.contains("summarize") ? "SUMMARY" : "FINAL";
+            String text = last.contains("summarize") ? "SUMMARY" : finalText;
             long promptTokens = req.prompt().messages().stream()
                     .mapToLong(m -> Math.max(1, m.content().length() / 4)).sum();
             var usage = new com.cajunsystems.catalyst.model.Usage(promptTokens, Math.max(1, text.length() / 4));
             return new Completion(text, java.util.List.of(), usage, "stop");
         }).build();
+    }
+
+    /**
+     * A deterministic, content-based mock model: it answers from the last user message rather than a
+     * positional script, so it returns the same answer for the same request in any process — exactly
+     * the property replay relies on.
+     */
+    private static MockModel summarizerModel() {
+        return answerModel("FINAL");
     }
 
     private Demo() {}

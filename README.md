@@ -16,13 +16,13 @@ usage, and cost are folds over events, not a separate instrumentation layer.
 Built on the [CajunSystems](https://github.com/CajunSystems) stack: **Gumbo** (a shared, append-only
 log) provides durability.
 
-> **Status: M1 — Replay + inspect** (on top of M0: execute + record + resume). Strict,
-> self-verifying replay with canonical hashing, plus a typed token/cost timeline. M2 (branch + diff)
-> is next. See [Milestones](#milestones).
+> **Status: v0.1 feature-complete (M0 + M1 + M2).** Durable execute/record/resume; strict,
+> self-verifying replay with canonical hashing and a typed token/cost timeline; and branch + diff
+> (fork a recorded run, swap the model or a tool result, and diff the trajectories).
 
 ---
 
-## What works today (M0 + M1)
+## What works today (M0 + M1 + M2)
 
 - **`Task` / `Context` API** — a task is a unit of AI work; everything it needs (model, tools,
   memory, effects) comes from the `Context` passed to `execute`.
@@ -47,9 +47,14 @@ log) provides durability.
   `ChatModel`, which buys OpenAI, Anthropic, Gemini, Ollama and local models. Catalyst keeps no
   provider HTTP client of its own; the completion flows through `ctx.model()` and is recorded and
   replayed like any other.
+- **Branch + diff (M2)** — `runtime.branch(id, atSeq).withModel(other).withRecordedToolResult(name,
+  value).run(task)` forks a recorded execution: it substitutes the prefix up to `atSeq` (swapping in
+  counterfactual tool results), then runs forward with the new model. Under `ReplayMode.BRANCH` a
+  divergence forks (appends `ExecutionBranched`, continues live) instead of throwing.
+  `Trajectory.diff(base, fork)` gives the step-by-step difference.
 
 Deferred to later milestones (schema slots already reserved so no breaking change is needed):
-`BRANCH` mode + branch/diff (M2), `WAITING`/signal APIs, snapshots and blob store (v0.2).
+`WAITING`/signal APIs and human-in-the-loop, snapshots and blob store, distributed execution (v0.2+/v1).
 
 ## Module layout
 
@@ -129,6 +134,26 @@ java -cp "$CP" com.cajunsystems.catalyst.api.Demo replay
 
 Asserted automatically in `M1ReplayAcceptanceTest`.
 
+## The M2 exit demo (branch + diff)
+
+`Demo branch` records a run, forks it at step 1 with a different model, and prints the diff:
+
+```bash
+java -cp "$CP" com.cajunsystems.catalyst.api.Demo branch
+```
+
+```
+[branch] parent ... -> SUMMARY|FINAL
+[branch] fork   ... (model swapped from step at seq 4)
+[branch] diff (1 step(s) changed):
+  [0] PROMPT  SAME
+  [1] MODEL  SAME
+  [2] PROMPT  SAME
+~ [3] MODEL  CHANGED  base={"message":"FINAL",...}  fork={"message":"FINAL-B",...}
+```
+
+Asserted automatically in `M2BranchAcceptanceTest`.
+
 ## A taste of the API
 
 ```java
@@ -163,7 +188,8 @@ CatalystRuntime runtime = Catalyst.builder()
 ## Specification
 
 The full v0.1 design lives in the project spec (Catalyst v0.1 Specification). This repository
-implements the **M0** and **M1** milestones of that spec.
+implements all three v0.1 milestones — **M0** (execute + record + resume), **M1** (replay + inspect),
+and **M2** (branch + diff).
 
 ## License
 

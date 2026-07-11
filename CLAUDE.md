@@ -1,9 +1,11 @@
 # Catalyst — notes for Claude
 
 Catalyst is a **durable AI execution runtime for the JVM** (Java 21, Maven multi-module). This repo
-implements **M0** (*execute + record + resume*) and **M1** (*replay + inspect*): strict,
-self-verifying replay with canonical hashing (`NonDeterministicReplayException`), `replay(id, task)`,
-and a typed token/cost timeline (`ExecutionState.timelineView()`, pluggable `CostModel`).
+implements all three v0.1 milestones: **M0** (*execute + record + resume*), **M1** (*replay +
+inspect* — strict canonical-hash replay with `NonDeterministicReplayException`, `replay(id, task)`,
+typed token/cost timeline via `ExecutionState.timelineView()` + pluggable `CostModel`), and **M2**
+(*branch + diff* — `ReplayMode.BRANCH` forks on divergence, `runtime.branch(id, atSeq)` with model /
+counterfactual-tool swaps, `Trajectory.diff`).
 
 ## Build & test
 
@@ -45,5 +47,7 @@ intended source, but if `jitpack.io` is blocked, install Gumbo locally first:
   resume, finish with zero duplicate model calls.
 - **M1** — `M1ReplayAcceptanceTest` + `Demo replay`: replay a recorded execution with zero external
   calls, canonical hashes verified, and a divergent replay raising `NonDeterministicReplayException`.
+- **M2** — `M2BranchAcceptanceTest` + `Demo branch`: rerun a recorded execution with a different
+  model from step N and diff the trajectories (only the post-branch step changes).
 
-CI (`.github/workflows/ci.yml`) runs both exit demos as gates — it is the source of truth per phase.
+CI (`.github/workflows/ci.yml`) runs all three exit demos as gates — it is the source of truth per phase.
