@@ -8,6 +8,7 @@ import com.cajunsystems.catalyst.Task;
 import com.cajunsystems.catalyst.Cost;
 import com.cajunsystems.catalyst.engine.BranchSpec;
 import com.cajunsystems.catalyst.engine.CostModel;
+import com.cajunsystems.catalyst.engine.ExecutionFailedException;
 import com.cajunsystems.catalyst.engine.ExecutionPausedSignal;
 import com.cajunsystems.catalyst.engine.ExecutionState;
 import com.cajunsystems.catalyst.engine.Hashing;
@@ -345,13 +346,20 @@ public final class CatalystRuntime implements AutoCloseable {
         try {
             List<SequencedEvent> recorded = log.read(id);
             ExecutionState state = Reducer.fold(id, recorded);
-            int attempt = state.attempt() + 1;
-            boolean appendEnabled = mode != Mode.REPLAY_TERMINAL;
 
+            // Attaching to an already-terminal execution returns its recorded outcome directly —
+            // never re-runs the task. Re-execution could surface a different (wrong) exception, and
+            // re-running a completed task is wasteful. (replay(id, task) is the explicit re-run path.)
+            if (mode == Mode.REPLAY_TERMINAL) {
+                completeFromTerminalState(id, state, future);
+                return;
+            }
+
+            int attempt = state.attempt() + 1;
             switch (mode) {
                 case FRESH -> log.append(id, new CatalystEvent.ExecutionStarted(now(), attempt, nodeId));
                 case RESUME -> log.append(id, new CatalystEvent.ExecutionResumed(now(), attempt));
-                case REPLAY_TERMINAL -> { /* pure replay: no lifecycle events appended */ }
+                case REPLAY_TERMINAL -> { /* handled above */ }
             }
 
             String effectiveTaskType = state.taskType() != null ? state.taskType() : taskType;
@@ -359,29 +367,36 @@ public final class CatalystRuntime implements AutoCloseable {
             Logger logger = LoggerFactory.getLogger("catalyst.exec." + id.value());
 
             ReplayingContext ctx = new ReplayingContext(id, log, defaultModel, info, opts.vars(),
-                    eventMapper, payloads, inDoubtPolicy, costModel, replayMode, null, clock, logger, recorded, appendEnabled);
+                    eventMapper, payloads, inDoubtPolicy, costModel, replayMode, null, clock, logger, recorded, /* appendEnabled */ true);
 
             try {
                 R result = task.execute(ctx);
-                if (appendEnabled) {
-                    log.append(id, new CatalystEvent.ExecutionCompleted(now(), payloads.toTree(result)));
-                }
+                log.append(id, new CatalystEvent.ExecutionCompleted(now(), payloads.toTree(result)));
                 future.complete(result);
             } catch (ExecutionPausedSignal pause) {
                 // ExecutionPaused already recorded by the context; leave the execution paused.
                 future.completeExceptionally(pause);
             } catch (Throwable t) {
-                if (appendEnabled) {
-                    try {
-                        log.append(id, new CatalystEvent.ExecutionFailed(now(), String.valueOf(t), log.latestSeq(id)));
-                    } catch (RuntimeException ignored) {
-                        // best-effort failure record; the future still completes exceptionally below
-                    }
+                try {
+                    log.append(id, new CatalystEvent.ExecutionFailed(now(), String.valueOf(t), log.latestSeq(id)));
+                } catch (RuntimeException ignored) {
+                    // best-effort failure record; the future still completes exceptionally below
                 }
                 future.completeExceptionally(t);
             }
         } catch (Throwable setupFailure) {
             future.completeExceptionally(setupFailure);
+        }
+    }
+
+    /** Completes a handle from an already-terminal execution's recorded outcome, without re-running. */
+    @SuppressWarnings("unchecked")
+    private <R> void completeFromTerminalState(ExecutionId id, ExecutionState state, CompletableFuture<R> future) {
+        switch (state.status()) {
+            case COMPLETED -> future.complete((R) payloads.fromTree(state.result()));
+            case FAILED, CANCELLED -> future.completeExceptionally(new ExecutionFailedException(id, state.error()));
+            default -> future.completeExceptionally(
+                    new IllegalStateException("Execution " + id + " is not terminal: " + state.status()));
         }
     }
 

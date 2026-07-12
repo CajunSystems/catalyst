@@ -113,15 +113,12 @@ public final class ReplayingContext implements Context {
      * substitutable event.
      */
     private void seed(List<SequencedEvent> recorded) {
-        CatalystEvent last = null;
-        long lastSeq = -1;
         String pendingRequestHash = null;
-        String pendingToolName = null;
+        ToolRequested pendingToolRequest = null; // an unmatched ToolRequested (in-doubt) if non-null at end
+        long pendingToolRequestSeq = -1;
         String pendingToolInputHash = null;
         for (SequencedEvent se : recorded) {
             CatalystEvent e = se.event();
-            last = e;
-            lastSeq = se.seq();
             switch (e) {
                 case CompletionRequested cr -> pendingRequestHash = cr.requestHash();
                 case CompletionReceived cr -> {
@@ -129,12 +126,15 @@ public final class ReplayingContext implements Context {
                     pendingRequestHash = null;
                 }
                 case ToolRequested tr -> {
-                    pendingToolName = tr.toolName();
+                    pendingToolRequest = tr;
+                    pendingToolRequestSeq = se.seq();
                     pendingToolInputHash = Hashing.canonicalJsonHash(tr.input());
                 }
                 case ToolCompleted tc -> {
-                    boundaries.add(new Boundary(se.seq(), e, pendingToolName, pendingToolInputHash));
-                    pendingToolName = null;
+                    String name = pendingToolRequest != null ? pendingToolRequest.toolName() : null;
+                    boundaries.add(new Boundary(se.seq(), e, name, pendingToolInputHash));
+                    pendingToolRequest = null;
+                    pendingToolRequestSeq = -1;
                     pendingToolInputHash = null;
                 }
                 case EffectRecorded er -> boundaries.add(new Boundary(se.seq(), e, er.label(), null));
@@ -146,10 +146,12 @@ public final class ReplayingContext implements Context {
                 default -> { /* lifecycle/marker events are not substitutable boundaries */ }
             }
         }
-        // A tool call is in-doubt only if the very last recorded event is its (uncompleted) request.
-        if (last instanceof ToolRequested tr) {
-            this.danglingTool = tr;
-            this.danglingToolSeq = lastSeq;
+        // A tool call is in-doubt if any ToolRequested was never matched by a ToolCompleted — even if
+        // lifecycle events (ExecutionFailed under FAIL, ExecutionPaused under ASK) were appended after
+        // it, so it is no longer the literal last event.
+        if (pendingToolRequest != null) {
+            this.danglingTool = pendingToolRequest;
+            this.danglingToolSeq = pendingToolRequestSeq;
         }
     }
 

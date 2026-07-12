@@ -5,6 +5,7 @@ import com.cajunsystems.catalyst.ExecutionOptions;
 import com.cajunsystems.catalyst.Status;
 import com.cajunsystems.catalyst.Task;
 import com.cajunsystems.catalyst.Tool;
+import com.cajunsystems.catalyst.engine.ExecutionFailedException;
 import com.cajunsystems.catalyst.engine.InDoubtException;
 import com.cajunsystems.catalyst.engine.InDoubtPolicy;
 import com.cajunsystems.catalyst.engine.NonDeterministicReplayException;
@@ -238,6 +239,46 @@ class CatalystRuntimeTest {
             // result(timeout) proves it completes (exceptionally) rather than hanging.
             assertThatThrownBy(() -> handle.result(java.time.Duration.ofSeconds(5)))
                     .hasMessageContaining("boom during setup");
+        }
+    }
+
+    @Test
+    void inDoubtToolIsDetectedEvenWhenALifecycleEventFollowsTheRequest() {
+        // Simulates an ASK-style in-doubt: ToolRequested followed by ExecutionPaused (non-terminal).
+        InMemoryEventLog log = new InMemoryEventLog();
+        ExecutionId id = ExecutionId.random();
+        Instant t = Instant.now();
+        log.putKey("k", id);
+        log.append(id, new CatalystEvent.ExecutionCreated(t, ADD_TASK.getClass().getName(), "h", "cfg", "k"));
+        log.append(id, new CatalystEvent.ExecutionStarted(t, 1, "node-0"));
+        log.append(id, new CatalystEvent.ToolRequested(t, "adder", NullNode.getInstance()));
+        log.append(id, new CatalystEvent.ExecutionPaused(t, "in-doubt tool: adder"));
+
+        try (CatalystRuntime runtime = CatalystRuntime.builder()
+                .log(log).inDoubtPolicy(InDoubtPolicy.FAIL).build()) {
+            ExecutionHandle<Integer> handle = runtime.execute(ADD_TASK, ExecutionOptions.withKey("k"));
+            // With the dangling tool still detected, the FAIL policy applies (rather than running live).
+            assertThatThrownBy(handle::result).isInstanceOf(InDoubtException.class);
+        }
+    }
+
+    @Test
+    void attachingToAFailedExecutionReturnsTheStoredErrorWithoutRerunning() {
+        InMemoryEventLog log = new InMemoryEventLog();
+        ExecutionId id = ExecutionId.random();
+        Instant t = Instant.now();
+        log.putKey("k", id);
+        log.append(id, new CatalystEvent.ExecutionCreated(t, "T", "h", "cfg", "k"));
+        log.append(id, new CatalystEvent.ExecutionStarted(t, 1, "node-0"));
+        log.append(id, new CatalystEvent.ExecutionFailed(t, "original boom", 1));
+
+        MockModel model = MockModel.alwaysReturn("x");
+        try (CatalystRuntime runtime = CatalystRuntime.builder().log(log).model(model).build()) {
+            ExecutionHandle<String> handle = runtime.execute(ONE_SHOT, ExecutionOptions.withKey("k"));
+            assertThatThrownBy(handle::result)
+                    .isInstanceOf(ExecutionFailedException.class)
+                    .hasMessageContaining("original boom");
+            assertThat(model.callCount()).isEqualTo(0); // the task was not re-executed
         }
     }
 
