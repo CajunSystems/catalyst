@@ -14,7 +14,10 @@ import com.cajunsystems.catalyst.model.Completion;
 import com.cajunsystems.catalyst.model.CompletionRequest;
 import com.cajunsystems.catalyst.model.Prompt;
 import com.cajunsystems.catalyst.ReplayMode;
+import com.cajunsystems.catalyst.engine.ExecutionPausedSignal;
 import com.cajunsystems.catalyst.engine.InDoubtPolicy;
+import com.cajunsystems.catalyst.events.SequencedEvent;
+import com.cajunsystems.catalyst.log.EventLog;
 import com.cajunsystems.catalyst.model.Role;
 import com.cajunsystems.catalyst.mock.MockModel;
 import com.fasterxml.jackson.databind.node.NullNode;
@@ -22,7 +25,13 @@ import org.junit.jupiter.api.Test;
 
 import java.time.Instant;
 
+import java.util.ArrayList;
+import java.util.List;
+import java.util.Map;
+import java.util.Optional;
+
 import static org.assertj.core.api.Assertions.assertThat;
+import static org.assertj.core.api.Assertions.assertThatThrownBy;
 
 class BranchTest {
 
@@ -147,6 +156,47 @@ class BranchTest {
 
             ExecutionHandle<String> handle = runtime.execute(task, ExecutionOptions.withKey("k"));
             assertThat(handle.result()).isEqualTo("ACTIVE"); // LOOKUP ran live after the fork
+        }
+    }
+
+    @Test
+    void branchLeavesTheChildPausedNotFailedOnInDoubtAsk() {
+        // Records every append so we can inspect the child's final event.
+        InMemoryEventLog delegate = new InMemoryEventLog();
+        List<Map.Entry<ExecutionId, CatalystEvent>> appends = new ArrayList<>();
+        EventLog log = new EventLog() {
+            public long append(ExecutionId id, CatalystEvent event) {
+                appends.add(Map.entry(id, event));
+                return delegate.append(id, event);
+            }
+            public List<SequencedEvent> read(ExecutionId id) { return delegate.read(id); }
+            public long latestSeq(ExecutionId id) { return delegate.latestSeq(id); }
+            public Optional<ExecutionId> findByKey(String key) { return delegate.findByKey(key); }
+            public void putKey(String key, ExecutionId id) { delegate.putKey(key, id); }
+            public void close() { delegate.close(); }
+        };
+
+        // Parent crashed mid-tool: its log ends with a dangling ToolRequested for "lookup".
+        ExecutionId parentId = ExecutionId.random();
+        java.time.Instant t = java.time.Instant.now();
+        log.append(parentId, new CatalystEvent.ExecutionCreated(t, "T", "h", "cfg", ""));
+        log.append(parentId, new CatalystEvent.ExecutionStarted(t, 1, "n"));
+        log.append(parentId, new CatalystEvent.ToolRequested(t, "lookup", NullNode.getInstance()));
+
+        Task<String> task = ctx -> ctx.call(LOOKUP, new Query("x"));
+        try (CatalystRuntime runtime = CatalystRuntime.builder()
+                .log(log).model(MockModel.alwaysReturn("m")).inDoubtPolicy(InDoubtPolicy.ASK).build()) {
+
+            assertThatThrownBy(() -> runtime.branch(parentId, Long.MAX_VALUE).run(task))
+                    .isInstanceOf(ExecutionPausedSignal.class);
+
+            ExecutionId childId = appends.stream().map(Map.Entry::getKey)
+                    .filter(x -> !x.equals(parentId)).findFirst().orElseThrow();
+            List<CatalystEvent> childEvents = appends.stream()
+                    .filter(e -> e.getKey().equals(childId)).map(Map.Entry::getValue).toList();
+            // The child must end PAUSED — no spurious ExecutionFailed appended after ExecutionPaused.
+            assertThat(childEvents.get(childEvents.size() - 1))
+                    .isInstanceOf(CatalystEvent.ExecutionPaused.class);
         }
     }
 }

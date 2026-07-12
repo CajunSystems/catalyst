@@ -258,6 +258,10 @@ public final class CatalystRuntime implements AutoCloseable {
         try {
             R result = task.execute(ctx);
             log.append(childId, new CatalystEvent.ExecutionCompleted(now(), payloads.toTree(result)));
+        } catch (ExecutionPausedSignal pause) {
+            // ExecutionPaused already recorded by the context (e.g. an ASK in-doubt tool); the child
+            // is left PAUSED — do NOT append a spurious ExecutionFailed on top of it.
+            throw pause;
         } catch (RuntimeException e) {
             log.append(childId, new CatalystEvent.ExecutionFailed(now(), String.valueOf(e), log.latestSeq(childId)));
             throw e;
