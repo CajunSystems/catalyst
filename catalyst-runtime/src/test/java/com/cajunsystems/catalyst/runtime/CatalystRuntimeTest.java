@@ -10,6 +10,7 @@ import com.cajunsystems.catalyst.engine.InDoubtPolicy;
 import com.cajunsystems.catalyst.engine.NonDeterministicReplayException;
 import com.cajunsystems.catalyst.events.CatalystEvent;
 import com.cajunsystems.catalyst.events.EventJson;
+import com.cajunsystems.catalyst.log.EventLog;
 import com.cajunsystems.catalyst.model.CompletionRequest;
 import com.cajunsystems.catalyst.model.Prompt;
 import com.cajunsystems.catalyst.mock.MockModel;
@@ -209,6 +210,34 @@ class CatalystRuntimeTest {
             // Once terminal it is a clean no-op.
             runtime.pause(handle.id());
             assertThat(runtime.inspect(handle.id()).status()).isEqualTo(Status.COMPLETED);
+        }
+    }
+
+    @Test
+    void setupFailureCompletesTheFutureInsteadOfHanging() {
+        // An event log that fails when the runtime tries to append ExecutionStarted — i.e. during
+        // runAttempt setup, before the task runs. The handle must fail fast, not block forever.
+        InMemoryEventLog delegate = new InMemoryEventLog();
+        EventLog failing = new EventLog() {
+            public long append(ExecutionId id, com.cajunsystems.catalyst.events.CatalystEvent event) {
+                if (event instanceof com.cajunsystems.catalyst.events.CatalystEvent.ExecutionStarted) {
+                    throw new RuntimeException("boom during setup");
+                }
+                return delegate.append(id, event);
+            }
+            public java.util.List<com.cajunsystems.catalyst.events.SequencedEvent> read(ExecutionId id) { return delegate.read(id); }
+            public long latestSeq(ExecutionId id) { return delegate.latestSeq(id); }
+            public java.util.Optional<ExecutionId> findByKey(String key) { return delegate.findByKey(key); }
+            public void putKey(String key, ExecutionId id) { delegate.putKey(key, id); }
+            public void close() { delegate.close(); }
+        };
+
+        try (CatalystRuntime runtime = CatalystRuntime.builder()
+                .log(failing).model(MockModel.alwaysReturn("pong")).build()) {
+            ExecutionHandle<String> handle = runtime.execute(ONE_SHOT, ExecutionOptions.withKey("k"));
+            // result(timeout) proves it completes (exceptionally) rather than hanging.
+            assertThatThrownBy(() -> handle.result(java.time.Duration.ofSeconds(5)))
+                    .hasMessageContaining("boom during setup");
         }
     }
 

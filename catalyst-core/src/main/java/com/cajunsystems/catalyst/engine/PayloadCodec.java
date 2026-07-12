@@ -71,6 +71,9 @@ public final class PayloadCodec {
         if (type.isRecord() || type.isEnum() || SAFE_TYPES.contains(type)) {
             return type;
         }
-        throw new IllegalStateException("Refusing to deserialize non-allowlisted payload type: " + typeName);
+        throw new IllegalStateException("Refusing to deserialize non-allowlisted payload type: " + typeName
+                + ". M0 payloads (tool outputs, effect values, memory values) must be a record, an enum,"
+                + " or a value type; collections/generics (e.g. List<T>, Map<K,V>) are not yet supported"
+                + " — wrap them in a record.");
     }
 }

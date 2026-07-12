@@ -10,6 +10,7 @@ import com.cajunsystems.catalyst.engine.BranchSpec;
 import com.cajunsystems.catalyst.engine.CostModel;
 import com.cajunsystems.catalyst.engine.ExecutionPausedSignal;
 import com.cajunsystems.catalyst.engine.ExecutionState;
+import com.cajunsystems.catalyst.engine.Hashing;
 import com.cajunsystems.catalyst.engine.InDoubtPolicy;
 import com.cajunsystems.catalyst.engine.NonDeterministicReplayException;
 import com.cajunsystems.catalyst.engine.PayloadCodec;
@@ -319,44 +320,68 @@ public final class CatalystRuntime implements AutoCloseable {
 
     private void createExecution(ExecutionId id, String taskType, String key, ExecutionOptions opts) {
         String configFingerprint = "replayMode=" + replayMode + ";inDoubt=" + inDoubtPolicy;
-        String argsHash = Integer.toHexString(opts.vars().hashCode());
-        log.append(id, new CatalystEvent.ExecutionCreated(now(), taskType, argsHash, configFingerprint, key));
+        log.append(id, new CatalystEvent.ExecutionCreated(now(), taskType, argsHash(opts.vars()), configFingerprint, key));
+    }
+
+    /**
+     * A stable content fingerprint of the task vars. Uses canonical JSON (keys are ordered by the
+     * shared mapper) hashed with SHA-256 — unlike {@code Map.hashCode()}, this is stable across JVMs
+     * and process restarts. Best-effort: unserializable vars fall back to a marker.
+     */
+    private String argsHash(Map<String, Object> vars) {
+        if (vars.isEmpty()) return "novars";
+        try {
+            return Hashing.sha256(eventMapper.valueToTree(vars).toString());
+        } catch (RuntimeException e) {
+            return "unhashable";
+        }
     }
 
     private <R> void runAttempt(Task<R> task, ExecutionId id, String taskType,
                                 ExecutionOptions opts, Mode mode, CompletableFuture<R> future) {
-        List<SequencedEvent> recorded = log.read(id);
-        ExecutionState state = Reducer.fold(id, recorded);
-        int attempt = state.attempt() + 1;
-        boolean appendEnabled = mode != Mode.REPLAY_TERMINAL;
-
-        switch (mode) {
-            case FRESH -> log.append(id, new CatalystEvent.ExecutionStarted(now(), attempt, nodeId));
-            case RESUME -> log.append(id, new CatalystEvent.ExecutionResumed(now(), attempt));
-            case REPLAY_TERMINAL -> { /* pure replay: no lifecycle events appended */ }
-        }
-
-        String effectiveTaskType = state.taskType() != null ? state.taskType() : taskType;
-        ExecutionInfo info = new ExecutionInfo(id, attempt, effectiveTaskType, opts.metadata());
-        Logger logger = LoggerFactory.getLogger("catalyst.exec." + id.value());
-
-        ReplayingContext ctx = new ReplayingContext(id, log, defaultModel, info, opts.vars(),
-                eventMapper, payloads, inDoubtPolicy, costModel, replayMode, null, clock, logger, recorded, appendEnabled);
-
+        // Everything is inside a try that always completes the future — including the setup below
+        // (log I/O, fold, lifecycle appends, context construction). If any of that throws, the caller
+        // must see the failure rather than block forever on handle.result().
         try {
-            R result = task.execute(ctx);
-            if (appendEnabled) {
-                log.append(id, new CatalystEvent.ExecutionCompleted(now(), payloads.toTree(result)));
+            List<SequencedEvent> recorded = log.read(id);
+            ExecutionState state = Reducer.fold(id, recorded);
+            int attempt = state.attempt() + 1;
+            boolean appendEnabled = mode != Mode.REPLAY_TERMINAL;
+
+            switch (mode) {
+                case FRESH -> log.append(id, new CatalystEvent.ExecutionStarted(now(), attempt, nodeId));
+                case RESUME -> log.append(id, new CatalystEvent.ExecutionResumed(now(), attempt));
+                case REPLAY_TERMINAL -> { /* pure replay: no lifecycle events appended */ }
             }
-            future.complete(result);
-        } catch (ExecutionPausedSignal pause) {
-            // ExecutionPaused already recorded by the context; leave the execution paused.
-            future.completeExceptionally(pause);
-        } catch (Throwable t) {
-            if (appendEnabled) {
-                log.append(id, new CatalystEvent.ExecutionFailed(now(), String.valueOf(t), log.latestSeq(id)));
+
+            String effectiveTaskType = state.taskType() != null ? state.taskType() : taskType;
+            ExecutionInfo info = new ExecutionInfo(id, attempt, effectiveTaskType, opts.metadata());
+            Logger logger = LoggerFactory.getLogger("catalyst.exec." + id.value());
+
+            ReplayingContext ctx = new ReplayingContext(id, log, defaultModel, info, opts.vars(),
+                    eventMapper, payloads, inDoubtPolicy, costModel, replayMode, null, clock, logger, recorded, appendEnabled);
+
+            try {
+                R result = task.execute(ctx);
+                if (appendEnabled) {
+                    log.append(id, new CatalystEvent.ExecutionCompleted(now(), payloads.toTree(result)));
+                }
+                future.complete(result);
+            } catch (ExecutionPausedSignal pause) {
+                // ExecutionPaused already recorded by the context; leave the execution paused.
+                future.completeExceptionally(pause);
+            } catch (Throwable t) {
+                if (appendEnabled) {
+                    try {
+                        log.append(id, new CatalystEvent.ExecutionFailed(now(), String.valueOf(t), log.latestSeq(id)));
+                    } catch (RuntimeException ignored) {
+                        // best-effort failure record; the future still completes exceptionally below
+                    }
+                }
+                future.completeExceptionally(t);
             }
-            future.completeExceptionally(t);
+        } catch (Throwable setupFailure) {
+            future.completeExceptionally(setupFailure);
         }
     }
 

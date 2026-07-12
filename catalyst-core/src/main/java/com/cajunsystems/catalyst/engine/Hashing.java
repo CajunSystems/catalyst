@@ -7,7 +7,6 @@ import com.cajunsystems.catalyst.model.ToolSpec;
 import java.nio.charset.StandardCharsets;
 import java.security.MessageDigest;
 import java.security.NoSuchAlgorithmException;
-import java.util.StringJoiner;
 
 /**
  * Canonical hashing for replay (spec §6). Hashes a <em>canonicalized</em> completion request —
@@ -20,17 +19,30 @@ public final class Hashing {
 
     private Hashing() {}
 
-    /** A stable hash of the canonical form of a completion request. */
+    /**
+     * A stable hash of the canonical form of a completion request. Fields are length-prefixed so the
+     * encoding is injective: no choice of message content can forge a delimiter and make two distinct
+     * requests hash the same (a plain newline/colon join could — e.g. content containing
+     * {@code "\nUSER:"}).
+     */
     public static String canonicalRequestHash(CompletionRequest request) {
-        StringJoiner sj = new StringJoiner("\n");
+        StringBuilder sb = new StringBuilder();
+        sb.append("msgs:").append(request.prompt().messages().size()).append('\n');
         for (Message m : request.prompt().messages()) {
-            sj.add(m.role().name() + ":" + m.content());
+            field(sb, m.role().name());
+            field(sb, m.content());
         }
-        sj.add("--tools--");
+        sb.append("tools:").append(request.tools().size()).append('\n');
         for (ToolSpec t : request.tools()) {
-            sj.add(t.name() + ":" + (t.inputSchema() == null ? "" : t.inputSchema()));
+            field(sb, t.name());
+            field(sb, t.inputSchema() == null ? "" : t.inputSchema());
         }
-        return sha256(sj.toString());
+        return sha256(sb.toString());
+    }
+
+    /** Appends a length-prefixed field: {@code <byteLength>:<value>\n}. */
+    private static void field(StringBuilder sb, String value) {
+        sb.append(value.getBytes(StandardCharsets.UTF_8).length).append(':').append(value).append('\n');
     }
 
     /**
