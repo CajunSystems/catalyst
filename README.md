@@ -191,6 +191,13 @@ The full v0.1 design lives in the project spec (Catalyst v0.1 Specification). Th
 implements all three v0.1 milestones — **M0** (execute + record + resume), **M1** (replay + inspect),
 and **M2** (branch + diff).
 
+## Roadmap
+
+v0.1 is complete. See [ROADMAP.md](ROADMAP.md) for what's next — v0.2 (snapshots, blob store,
+auto-capture agent, OTel/timeline observability, remaining built-in tools) and v1 (agents, the
+`WAITING`/signal APIs and human-in-the-loop via Boudin, distributed execution over a Gumbo cluster,
+and the replay-driven eval harness).
+
 ## License
 
 MIT — see [LICENSE](LICENSE).
