@@ -1,0 +1,164 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<project xmlns="http://maven.apache.org/POM/4.0.0"
+         xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance"
+         xsi:schemaLocation="http://maven.apache.org/POM/4.0.0 http://maven.apache.org/xsd/maven-4.0.0.xsd">
+    <modelVersion>4.0.0</modelVersion>
+
+    <groupId>com.cajunsystems</groupId>
+    <artifactId>catalyst-parent</artifactId>
+    <version>0.1.0-SNAPSHOT</version>
+    <packaging>pom</packaging>
+
+    <name>Catalyst</name>
+    <description>The Durable AI Execution Runtime for the JVM.</description>
+
+    <modules>
+        <module>catalyst-events</module>
+        <module>catalyst-core</module>
+        <module>catalyst-runtime</module>
+        <module>catalyst-gumbo</module>
+        <module>catalyst-tools</module>
+        <module>catalyst-langchain4j</module>
+        <module>catalyst-api</module>
+    </modules>
+
+    <properties>
+        <maven.compiler.release>21</maven.compiler.release>
+        <project.build.sourceEncoding>UTF-8</project.build.sourceEncoding>
+
+        <catalyst.version>0.1.0-SNAPSHOT</catalyst.version>
+        <jackson.version>2.17.2</jackson.version>
+        <slf4j.version>2.0.12</slf4j.version>
+        <gumbo.version>0.2.0</gumbo.version>
+        <langchain4j.version>1.8.0</langchain4j.version>
+
+        <junit.version>5.10.2</junit.version>
+        <assertj.version>3.25.3</assertj.version>
+    </properties>
+
+    <!--
+      Gumbo (com.cajunsystems:gumbo:0.2.0) is the durable log backend. The intended delivery was
+      JitPack, but jitpack.io is blocked by this environment's egress policy, so Gumbo is resolved
+      from the local Maven repository instead: build it once with
+          mvn -f /path/to/gumbo/pom.xml install -DskipTests
+      which installs com.cajunsystems:gumbo:0.2.0 into ~/.m2. Its own dependencies resolve from
+      Maven Central. No Gumbo source is vendored into this build.
+    -->
+
+    <dependencyManagement>
+        <dependencies>
+            <!-- Internal modules -->
+            <dependency>
+                <groupId>com.cajunsystems</groupId>
+                <artifactId>catalyst-events</artifactId>
+                <version>${catalyst.version}</version>
+            </dependency>
+            <dependency>
+                <groupId>com.cajunsystems</groupId>
+                <artifactId>catalyst-core</artifactId>
+                <version>${catalyst.version}</version>
+            </dependency>
+            <dependency>
+                <groupId>com.cajunsystems</groupId>
+                <artifactId>catalyst-runtime</artifactId>
+                <version>${catalyst.version}</version>
+            </dependency>
+            <dependency>
+                <groupId>com.cajunsystems</groupId>
+                <artifactId>catalyst-gumbo</artifactId>
+                <version>${catalyst.version}</version>
+            </dependency>
+            <dependency>
+                <groupId>com.cajunsystems</groupId>
+                <artifactId>catalyst-tools</artifactId>
+                <version>${catalyst.version}</version>
+            </dependency>
+
+            <!-- Third-party -->
+            <dependency>
+                <groupId>com.fasterxml.jackson</groupId>
+                <artifactId>jackson-bom</artifactId>
+                <version>${jackson.version}</version>
+                <type>pom</type>
+                <scope>import</scope>
+            </dependency>
+            <dependency>
+                <groupId>org.slf4j</groupId>
+                <artifactId>slf4j-api</artifactId>
+                <version>${slf4j.version}</version>
+            </dependency>
+            <dependency>
+                <groupId>org.slf4j</groupId>
+                <artifactId>slf4j-simple</artifactId>
+                <version>${slf4j.version}</version>
+            </dependency>
+            <dependency>
+                <groupId>dev.langchain4j</groupId>
+                <artifactId>langchain4j-core</artifactId>
+                <version>${langchain4j.version}</version>
+            </dependency>
+            <dependency>
+                <groupId>com.cajunsystems</groupId>
+                <artifactId>gumbo</artifactId>
+                <version>${gumbo.version}</version>
+                <exclusions>
+                    <!-- Stay logging-backend-neutral: don't force logback on Catalyst consumers.
+                         Gumbo logs via the SLF4J API; downstreams pick their own binding. -->
+                    <exclusion>
+                        <groupId>ch.qos.logback</groupId>
+                        <artifactId>logback-classic</artifactId>
+                    </exclusion>
+                </exclusions>
+            </dependency>
+
+            <!-- Test -->
+            <dependency>
+                <groupId>org.junit</groupId>
+                <artifactId>junit-bom</artifactId>
+                <version>${junit.version}</version>
+                <type>pom</type>
+                <scope>import</scope>
+            </dependency>
+            <dependency>
+                <groupId>org.assertj</groupId>
+                <artifactId>assertj-core</artifactId>
+                <version>${assertj.version}</version>
+            </dependency>
+        </dependencies>
+    </dependencyManagement>
+
+    <dependencies>
+        <dependency>
+            <groupId>org.junit.jupiter</groupId>
+            <artifactId>junit-jupiter</artifactId>
+            <scope>test</scope>
+        </dependency>
+        <dependency>
+            <groupId>org.assertj</groupId>
+            <artifactId>assertj-core</artifactId>
+            <scope>test</scope>
+        </dependency>
+        <dependency>
+            <groupId>org.slf4j</groupId>
+            <artifactId>slf4j-simple</artifactId>
+            <scope>test</scope>
+        </dependency>
+    </dependencies>
+
+    <build>
+        <pluginManagement>
+            <plugins>
+                <plugin>
+                    <groupId>org.apache.maven.plugins</groupId>
+                    <artifactId>maven-compiler-plugin</artifactId>
+                    <version>3.13.0</version>
+                </plugin>
+                <plugin>
+                    <groupId>org.apache.maven.plugins</groupId>
+                    <artifactId>maven-surefire-plugin</artifactId>
+                    <version>3.2.5</version>
+                </plugin>
+            </plugins>
+        </pluginManagement>
+    </build>
+</project>
