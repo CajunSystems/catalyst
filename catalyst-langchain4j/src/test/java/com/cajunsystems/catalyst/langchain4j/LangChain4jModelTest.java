@@ -3,7 +3,9 @@ package com.cajunsystems.catalyst.langchain4j;
 import com.cajunsystems.catalyst.model.Completion;
 import com.cajunsystems.catalyst.model.CompletionRequest;
 import com.cajunsystems.catalyst.model.Prompt;
+import com.cajunsystems.catalyst.model.ToolSpec;
 import com.cajunsystems.catalyst.model.Usage;
+import dev.langchain4j.agent.tool.ToolSpecification;
 import dev.langchain4j.data.message.AiMessage;
 import dev.langchain4j.data.message.SystemMessage;
 import dev.langchain4j.data.message.UserMessage;
@@ -60,6 +62,40 @@ class LangChain4jModelTest {
         assertThat(fake.received.messages()).hasSize(2);
         assertThat(fake.received.messages().get(0)).isInstanceOf(SystemMessage.class);
         assertThat(fake.received.messages().get(1)).isInstanceOf(UserMessage.class);
+    }
+
+    @Test
+    void forwardsToolSpecificationsToTheChatRequest() {
+        FakeChatModel fake = new FakeChatModel(ChatResponse.builder()
+                .aiMessage(AiMessage.from("ok")).build());
+
+        ToolSpec spec = new ToolSpec("calculator", "adds two numbers",
+                "{\"type\":\"object\",\"properties\":{"
+                        + "\"a\":{\"type\":\"integer\"},"
+                        + "\"b\":{\"type\":\"integer\",\"description\":\"the second number\"}},"
+                        + "\"required\":[\"a\",\"b\"]}");
+        CompletionRequest request = CompletionRequest.of(Prompt.builder().user("2 + 3").build())
+                .withTools(java.util.List.of(spec));
+
+        LangChain4jModel.of(fake).complete(request);
+
+        assertThat(fake.received.toolSpecifications()).hasSize(1);
+        ToolSpecification forwarded = fake.received.toolSpecifications().get(0);
+        assertThat(forwarded.name()).isEqualTo("calculator");
+        assertThat(forwarded.description()).isEqualTo("adds two numbers");
+        assertThat(forwarded.parameters()).isNotNull();
+        assertThat(forwarded.parameters().properties()).containsKeys("a", "b");
+        assertThat(forwarded.parameters().required()).contains("a", "b");
+    }
+
+    @Test
+    void noToolsLeavesToolSpecificationsUnset() {
+        FakeChatModel fake = new FakeChatModel(ChatResponse.builder()
+                .aiMessage(AiMessage.from("ok")).build());
+        LangChain4jModel.of(fake).complete(CompletionRequest.of(Prompt.builder().user("hi").build()));
+        // No tools requested → none forwarded (null or empty is acceptable).
+        assertThat(fake.received.toolSpecifications() == null || fake.received.toolSpecifications().isEmpty())
+                .isTrue();
     }
 
     @Test
