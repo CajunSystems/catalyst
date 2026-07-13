@@ -168,13 +168,21 @@ public final class CatalystRuntime implements AutoCloseable {
      * when no snapshot exists or the log does not persist them.
      */
     private ExecutionState foldState(ExecutionId id) {
-        Optional<Snapshot> snap = log.readSnapshot(id);
-        ReducerState base;
-        long fromExclusive;
-        if (snap.isPresent()) {
-            base = deserializeState(snap.get().state());
-            fromExclusive = snap.get().throughSeq();
-        } else {
+        ReducerState base = ReducerState.initial();
+        long fromExclusive = -1;
+        try {
+            Optional<Snapshot> snap = log.readSnapshot(id);
+            if (snap.isPresent()) {
+                base = deserializeState(snap.get().state());
+                fromExclusive = snap.get().throughSeq();
+            }
+        } catch (RuntimeException e) {
+            // A snapshot is a pure optimization: a corrupt or schema-incompatible one must never make an
+            // intact log inaccessible. Fall back to a full re-fold — exactly as if no snapshot existed —
+            // symmetric with maybeSnapshot's best-effort write. maybeSnapshot below then overwrites the
+            // bad checkpoint with a fresh, valid one, so the log self-heals.
+            LoggerFactory.getLogger("catalyst.snapshot")
+                    .warn("ignoring unreadable snapshot for {}, folding the full log: {}", id, e.toString());
             base = ReducerState.initial();
             fromExclusive = -1;
         }

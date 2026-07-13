@@ -283,6 +283,44 @@ class CatalystRuntimeTest {
     }
 
     @Test
+    void aCorruptSnapshotFallsBackToAFullFoldAndSelfHeals() {
+        // A log whose stored snapshot is garbage bytes: inspect must ignore it, fold the full log
+        // correctly, and overwrite the bad checkpoint with a valid one (self-heal).
+        InMemoryEventLog inner = new InMemoryEventLog();
+        boolean[] returnCorrupt = {true};
+        EventLog corrupting = new EventLog() {
+            @Override public long append(ExecutionId id, CatalystEvent e) { return inner.append(id, e); }
+            @Override public java.util.List<com.cajunsystems.catalyst.events.SequencedEvent> read(ExecutionId id) { return inner.read(id); }
+            @Override public java.util.List<com.cajunsystems.catalyst.events.SequencedEvent> readFrom(ExecutionId id, long after) { return inner.readFrom(id, after); }
+            @Override public long latestSeq(ExecutionId id) { return inner.latestSeq(id); }
+            @Override public java.util.Optional<ExecutionId> findByKey(String k) { return inner.findByKey(k); }
+            @Override public void putKey(String k, ExecutionId id) { inner.putKey(k, id); }
+            @Override public java.util.Optional<com.cajunsystems.catalyst.log.Snapshot> readSnapshot(ExecutionId id) {
+                if (returnCorrupt[0]) return java.util.Optional.of(new com.cajunsystems.catalyst.log.Snapshot(0, new byte[]{1, 2, 3}));
+                return inner.readSnapshot(id);
+            }
+            @Override public void writeSnapshot(ExecutionId id, com.cajunsystems.catalyst.log.Snapshot s) { inner.writeSnapshot(id, s); }
+            @Override public void close() { inner.close(); }
+        };
+
+        MockModel model = MockModel.alwaysReturn("pong");
+        try (CatalystRuntime runtime = CatalystRuntime.builder()
+                .log(corrupting).model(model).snapshotInterval(1).build()) {
+            ExecutionHandle<String> handle = runtime.execute(ONE_SHOT);
+            assertThat(handle.result()).isEqualTo("pong");
+            ExecutionId id = handle.id();
+
+            // inspect() sees the corrupt snapshot, must not throw, and folds the intact log correctly.
+            assertThat(runtime.inspect(id).status()).isEqualTo(Status.COMPLETED);
+
+            // A fresh, valid checkpoint was written over the corrupt one; a later read works normally.
+            returnCorrupt[0] = false;
+            assertThat(inner.readSnapshot(id)).isPresent();
+            assertThat(runtime.inspect(id).status()).isEqualTo(Status.COMPLETED);
+        }
+    }
+
+    @Test
     void serializerFactoryProducesUsableMapper() {
         assertThat(EventJson.newMapper()).isNotNull();
     }
