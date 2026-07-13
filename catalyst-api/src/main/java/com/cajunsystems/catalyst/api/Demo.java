@@ -223,8 +223,13 @@ public final class Demo {
             };
 
             try (CatalystRuntime runtime = Catalyst.builder().log(counting).snapshotInterval(100).build()) {
-                ExecutionId id = runtime.execute(counter, ExecutionOptions.withKey("count:1")).id();
-                int result = runtime.execute(counter, ExecutionOptions.withKey("count:1")).result();
+                // A single blocking run: a fresh execute folds via Reducer.fold and never calls
+                // foldState, so it deterministically writes no snapshot and the first inspect below is
+                // the genuine cold path. (Two idempotent execute() calls would race: if the first
+                // completed between them, the second would fold and pre-write a snapshot.)
+                ExecutionHandle<Integer> handle = runtime.execute(counter, ExecutionOptions.withKey("count:1"));
+                int result = handle.result();
+                ExecutionId id = handle.id();
                 long total = counting.read(id).size();
                 System.out.println("[snapshot] recorded execution " + id.value() + " -> " + result
                         + " (" + total + " events, snapshot interval 100)");

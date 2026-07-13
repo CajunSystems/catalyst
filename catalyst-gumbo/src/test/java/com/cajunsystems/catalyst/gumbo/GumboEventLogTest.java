@@ -70,6 +70,23 @@ class GumboEventLogTest {
     }
 
     @Test
+    void readFromOnAFileBackedLogReadsOnlyTheTailAcrossReopen(@TempDir Path dir) {
+        ExecutionId id = ExecutionId.random();
+        try (GumboEventLog log = GumboEventLog.at(dir)) {
+            for (int i = 0; i < 5; i++) {
+                log.append(id, new CatalystEvent.EffectRecorded(T, "e" + i, new TextNode("v" + i)));
+            }
+            assertThat(log.readFrom(id, 1)).extracting(SequencedEvent::seq).containsExactly(2L, 3L, 4L);
+        }
+        // Reopen with a cold cache so readFrom must go through Gumbo's native file-backed readAfter.
+        try (GumboEventLog reopened = GumboEventLog.at(dir)) {
+            assertThat(reopened.readFrom(id, 2)).extracting(SequencedEvent::seq).containsExactly(3L, 4L);
+            assertThat(reopened.readFrom(id, 4)).isEmpty();
+            assertThat(reopened.readFrom(id, -1)).hasSize(5);
+        }
+    }
+
+    @Test
     void snapshotRoundTripsAndSurvivesReopen(@TempDir Path dir) {
         ExecutionId id = ExecutionId.random();
         byte[] state = "folded-state-bytes".getBytes(StandardCharsets.UTF_8);
