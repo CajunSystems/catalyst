@@ -104,3 +104,22 @@ jobs:
           echo "$OUT" | grep -q "MODEL  CHANGED" \
             || { echo "FAIL: branch diff did not mark the model step changed"; exit 1; }
           echo "M2 exit criterion holds: branch with a swapped model produced a step-by-step diff."
+
+      # The v0.2 durability exit criterion (roadmap — Snapshots): a long execution is checkpointed so
+      # inspect/resume folds from the snapshot forward instead of re-folding the whole log, and the
+      # snapshot fold matches a full re-fold exactly.
+      - name: v0.2 Snapshot exit demo (fold from a checkpoint, not the whole log)
+        run: |
+          set -uo pipefail
+          CP="catalyst-api/target/classes:$(cat catalyst-api/target/cp.txt)"
+
+          echo "--- fold a long execution from a snapshot ---"
+          OUT="$(java -cp "$CP" com.cajunsystems.catalyst.api.Demo snapshot)"
+          echo "$OUT"
+          echo "$OUT" | grep -q "snapshot fold matches full fold: true" \
+            || { echo "FAIL: snapshot fold diverged from a full re-fold"; exit 1; }
+          COLD="$(echo "$OUT" | sed -n 's/.*cold inspect folded \([0-9]*\) events.*/\1/p')"
+          WARM="$(echo "$OUT" | sed -n 's/.*warm inspect folded \([0-9]*\) events.*/\1/p')"
+          [ -n "$COLD" ] && [ -n "$WARM" ] && [ "$WARM" -lt "$COLD" ] \
+            || { echo "FAIL: warm inspect did not fold fewer events than cold ($WARM vs $COLD)"; exit 1; }
+          echo "v0.2 Snapshot exit criterion holds: warm fold read $WARM events vs $COLD cold, results identical."

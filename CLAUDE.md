@@ -49,5 +49,9 @@ intended source, but if `jitpack.io` is blocked, install Gumbo locally first:
   calls, canonical hashes verified, and a divergent replay raising `NonDeterministicReplayException`.
 - **M2** — `M2BranchAcceptanceTest` + `Demo branch`: rerun a recorded execution with a different
   model from step N and diff the trajectories (only the post-branch step changes).
+- **v0.2 Snapshots** — `SnapshotAcceptanceTest` + `Demo snapshot`: a long execution is checkpointed so
+  `inspect` folds from the latest snapshot forward (warm inspect reads only the log tail, not the whole
+  log) and the snapshot fold matches a full re-fold exactly. The reducer is resumable via
+  `Reducer.foldFrom(ReducerState, events)`; the `EventLog` seam is `readFrom` + `readSnapshot`/`writeSnapshot`.
 
-CI (`.github/workflows/ci.yml`) runs all three exit demos as gates — it is the source of truth per phase.
+CI (`.github/workflows/ci.yml`) runs all four exit demos as gates — it is the source of truth per phase.

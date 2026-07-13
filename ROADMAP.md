@@ -29,9 +29,12 @@ CI runs all three exit demos as gates (`.github/workflows/ci.yml`).
 Production-readiness for the single-node runtime. No new top-level concepts; deepen what exists.
 
 ### Durability & storage (spec §8)
-- **Snapshots** — periodic fold checkpoints so long executions don't re-fold the whole log on
-  `inspect`/resume. `EventLog` gains a snapshot read/write seam; the reducer folds *from* the latest
-  snapshot forward.
+- ✅ **Snapshots** — periodic fold checkpoints so long executions don't re-fold the whole log on
+  `inspect`/resume. `EventLog` gained a snapshot read/write seam (`readSnapshot`/`writeSnapshot`) plus
+  a tail read (`readFrom`); the reducer is now resumable (`Reducer.foldFrom` over a serializable
+  `ReducerState`) and folds *from* the latest snapshot forward. The runtime checkpoints
+  opportunistically every `snapshotInterval` events (builder-configurable, default 100; `0` disables).
+  Gated by the v0.2 Snapshot exit demo in CI.
 - **Blob store** — content-addressed payloads > 64 KB referenced from events (completions and tool
   results can be megabytes). Lifts the current "everything inlined" limitation and unblocks large
   generic-collection / document payloads.

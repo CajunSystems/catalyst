@@ -22,19 +22,29 @@ public final class Reducer {
 
     /** Folds an execution's events into its current {@link ExecutionState}. */
     public static ExecutionState fold(ExecutionId id, List<SequencedEvent> events) {
-        Status status = Status.NEW;
-        String taskType = null;
-        String idempotencyKey = null;
-        int attempt = 0;
-        Instant startedAt = null;
-        Instant endedAt = null;
-        Cost cost = Cost.ZERO;
-        long totalLatencyMillis = 0;
-        com.fasterxml.jackson.databind.JsonNode result = null;
-        String error = null;
-        long lastSeq = -1;
-        int lastToolStepIndex = -1;
-        List<TimelineStep> timeline = new ArrayList<>();
+        return foldFrom(ReducerState.initial(), events).toExecutionState(id);
+    }
+
+    /**
+     * Continues a fold from a restored {@code base} accumulator (spec §8): applies {@code events} —
+     * which must be exactly the events with seq &gt; {@code base.lastSeq()} — and returns the new
+     * accumulator. {@code foldFrom(initial(), all)} equals a full {@link #fold}; restoring a snapshot
+     * and folding only the tail yields the identical result.
+     */
+    public static ReducerState foldFrom(ReducerState base, List<SequencedEvent> events) {
+        Status status = base.status();
+        String taskType = base.taskType();
+        String idempotencyKey = base.idempotencyKey();
+        int attempt = base.attempt();
+        Instant startedAt = base.startedAt();
+        Instant endedAt = base.endedAt();
+        Cost cost = base.cost();
+        long totalLatencyMillis = base.totalLatencyMillis();
+        com.fasterxml.jackson.databind.JsonNode result = base.result();
+        String error = base.error();
+        long lastSeq = base.lastSeq();
+        int lastToolStepIndex = base.lastToolStepIndex();
+        List<TimelineStep> timeline = new ArrayList<>(base.timeline());
 
         for (SequencedEvent se : events) {
             lastSeq = se.seq();
@@ -112,7 +122,7 @@ public final class Reducer {
             }
         }
 
-        return new ExecutionState(id, status, taskType, idempotencyKey, attempt, startedAt, endedAt,
-                cost, totalLatencyMillis, result, error, lastSeq, timeline);
+        return new ReducerState(status, taskType, idempotencyKey, attempt, startedAt, endedAt,
+                cost, totalLatencyMillis, result, error, lastSeq, lastToolStepIndex, timeline);
     }
 }
