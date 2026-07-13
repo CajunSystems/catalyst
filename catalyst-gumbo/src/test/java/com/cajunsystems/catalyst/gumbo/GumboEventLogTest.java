@@ -3,10 +3,12 @@ package com.cajunsystems.catalyst.gumbo;
 import com.cajunsystems.catalyst.ExecutionId;
 import com.cajunsystems.catalyst.events.CatalystEvent;
 import com.cajunsystems.catalyst.events.SequencedEvent;
+import com.cajunsystems.catalyst.log.Snapshot;
 import com.fasterxml.jackson.databind.node.TextNode;
 import org.junit.jupiter.api.Test;
 import org.junit.jupiter.api.io.TempDir;
 
+import java.nio.charset.StandardCharsets;
 import java.nio.file.Path;
 import java.time.Instant;
 import java.util.List;
@@ -50,6 +52,54 @@ class GumboEventLogTest {
             // Each execution's seq is dense from 0, independent of the other's interleaving.
             assertThat(log.read(a)).extracting(SequencedEvent::seq).containsExactly(0L, 1L);
             assertThat(log.read(b)).extracting(SequencedEvent::seq).containsExactly(0L);
+        }
+    }
+
+    @Test
+    void readFromReturnsOnlyEventsStrictlyAfterTheGivenSeq() {
+        try (GumboEventLog log = GumboEventLog.inMemory()) {
+            ExecutionId id = ExecutionId.random();
+            for (int i = 0; i < 5; i++) {
+                log.append(id, new CatalystEvent.EffectRecorded(T, "e" + i, new TextNode("v" + i)));
+            }
+            // Exclusive lower bound: readFrom(id, 1) must skip seq 0 and 1, returning 2,3,4.
+            assertThat(log.readFrom(id, 1)).extracting(SequencedEvent::seq).containsExactly(2L, 3L, 4L);
+            assertThat(log.readFrom(id, -1)).extracting(SequencedEvent::seq).containsExactly(0L, 1L, 2L, 3L, 4L);
+            assertThat(log.readFrom(id, 4)).isEmpty();
+        }
+    }
+
+    @Test
+    void readFromOnAFileBackedLogReadsOnlyTheTailAcrossReopen(@TempDir Path dir) {
+        ExecutionId id = ExecutionId.random();
+        try (GumboEventLog log = GumboEventLog.at(dir)) {
+            for (int i = 0; i < 5; i++) {
+                log.append(id, new CatalystEvent.EffectRecorded(T, "e" + i, new TextNode("v" + i)));
+            }
+            assertThat(log.readFrom(id, 1)).extracting(SequencedEvent::seq).containsExactly(2L, 3L, 4L);
+        }
+        // Reopen with a cold cache so readFrom must go through Gumbo's native file-backed readAfter.
+        try (GumboEventLog reopened = GumboEventLog.at(dir)) {
+            assertThat(reopened.readFrom(id, 2)).extracting(SequencedEvent::seq).containsExactly(3L, 4L);
+            assertThat(reopened.readFrom(id, 4)).isEmpty();
+            assertThat(reopened.readFrom(id, -1)).hasSize(5);
+        }
+    }
+
+    @Test
+    void snapshotRoundTripsAndSurvivesReopen(@TempDir Path dir) {
+        ExecutionId id = ExecutionId.random();
+        byte[] state = "folded-state-bytes".getBytes(StandardCharsets.UTF_8);
+        try (GumboEventLog log = GumboEventLog.at(dir)) {
+            assertThat(log.readSnapshot(id)).isEmpty();
+            log.writeSnapshot(id, new Snapshot(41, state));
+            log.writeSnapshot(id, new Snapshot(42, state)); // latest wins
+        }
+        try (GumboEventLog reopened = GumboEventLog.at(dir)) {
+            assertThat(reopened.readSnapshot(id)).hasValueSatisfying(s -> {
+                assertThat(s.throughSeq()).isEqualTo(42);
+                assertThat(s.state()).isEqualTo(state);
+            });
         }
     }
 

@@ -60,6 +60,41 @@ class ReducerTest {
         assertThat(state.error()).isEqualTo("boom");
     }
 
+    @Test
+    void foldFromSnapshotEqualsFullFoldAtEverySplit() {
+        Instant t = Instant.parse("2026-01-01T00:00:00Z");
+        // A stream whose tool request (seq 4) and its completion (seq 5) straddle any split taken
+        // between them — the case that exercises the open-tool-step carried on the accumulator.
+        List<SequencedEvent> events = seq(List.of(
+                new ExecutionCreated(t, "TaskA", "h", "cfg", "key-1"),
+                new ExecutionStarted(t, 1, "node-0"),
+                new CompletionRequested(t, "rq"),
+                new CompletionReceived(t, new TextNode("hi"), 10, 4, 25, 0.002, "stop"),
+                new ToolRequested(t, "calculator", new TextNode("1+1")),
+                new ToolCompleted(t, new TextNode("2"), null, 1),
+                new EffectRecorded(t, "now", new TextNode("2026")),
+                new ExecutionCompleted(t, new TextNode("done"))));
+
+        ExecutionState full = Reducer.fold(id, events);
+
+        // Splitting the fold at every boundary and continuing from the accumulator must reproduce the
+        // full fold exactly — this is the invariant snapshots rely on.
+        for (int split = 0; split <= events.size(); split++) {
+            ReducerState base = Reducer.foldFrom(ReducerState.initial(), events.subList(0, split));
+            ReducerState resumed = Reducer.foldFrom(base, events.subList(split, events.size()));
+            ExecutionState viaSplit = resumed.toExecutionState(id);
+
+            assertThat(viaSplit.status()).as("split@%d status", split).isEqualTo(full.status());
+            assertThat(viaSplit.lastSeq()).as("split@%d lastSeq", split).isEqualTo(full.lastSeq());
+            assertThat(viaSplit.cost()).as("split@%d cost", split).isEqualTo(full.cost());
+            assertThat(viaSplit.totalLatencyMillis()).as("split@%d latency", split)
+                    .isEqualTo(full.totalLatencyMillis());
+            assertThat(viaSplit.result()).as("split@%d result", split).isEqualTo(full.result());
+            assertThat(viaSplit.trajectory()).as("split@%d timeline", split)
+                    .isEqualTo(full.trajectory());
+        }
+    }
+
     private static List<SequencedEvent> seq(List<CatalystEvent> events) {
         List<SequencedEvent> out = new ArrayList<>();
         for (int i = 0; i < events.size(); i++) out.add(new SequencedEvent(i, events.get(i)));

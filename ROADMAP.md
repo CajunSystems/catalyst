@@ -28,10 +28,21 @@ CI runs all three exit demos as gates (`.github/workflows/ci.yml`).
 
 Production-readiness for the single-node runtime. No new top-level concepts; deepen what exists.
 
+**Delivery: small, independently-shippable increments.** Each item below lands as its own PR with its
+own tests (and an exit demo where it touches the engine), keeping the diff reviewable and CI green at
+every step. Snapshots was the first. Planned order of the remaining increments — most self-contained
+first: **① cancellation event → ② task registry / `resume(id)` → ③ built-in HTTP + Filesystem tools →
+④ generic-collection payloads → ⑤ blob store**, with schema evolution, retry semantics, the
+auto-capture agent, per-execution locking, streaming, and observability sequenced after. Order is a
+guide, not a contract — it flexes as we learn.
+
 ### Durability & storage (spec §8)
-- **Snapshots** — periodic fold checkpoints so long executions don't re-fold the whole log on
-  `inspect`/resume. `EventLog` gains a snapshot read/write seam; the reducer folds *from* the latest
-  snapshot forward.
+- ✅ **Snapshots** — periodic fold checkpoints so long executions don't re-fold the whole log on
+  `inspect`/resume. `EventLog` gained a snapshot read/write seam (`readSnapshot`/`writeSnapshot`) plus
+  a tail read (`readFrom`); the reducer is now resumable (`Reducer.foldFrom` over a serializable
+  `ReducerState`) and folds *from* the latest snapshot forward. The runtime checkpoints
+  opportunistically every `snapshotInterval` events (builder-configurable, default 100; `0` disables).
+  Gated by the v0.2 Snapshot exit demo in CI.
 - **Blob store** — content-addressed payloads > 64 KB referenced from events (completions and tool
   results can be megabytes). Lifts the current "everything inlined" limitation and unblocks large
   generic-collection / document payloads.
@@ -50,12 +61,12 @@ Production-readiness for the single-node runtime. No new top-level concepts; dee
   counter, already in the schema) vs. child execution, and wire a retry policy.
 
 ### Runtime ergonomics & scale
-- **Standalone `resume(id)` / task registry** — today resume is driven by re-submitting the task
+- 🔜 **Dedicated cancellation event** (①, open question §13, review follow-up) — add
+  `ExecutionCancelled` so `cancel()` folds to `CANCELLED` instead of `FAILED`; wire cooperative
+  cancellation of a running task (ties into `WAITING`). *Next increment.*
+- **Standalone `resume(id)` / task registry** (②) — today resume is driven by re-submitting the task
   with its key; a task-type registry makes `runtime.resume(id)` work without the caller holding the
   `Task`.
-- **Dedicated cancellation event** (open question §13, review follow-up) — add `ExecutionCancelled`
-  so `cancel()` folds to `CANCELLED` instead of `FAILED`; wire cooperative cancellation of a running
-  task (ties into `WAITING`).
 - **Per-execution locking** — replace the single coarse `synchronized execute` lock with per-id
   coordination to lift the throughput ceiling under concurrent load.
 - **Remaining built-in tools** — `HttpTool` and `FilesystemTool` (sandboxed to a root dir), per spec

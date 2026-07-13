@@ -67,6 +67,8 @@ public final class Demo {
             replayDemo(Files.createTempDirectory("catalyst-replay-"));
         } else if (args.length >= 1 && args[0].equals("branch")) {
             branchDemo(Files.createTempDirectory("catalyst-branch-"));
+        } else if (args.length >= 1 && args[0].equals("snapshot")) {
+            snapshotDemo(Files.createTempDirectory("catalyst-snapshot-"));
         } else {
             Path dir = Files.createTempDirectory("catalyst-demo-");
             System.out.println("No args: running record + resume in-process under " + dir);
@@ -182,6 +184,76 @@ public final class Demo {
                     + " (model swapped from step at seq " + step1Seq + ")");
             System.out.println("[branch] diff (" + diff.changedCount() + " step(s) changed):");
             System.out.print(diff.pretty());
+        }
+    }
+
+    /**
+     * The v0.2 durability exit demo (roadmap — Snapshots): record a long execution, then show that
+     * {@code inspect} folds from a checkpoint instead of re-folding the whole log, and that the
+     * snapshot fold matches a full re-fold exactly.
+     */
+    private static void snapshotDemo(Path dir) {
+        final int steps = 250;
+        Task<Integer> counter = ctx -> {
+            int sum = 0;
+            for (int i = 0; i < steps; i++) {
+                final int step = i;
+                sum += ctx.effect("step-" + step, () -> step);
+            }
+            return sum;
+        };
+
+        // A tiny counting wrapper so the demo can report how many events each fold reads.
+        long[] readFromEvents = {0};
+        try (GumboEventLog inner = GumboEventLog.at(dir)) {
+            com.cajunsystems.catalyst.log.EventLog counting = new com.cajunsystems.catalyst.log.EventLog() {
+                @Override public long append(ExecutionId id, CatalystEvent e) { return inner.append(id, e); }
+                @Override public java.util.List<com.cajunsystems.catalyst.events.SequencedEvent> read(ExecutionId id) { return inner.read(id); }
+                @Override public java.util.List<com.cajunsystems.catalyst.events.SequencedEvent> readFrom(ExecutionId id, long after) {
+                    var tail = inner.readFrom(id, after);
+                    readFromEvents[0] += tail.size();
+                    return tail;
+                }
+                @Override public long latestSeq(ExecutionId id) { return inner.latestSeq(id); }
+                @Override public java.util.Optional<ExecutionId> findByKey(String k) { return inner.findByKey(k); }
+                @Override public void putKey(String k, ExecutionId id) { inner.putKey(k, id); }
+                @Override public java.util.Optional<com.cajunsystems.catalyst.log.Snapshot> readSnapshot(ExecutionId id) { return inner.readSnapshot(id); }
+                @Override public void writeSnapshot(ExecutionId id, com.cajunsystems.catalyst.log.Snapshot s) { inner.writeSnapshot(id, s); }
+                @Override public void close() { /* inner closed by try-with-resources */ }
+            };
+
+            try (CatalystRuntime runtime = Catalyst.builder().log(counting).snapshotInterval(100).build()) {
+                // A single blocking run: a fresh execute folds via Reducer.fold and never calls
+                // foldState, so it deterministically writes no snapshot and the first inspect below is
+                // the genuine cold path. (Two idempotent execute() calls would race: if the first
+                // completed between them, the second would fold and pre-write a snapshot.)
+                ExecutionHandle<Integer> handle = runtime.execute(counter, ExecutionOptions.withKey("count:1"));
+                int result = handle.result();
+                ExecutionId id = handle.id();
+                long total = counting.read(id).size();
+                System.out.println("[snapshot] recorded execution " + id.value() + " -> " + result
+                        + " (" + total + " events, snapshot interval 100)");
+
+                readFromEvents[0] = 0;
+                ExecutionState cold = runtime.inspect(id); // no snapshot yet: folds the whole log, writes one
+                long coldFolded = readFromEvents[0];
+
+                readFromEvents[0] = 0;
+                ExecutionState warm = runtime.inspect(id); // restores the snapshot, folds only the tail
+                long warmFolded = readFromEvents[0];
+
+                ExecutionState fullRefold = com.cajunsystems.catalyst.engine.Reducer.fold(id, counting.read(id));
+                boolean matches = warm.status() == fullRefold.status()
+                        && warm.lastSeq() == fullRefold.lastSeq()
+                        && warm.trajectory().equals(fullRefold.trajectory());
+
+                System.out.println("[snapshot] cold inspect folded " + coldFolded + " events");
+                System.out.println("[snapshot] warm inspect folded " + warmFolded + " events (from snapshot)");
+                System.out.println("[snapshot] snapshot fold matches full fold: " + matches);
+                if (warmFolded >= coldFolded) throw new AssertionError("warm fold did not use the snapshot");
+                if (!matches) throw new AssertionError("snapshot fold diverged from full fold");
+                System.out.println("[snapshot] cold=" + cold.status() + " warm=" + warm.status());
+            }
         }
     }
 

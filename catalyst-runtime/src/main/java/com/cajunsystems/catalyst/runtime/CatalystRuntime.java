@@ -16,6 +16,7 @@ import com.cajunsystems.catalyst.engine.InDoubtPolicy;
 import com.cajunsystems.catalyst.engine.NonDeterministicReplayException;
 import com.cajunsystems.catalyst.engine.PayloadCodec;
 import com.cajunsystems.catalyst.engine.Reducer;
+import com.cajunsystems.catalyst.engine.ReducerState;
 import com.cajunsystems.catalyst.engine.ReplayingContext;
 import com.cajunsystems.catalyst.engine.TimelineStep;
 import com.cajunsystems.catalyst.engine.Trajectory;
@@ -23,7 +24,9 @@ import com.cajunsystems.catalyst.events.CatalystEvent;
 import com.cajunsystems.catalyst.events.EventJson;
 import com.cajunsystems.catalyst.events.SequencedEvent;
 import com.cajunsystems.catalyst.log.EventLog;
+import com.cajunsystems.catalyst.log.Snapshot;
 import com.cajunsystems.catalyst.model.Model;
+import com.fasterxml.jackson.core.JsonProcessingException;
 import com.fasterxml.jackson.databind.JsonNode;
 import com.fasterxml.jackson.databind.ObjectMapper;
 import org.slf4j.Logger;
@@ -58,6 +61,7 @@ public final class CatalystRuntime implements AutoCloseable {
     private final ObjectMapper eventMapper;
     private final PayloadCodec payloads;
     private final String nodeId;
+    private final long snapshotInterval;
     private final ExecutorService executor;
 
     /**
@@ -79,6 +83,7 @@ public final class CatalystRuntime implements AutoCloseable {
         this.eventMapper = b.eventMapper;
         this.payloads = new PayloadCodec();
         this.nodeId = b.nodeId;
+        this.snapshotInterval = b.snapshotInterval;
         this.executor = Executors.newThreadPerTaskExecutor(
                 Thread.ofVirtual().name("catalyst-exec-", 0).factory());
     }
@@ -106,7 +111,7 @@ public final class CatalystRuntime implements AutoCloseable {
                 if (running != null) {
                     return new FutureExecutionHandle<>(id, cast(running));
                 }
-                ExecutionState state = Reducer.fold(id, log.read(id));
+                ExecutionState state = foldState(id);
                 mode = state.isTerminal() ? Mode.REPLAY_TERMINAL : Mode.RESUME;
             } else {
                 id = ExecutionId.random();
@@ -147,9 +152,75 @@ public final class CatalystRuntime implements AutoCloseable {
         return execute(task, opts).result();
     }
 
-    /** Folded state plus the typed timeline for an execution. */
+    /**
+     * Folded state plus the typed timeline for an execution. Restores the latest snapshot (if any)
+     * and folds only the events after it, so {@code inspect} on a long execution does not re-fold the
+     * whole log (spec §8). Opportunistically writes a fresh snapshot once enough new events have
+     * accumulated since the last one.
+     */
     public ExecutionState inspect(ExecutionId id) {
-        return Reducer.fold(id, log.read(id));
+        return foldState(id);
+    }
+
+    /**
+     * The snapshot-aware fold used everywhere state is derived: read the latest checkpoint, fold the
+     * log's tail from it, and checkpoint again if the interval has elapsed. Falls back to a full fold
+     * when no snapshot exists or the log does not persist them.
+     */
+    private ExecutionState foldState(ExecutionId id) {
+        ReducerState base = ReducerState.initial();
+        long fromExclusive = -1;
+        try {
+            Optional<Snapshot> snap = log.readSnapshot(id);
+            if (snap.isPresent()) {
+                base = deserializeState(snap.get().state());
+                fromExclusive = snap.get().throughSeq();
+            }
+        } catch (RuntimeException e) {
+            // A snapshot is a pure optimization: a corrupt or schema-incompatible one must never make an
+            // intact log inaccessible. Fall back to a full re-fold — exactly as if no snapshot existed —
+            // symmetric with maybeSnapshot's best-effort write. maybeSnapshot below then overwrites the
+            // bad checkpoint with a fresh, valid one, so the log self-heals.
+            LoggerFactory.getLogger("catalyst.snapshot")
+                    .warn("ignoring unreadable snapshot for {}, folding the full log: {}", id, e.toString());
+            base = ReducerState.initial();
+            fromExclusive = -1;
+        }
+        ReducerState folded = Reducer.foldFrom(base, log.readFrom(id, fromExclusive));
+        maybeSnapshot(id, folded, fromExclusive);
+        return folded.toExecutionState(id);
+    }
+
+    /**
+     * Persists a fresh checkpoint when at least {@code snapshotInterval} events have been folded since
+     * the checkpoint we restored from ({@code sinceSeqExclusive}). A no-op when snapshots are disabled
+     * ({@code snapshotInterval <= 0}) or nothing new has accumulated. Best-effort: a failed write only
+     * costs a future re-fold, so it never fails the caller.
+     */
+    private void maybeSnapshot(ExecutionId id, ReducerState folded, long sinceSeqExclusive) {
+        if (snapshotInterval <= 0) return;
+        if (folded.lastSeq() - sinceSeqExclusive < snapshotInterval) return;
+        try {
+            log.writeSnapshot(id, new Snapshot(folded.lastSeq(), serializeState(folded)));
+        } catch (RuntimeException e) {
+            LoggerFactory.getLogger("catalyst.snapshot").debug("snapshot write failed for {}: {}", id, e.toString());
+        }
+    }
+
+    private byte[] serializeState(ReducerState state) {
+        try {
+            return eventMapper.writeValueAsBytes(state);
+        } catch (JsonProcessingException e) {
+            throw new IllegalStateException("Failed to serialize reducer snapshot", e);
+        }
+    }
+
+    private ReducerState deserializeState(byte[] bytes) {
+        try {
+            return eventMapper.readValue(bytes, ReducerState.class);
+        } catch (java.io.IOException e) {
+            throw new IllegalStateException("Failed to deserialize reducer snapshot", e);
+        }
     }
 
     /**
@@ -425,6 +496,7 @@ public final class CatalystRuntime implements AutoCloseable {
         private CostModel costModel = CostModel.free();
         private ObjectMapper eventMapper = EventJson.shared();
         private String nodeId = "node-0";
+        private long snapshotInterval = 100;
 
         public Builder log(EventLog log) {
             this.log = log;
@@ -464,6 +536,16 @@ public final class CatalystRuntime implements AutoCloseable {
 
         public Builder nodeId(String nodeId) {
             this.nodeId = nodeId;
+            return this;
+        }
+
+        /**
+         * How many new events may accumulate before {@code inspect}/resume writes a fresh fold
+         * checkpoint (spec §8). A checkpoint lets later folds skip the events before it. Default 100;
+         * {@code 0} (or negative) disables snapshotting and always folds the full log.
+         */
+        public Builder snapshotInterval(long snapshotInterval) {
+            this.snapshotInterval = snapshotInterval;
             return this;
         }
 

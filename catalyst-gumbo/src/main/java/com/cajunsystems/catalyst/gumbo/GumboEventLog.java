@@ -5,6 +5,7 @@ import com.cajunsystems.catalyst.events.CatalystEvent;
 import com.cajunsystems.catalyst.events.EventCodec;
 import com.cajunsystems.catalyst.events.SequencedEvent;
 import com.cajunsystems.catalyst.log.EventLog;
+import com.cajunsystems.catalyst.log.Snapshot;
 import com.cajunsystems.gumbo.api.LogView;
 import com.cajunsystems.gumbo.api.TypedLogView;
 import com.cajunsystems.gumbo.core.LogEntry;
@@ -17,6 +18,7 @@ import com.cajunsystems.gumbo.service.SharedLogService;
 
 import java.io.IOException;
 import java.io.UncheckedIOException;
+import java.nio.ByteBuffer;
 import java.nio.charset.StandardCharsets;
 import java.nio.file.Path;
 import java.util.ArrayList;
@@ -37,6 +39,7 @@ public final class GumboEventLog implements EventLog {
 
     private static final String EXEC_NAMESPACE = "catalyst-exec";
     private static final LogTag INDEX_TAG = LogTag.of("catalyst-index", "keys");
+    private static final LogTag SNAPSHOT_TAG = LogTag.of("catalyst-index", "snapshots");
 
     private final SharedLogService service;
     private final EventLogSerializer serializer;
@@ -44,11 +47,13 @@ public final class GumboEventLog implements EventLog {
     /** Cache of the last seq (Gumbo localId) per execution, so latestSeq is O(1) after an append. */
     private final Map<ExecutionId, Long> lastSeq = new ConcurrentHashMap<>();
     private final LogView indexView;
+    private final LogView snapshotView;
 
     private GumboEventLog(SharedLogService service) {
         this.service = service;
         this.serializer = new EventLogSerializer(new EventCodec());
         this.indexView = service.getView(INDEX_TAG);
+        this.snapshotView = service.getView(SNAPSHOT_TAG);
     }
 
     /** Opens (or creates) an embedded, file-backed durable log rooted at {@code path}. */
@@ -95,6 +100,19 @@ public final class GumboEventLog implements EventLog {
     }
 
     @Override
+    public List<SequencedEvent> readFrom(ExecutionId executionId, long afterSeqExclusive) {
+        if (afterSeqExclusive < 0) return read(executionId);
+        // Gumbo localId == Catalyst seq; readAfter returns entries strictly greater than the argument,
+        // so the durable log reads only the tail rather than the whole stream.
+        List<LogEntry> entries = viewFor(executionId).rawView().readAfter(afterSeqExclusive).join();
+        List<SequencedEvent> events = new ArrayList<>(entries.size());
+        for (LogEntry entry : entries) {
+            events.add(new SequencedEvent(entry.localId(), serializer.deserialize(entry.dataUnsafe())));
+        }
+        return events;
+    }
+
+    @Override
     public long latestSeq(ExecutionId executionId) {
         Long cached = lastSeq.get(executionId);
         if (cached != null) return cached;
@@ -116,6 +134,28 @@ public final class GumboEventLog implements EventLog {
     @Override
     public void putKey(String idempotencyKey, ExecutionId executionId) {
         indexView.setValue(idempotencyKey, executionId.value().getBytes(StandardCharsets.UTF_8)).join();
+    }
+
+    @Override
+    public Optional<Snapshot> readSnapshot(ExecutionId executionId) {
+        byte[] framed = snapshotView.getValue(executionId.value()).join();
+        if (framed == null || framed.length < Long.BYTES) return Optional.empty();
+        ByteBuffer buf = ByteBuffer.wrap(framed);
+        long throughSeq = buf.getLong();
+        byte[] state = new byte[buf.remaining()];
+        buf.get(state);
+        return Optional.of(new Snapshot(throughSeq, state));
+    }
+
+    @Override
+    public void writeSnapshot(ExecutionId executionId, Snapshot snapshot) {
+        byte[] state = snapshot.state();
+        // Frame as [8-byte throughSeq][state]; the snapshot KV holds one entry per execution.
+        byte[] framed = ByteBuffer.allocate(Long.BYTES + state.length)
+                .putLong(snapshot.throughSeq())
+                .put(state)
+                .array();
+        snapshotView.setValue(executionId.value(), framed).join();
     }
 
     @Override
