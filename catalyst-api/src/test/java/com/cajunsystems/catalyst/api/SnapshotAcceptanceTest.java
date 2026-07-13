@@ -50,11 +50,14 @@ class SnapshotAcceptanceTest {
                 .snapshotInterval(100)
                 .build()) {
 
-            // Record a long execution to completion. Fresh runs never touch the snapshot machinery.
-            ExecutionId id = runtime.execute(COUNTER, ExecutionOptions.withKey("count:1")).id();
-            int result = runtime.execute(COUNTER, ExecutionOptions.withKey("count:1")).result();
+            // Record a long execution to completion with a single blocking run. A fresh execute folds
+            // via Reducer.fold directly and never calls foldState, so it deterministically writes no
+            // snapshot — the first inspect below is the genuine cold path.
+            var handle = runtime.execute(COUNTER, ExecutionOptions.withKey("count:1"));
+            int result = handle.result();
+            ExecutionId id = handle.id();
             assertThat(result).isEqualTo(STEPS * (STEPS - 1) / 2);
-            assertThat(log.readSnapshot(id)).as("no snapshot before first inspect").isEmpty();
+            assertThat(log.readSnapshot(id)).as("a fresh recording run writes no snapshot").isEmpty();
 
             long totalEvents = log.read(id).size();
             assertThat(totalEvents).isGreaterThan(STEPS); // effects + lifecycle
@@ -96,8 +99,9 @@ class SnapshotAcceptanceTest {
                 .snapshotInterval(0) // disabled
                 .build()) {
 
-            ExecutionId id = runtime.execute(COUNTER, ExecutionOptions.withKey("count:2")).id();
-            runtime.execute(COUNTER, ExecutionOptions.withKey("count:2")).result();
+            var handle = runtime.execute(COUNTER, ExecutionOptions.withKey("count:2"));
+            handle.result();
+            ExecutionId id = handle.id();
 
             runtime.inspect(id);
             assertThat(log.readSnapshot(id)).as("no snapshot when disabled").isEmpty();

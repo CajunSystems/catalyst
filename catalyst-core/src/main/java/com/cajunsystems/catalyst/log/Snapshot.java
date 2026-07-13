@@ -1,5 +1,7 @@
 package com.cajunsystems.catalyst.log;
 
+import java.util.Arrays;
+
 /**
  * A durable fold checkpoint (spec §8): the reducer's accumulated state through {@code throughSeq},
  * serialized to opaque bytes owned by the runtime. On {@code inspect}/resume the runtime restores a
@@ -20,5 +22,25 @@ public record Snapshot(long throughSeq, byte[] state) {
     @Override
     public byte[] state() {
         return state.clone();
+    }
+
+    // A record's generated equals/hashCode compare byte[] by identity; make Snapshot a proper value
+    // type so two snapshots with the same seq and content are equal (and safe to use in collections).
+
+    @Override
+    public boolean equals(Object o) {
+        return o instanceof Snapshot other
+                && throughSeq == other.throughSeq
+                && Arrays.equals(state, other.state);
+    }
+
+    @Override
+    public int hashCode() {
+        return 31 * Long.hashCode(throughSeq) + Arrays.hashCode(state);
+    }
+
+    @Override
+    public String toString() {
+        return "Snapshot[throughSeq=" + throughSeq + ", state=" + state.length + " bytes]";
     }
 }
