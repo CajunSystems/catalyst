@@ -54,6 +54,32 @@ class HttpToolTest {
     }
 
     @Test
+    void defaultPolicyBlocksLoopbackPrivateAndMetadataTargets() {
+        HttpTool http = new HttpTool(); // default sender, block-private-networks policy
+
+        // The policy rejects before any connection is attempted, so these run offline.
+        assertThatThrownBy(() -> http.apply(HttpTool.Request.get("http://127.0.0.1:1/x")))
+                .isInstanceOf(java.io.IOException.class)
+                .hasMessageContaining("non-public");
+        assertThatThrownBy(() -> http.apply(HttpTool.Request.get("http://169.254.169.254/latest/meta-data/")))
+                .isInstanceOf(java.io.IOException.class)
+                .hasMessageContaining("non-public");
+        assertThatThrownBy(() -> http.apply(HttpTool.Request.get("http://localhost:1/x")))
+                .isInstanceOf(java.io.IOException.class);
+    }
+
+    @Test
+    void aCustomPolicyCanPermitAnAddress() {
+        // allowAll would reach the network; instead assert the seam is honored by a policy that throws
+        // a distinctive error for every target, proving apply() routes through the configured policy.
+        HttpTool http = new HttpTool(java.time.Duration.ofSeconds(1),
+                (uri, address) -> { throw new java.io.IOException("policy: " + uri.getHost()); });
+        assertThatThrownBy(() -> http.apply(HttpTool.Request.get("http://127.0.0.1:1/x")))
+                .isInstanceOf(java.io.IOException.class)
+                .hasMessageContaining("policy: 127.0.0.1");
+    }
+
+    @Test
     void surfacesSenderFailures() {
         HttpTool http = new HttpTool(req -> { throw new java.io.IOException("connection refused"); });
         assertThatThrownBy(() -> http.apply(HttpTool.Request.get("http://localhost:1/x")))

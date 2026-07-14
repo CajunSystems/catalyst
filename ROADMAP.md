@@ -83,8 +83,11 @@ generic-collection payloads (④) are next.
 - **Per-execution locking** — replace the single coarse `synchronized execute` lock with per-id
   coordination to lift the throughput ceiling under concurrent load.
 - ✅ **Remaining built-in tools** (③) — `HttpTool` (pluggable `Sender` seam; default wraps
-  `java.net.http.HttpClient`, tests run offline) and `FilesystemTool` (sandboxed to a root dir;
-  rejects `..`, absolute, and symlink escapes). Both are non-deterministic recorded boundaries: a
+  `java.net.http.HttpClient`, tests run offline; safe-by-default `TargetPolicy` blocks
+  loopback/link-local/private/metadata targets and re-validates every redirect hop, with
+  `allowAll()`/custom opt-outs) and `FilesystemTool` (sandboxed to a root dir; rejects `..`, absolute,
+  and symlink escapes, and opens final components `NOFOLLOW`). Both are non-deterministic recorded
+  boundaries: a
   strict replay substitutes them, re-issuing no request and re-applying no write. Outputs are flat
   records (full header maps / structured listings await ④); large bodies inline until the blob store
   (⑤). Gated by the v0.2 Built-in-tools exit demo in CI. (`ShellTool` stays excluded until there's a

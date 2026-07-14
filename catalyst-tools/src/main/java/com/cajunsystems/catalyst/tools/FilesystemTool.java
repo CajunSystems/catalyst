@@ -8,6 +8,7 @@ import java.nio.charset.StandardCharsets;
 import java.nio.file.Files;
 import java.nio.file.LinkOption;
 import java.nio.file.Path;
+import java.nio.file.StandardOpenOption;
 import java.util.stream.Stream;
 
 /**
@@ -20,6 +21,14 @@ import java.util.stream.Stream;
  * state of the filesystem when it ran, and a write/delete is a side effect. Invoked through
  * {@code ctx.call(tool, cmd)} the result is recorded once and substituted on replay — so a resumed or
  * replayed execution never re-reads changed bytes and never re-applies a write it already performed.
+ *
+ * <p>Reads and writes open the target with {@link LinkOption#NOFOLLOW_LINKS}, so a symlink swapped in
+ * for the final path component is rejected atomically at open — not followed. The escape checks and
+ * the operations still race on <em>intermediate</em> directories: an adversary who can write into the
+ * sandbox tree concurrently could swap a checked directory for a symlink between the check and the
+ * operation (a TOCTOU that pure NIO cannot fully close without {@code openat}). That is outside this
+ * tool's threat model — it guards a task's own paths, not a concurrent local attacker who already has
+ * write access to the root.
  *
  * <p>Payload note: {@link Action#LIST} returns its entries as a newline-joined string (with the count
  * in {@code size}) because generic-collection payloads are a later increment (roadmap ④). Bodies are
@@ -100,12 +109,15 @@ public final class FilesystemTool implements Tool<FilesystemTool.Command, Filesy
     }
 
     private Result read(Path target, String rel) throws IOException {
-        if (!Files.isRegularFile(target)) {
+        if (!Files.isRegularFile(target, LinkOption.NOFOLLOW_LINKS)) {
             throw new IOException("Not a regular file: " + rel);
         }
-        String content = Files.readString(target, StandardCharsets.UTF_8);
-        return new Result(Action.READ, rel, true, content,
-                content.getBytes(StandardCharsets.UTF_8).length, true);
+        // NOFOLLOW at open: a symlink swapped in for the final component is rejected, not followed.
+        byte[] bytes;
+        try (var in = Files.newInputStream(target, LinkOption.NOFOLLOW_LINKS)) {
+            bytes = in.readAllBytes();
+        }
+        return new Result(Action.READ, rel, true, new String(bytes, StandardCharsets.UTF_8), bytes.length, true);
     }
 
     private Result write(Path target, String rel, String content) throws IOException {
@@ -113,12 +125,16 @@ public final class FilesystemTool implements Tool<FilesystemTool.Command, Filesy
         Path parent = target.getParent();
         if (parent != null) Files.createDirectories(parent);
         byte[] bytes = body.getBytes(StandardCharsets.UTF_8);
-        Files.write(target, bytes);
+        // NOFOLLOW so an existing symlink at the target is not followed out of the sandbox.
+        try (var out = Files.newOutputStream(target, StandardOpenOption.CREATE,
+                StandardOpenOption.WRITE, StandardOpenOption.TRUNCATE_EXISTING, LinkOption.NOFOLLOW_LINKS)) {
+            out.write(bytes);
+        }
         return new Result(Action.WRITE, rel, true, null, bytes.length, true);
     }
 
     private Result list(Path target, String rel) throws IOException {
-        if (!Files.isDirectory(target)) {
+        if (Files.isSymbolicLink(target) || !Files.isDirectory(target, LinkOption.NOFOLLOW_LINKS)) {
             throw new IOException("Not a directory: " + rel);
         }
         try (Stream<Path> entries = Files.list(target)) {
