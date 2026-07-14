@@ -1,5 +1,6 @@
 package com.cajunsystems.catalyst.api;
 
+import com.cajunsystems.catalyst.Context;
 import com.cajunsystems.catalyst.ExecutionId;
 import com.cajunsystems.catalyst.ExecutionInfo;
 import com.cajunsystems.catalyst.ExecutionOptions;
@@ -56,6 +57,20 @@ public final class Demo {
         return summary + "|" + finalAnswer;
     };
 
+    /**
+     * The same two-step task as a <em>named</em> class. A lambda's synthetic class name is not stable
+     * across processes, but a named class records a fixed {@code taskType} — so a {@link
+     * com.cajunsystems.catalyst.TaskRegistry} can reconstruct it and drive {@code resume(id)} from the
+     * log alone.
+     */
+    static final class TwoStepTask implements Task<String> {
+        @Override public String execute(Context ctx) throws Exception {
+            String summary = ctx.model().complete(STEP1).message();
+            String finalAnswer = ctx.model().complete(STEP2).message();
+            return summary + "|" + finalAnswer;
+        }
+    }
+
     public static void main(String[] args) throws Exception {
         if (args.length >= 2 && args[1].equals("record")) {
             record(Path.of(args[0]));
@@ -71,6 +86,8 @@ public final class Demo {
             snapshotDemo(Files.createTempDirectory("catalyst-snapshot-"));
         } else if (args.length >= 1 && args[0].equals("cancel")) {
             cancelDemo(Files.createTempDirectory("catalyst-cancel-"));
+        } else if (args.length >= 1 && args[0].equals("resumeid")) {
+            resumeByIdDemo(Files.createTempDirectory("catalyst-resumeid-"));
         } else {
             Path dir = Files.createTempDirectory("catalyst-demo-");
             System.out.println("No args: running record + resume in-process under " + dir);
@@ -309,6 +326,60 @@ public final class Demo {
             if (model.callCount() != 1) {
                 throw new AssertionError("expected exactly 1 model call, got " + model.callCount());
             }
+        }
+    }
+
+    /**
+     * The v0.2 resume-by-id exit demo (roadmap increment ②): durably record a task's first step, then
+     * recover it <em>from its id alone</em> — no idempotency key, no re-submitting the task instance.
+     * The runtime reconstructs the task from its recorded type via the {@code TaskRegistry}, substitutes
+     * step 1 from the log, and runs only step 2 live (zero duplicate model calls).
+     */
+    private static void resumeByIdDemo(Path dir) {
+        MockModel model = summarizerModel();
+        String taskType = TwoStepTask.class.getName();
+        ExecutionId id = ExecutionId.random();
+
+        // ── Phase 1: durably record step 1 against the NAMED task, then "crash" (no completion) ──
+        try (GumboEventLog log = GumboEventLog.at(dir)) {
+            Instant t = Instant.now();
+            log.append(id, new CatalystEvent.ExecutionCreated(t, taskType, "h", "cfg", ""));
+            log.append(id, new CatalystEvent.ExecutionStarted(t, 1, "node-0"));
+
+            ExecutionInfo info = new ExecutionInfo(id, 1, taskType, Map.of());
+            ReplayingContext ctx = new ReplayingContext(id, log, model, info, Map.of(),
+                    EventJson.shared(), new PayloadCodec(), InDoubtPolicy.FAIL, CostModel.free(),
+                    com.cajunsystems.catalyst.ReplayMode.STRICT, null,
+                    Clock.systemUTC(), LoggerFactory.getLogger("demo.resumeid"), log.read(id), true);
+            String summary = ctx.model().complete(STEP1).message();
+            System.out.println("[resume-id] recorded execution " + id.value() + " step 1 = " + summary
+                    + " (model calls this run: " + model.callCount() + ")");
+            // kill -9: control leaves here with no ExecutionCompleted written.
+        }
+
+        // ── Phase 2: reopen the durable log, register the task TYPE, recover from the id alone ──
+        try (CatalystRuntime runtime = Catalyst.builder()
+                .log(GumboEventLog.at(dir))
+                .model(model)
+                .task(new TwoStepTask())   // register the type so resume(id) can reconstruct it
+                .build()) {
+
+            String result = (String) runtime.resume(id).result();  // no key, no re-submitted task
+            ExecutionState state = runtime.inspect(id);
+
+            System.out.println("[resume-id] resumed " + id.value() + " -> " + state.status());
+            System.out.println("[resume-id] result: " + result);
+            System.out.println("[resume-id] model calls THIS run: " + model.callCount()
+                    + " (step 1 was substituted from the log; only step 2 ran live)");
+
+            if (state.status() != com.cajunsystems.catalyst.Status.COMPLETED) {
+                throw new AssertionError("expected COMPLETED, got " + state.status());
+            }
+            if (model.callCount() != 2) {
+                throw new AssertionError("expected 2 model calls total, got " + model.callCount());
+            }
+            System.out.println("[resume-id] resume-by-id criterion holds: recovered from the id alone,"
+                    + " zero duplicate model calls.");
         }
     }
 

@@ -5,6 +5,8 @@ import com.cajunsystems.catalyst.ExecutionInfo;
 import com.cajunsystems.catalyst.ExecutionOptions;
 import com.cajunsystems.catalyst.ReplayMode;
 import com.cajunsystems.catalyst.Task;
+import com.cajunsystems.catalyst.TaskFactory;
+import com.cajunsystems.catalyst.TaskRegistry;
 import com.cajunsystems.catalyst.Cost;
 import com.cajunsystems.catalyst.engine.BranchSpec;
 import com.cajunsystems.catalyst.engine.CancellationSignal;
@@ -65,6 +67,7 @@ public final class CatalystRuntime implements AutoCloseable {
     private final PayloadCodec payloads;
     private final String nodeId;
     private final long snapshotInterval;
+    private final TaskRegistry registry;
     private final ExecutorService executor;
 
     /**
@@ -101,6 +104,7 @@ public final class CatalystRuntime implements AutoCloseable {
         this.payloads = new PayloadCodec();
         this.nodeId = b.nodeId;
         this.snapshotInterval = b.snapshotInterval;
+        this.registry = b.registry;
         this.executor = Executors.newThreadPerTaskExecutor(
                 Thread.ofVirtual().name("catalyst-exec-", 0).factory());
     }
@@ -142,18 +146,27 @@ public final class CatalystRuntime implements AutoCloseable {
             mode = Mode.FRESH;
         }
 
-        final ExecutionId execId = id;
-        final Mode runMode = mode;
+        return scheduleAttempt(task, id, taskType, opts, mode);
+    }
+
+    /**
+     * Schedules an attempt for {@code id} on a virtual thread and returns its handle. Registers the
+     * in-flight future and cancellation handle under the monitor held by the caller ({@code execute} /
+     * {@code resume} are both {@code synchronized}), so a second concurrent attempt for the same
+     * execution can be detected and attached to rather than scheduled.
+     */
+    private <R> ExecutionHandle<R> scheduleAttempt(Task<R> task, ExecutionId id, String taskType,
+                                                   ExecutionOptions opts, Mode mode) {
         CompletableFuture<R> future = new CompletableFuture<>();
         RunningAttempt attempt = new RunningAttempt();
-        inFlight.put(execId, future);
-        running.put(execId, attempt);
+        inFlight.put(id, future);
+        running.put(id, attempt);
         future.whenComplete((r, t) -> {
-            inFlight.remove(execId, future);
-            running.remove(execId, attempt);
+            inFlight.remove(id, future);
+            running.remove(id, attempt);
         });
-        executor.execute(() -> runAttempt(task, execId, taskType, opts, runMode, future, attempt));
-        return new FutureExecutionHandle<>(execId, future);
+        executor.execute(() -> runAttempt(task, id, taskType, opts, mode, future, attempt));
+        return new FutureExecutionHandle<>(id, future);
     }
 
     @SuppressWarnings("unchecked")
@@ -291,16 +304,51 @@ public final class CatalystRuntime implements AutoCloseable {
         return inspect(id);
     }
 
-    /**
-     * Recovers an execution after a crash or pause. In M0 a runtime cannot reconstruct the original
-     * {@link Task} instance, so resume is driven by re-submitting the task with the same idempotency
-     * key: {@code execute(task, ExecutionOptions.withKey(k))}. A task registry that makes
-     * {@code resume(id)} standalone is a thin follow-up.
-     */
+    /** Recovers an execution by id, with no task input vars. See {@link #resume(ExecutionId, ExecutionOptions)}. */
     public ExecutionHandle<?> resume(ExecutionId id) {
-        throw new UnsupportedOperationException(
-                "M0 resumes by re-submitting the task with the same idempotency key: "
-                        + "execute(task, ExecutionOptions.withKey(key)). Standalone resume(id) needs a task registry.");
+        return resume(id, ExecutionOptions.none());
+    }
+
+    /**
+     * Recovers an execution after a crash or pause <em>from its id alone</em> (spec §7, v0.2 increment
+     * ②). The runtime reconstructs the {@link Task} from its recorded task type via the configured
+     * {@link TaskRegistry} — so the caller no longer has to re-submit the original task instance with
+     * its idempotency key (the M0 recovery path, which still works). Register the task type up front
+     * with {@code Catalyst.builder().task(...)}.
+     *
+     * <p>An execution already running in this process attaches to the in-flight attempt (no second
+     * concurrent attempt). A non-terminal execution runs forward, recording {@code ExecutionResumed}
+     * and substituting every recorded boundary from the log until the task passes the log tail — so
+     * recovery performs no duplicate side effects. Resuming an already-terminal execution replays its
+     * recorded outcome without re-running the task, exactly as attaching by key does.
+     *
+     * <p>Task input vars are not persisted (only their {@code argsHash} is), so a task that branches
+     * on {@code ctx.var(...)} must be resumed with the same vars via {@code opts}; otherwise it takes a
+     * different path and (correctly) trips {@link NonDeterministicReplayException} under strict replay.
+     *
+     * @throws IllegalArgumentException if no execution with this id exists
+     * @throws IllegalStateException    if no task is registered for the execution's recorded task type
+     */
+    public synchronized ExecutionHandle<?> resume(ExecutionId id, ExecutionOptions opts) {
+        // Already running here → attach to the in-flight attempt rather than scheduling a duplicate
+        // that would interleave events and corrupt the stream (same guard as execute()).
+        CompletableFuture<?> live = inFlight.get(id);
+        if (live != null) {
+            return new FutureExecutionHandle<>(id, live);
+        }
+
+        ExecutionState state = foldState(id);
+        String taskType = state.taskType();
+        if (taskType == null) {
+            throw new IllegalArgumentException("Cannot resume unknown execution: " + id);
+        }
+        TaskFactory factory = registry.lookup(taskType).orElseThrow(() -> new IllegalStateException(
+                "No task registered for type '" + taskType + "' to resume " + id
+                        + "; register it with Catalyst.builder().task(...), or recover by re-submitting the"
+                        + " task with its idempotency key via execute(task, ExecutionOptions.withKey(key))."));
+
+        Mode mode = state.isTerminal() ? Mode.REPLAY_TERMINAL : Mode.RESUME;
+        return scheduleAttempt(factory.create(), id, taskType, opts, mode);
     }
 
     /**
@@ -554,6 +602,7 @@ public final class CatalystRuntime implements AutoCloseable {
         private ObjectMapper eventMapper = EventJson.shared();
         private String nodeId = "node-0";
         private long snapshotInterval = 100;
+        private TaskRegistry registry = new TaskRegistry();
 
         public Builder log(EventLog log) {
             this.log = log;
@@ -603,6 +652,35 @@ public final class CatalystRuntime implements AutoCloseable {
          */
         public Builder snapshotInterval(long snapshotInterval) {
             this.snapshotInterval = snapshotInterval;
+            return this;
+        }
+
+        /**
+         * Registers a task instance under its class name so {@code runtime.resume(id)} can reconstruct
+         * it from the recorded log (spec §7, v0.2 increment ②). Prefer a named {@code Task} class:
+         * a lambda's class name is not stable across processes. A task is re-invoked on resume with its
+         * boundaries substituted, so sharing one stateless instance is safe.
+         */
+        public Builder task(Task<?> task) {
+            registry.register(task);
+            return this;
+        }
+
+        /** Registers a factory that reconstructs a task for the given recorded task type. */
+        public Builder task(String taskType, TaskFactory factory) {
+            registry.register(taskType, factory);
+            return this;
+        }
+
+        /** Registers a factory under {@code type.getName()} — the type a named {@code Task} class records. */
+        public Builder task(Class<? extends Task<?>> type, TaskFactory factory) {
+            registry.register(type, factory);
+            return this;
+        }
+
+        /** Replaces the task registry wholesale (for callers assembling registrations elsewhere). */
+        public Builder tasks(TaskRegistry registry) {
+            this.registry = java.util.Objects.requireNonNull(registry, "registry");
             return this;
         }
 

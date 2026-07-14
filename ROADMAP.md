@@ -34,8 +34,8 @@ every step. Snapshots was the first. Planned order of the remaining increments �
 first: **① cancellation event → ② task registry / `resume(id)` → ③ built-in HTTP + Filesystem tools →
 ④ generic-collection payloads → ⑤ blob store**, with schema evolution, retry semantics, the
 auto-capture agent, per-execution locking, streaming, and observability sequenced after. Order is a
-guide, not a contract — it flexes as we learn. Snapshots and the cancellation event (①) have shipped;
-the task registry / standalone `resume(id)` (②) is next.
+guide, not a contract — it flexes as we learn. Snapshots, the cancellation event (①), and the task
+registry / standalone `resume(id)` (②) have shipped; built-in HTTP + Filesystem tools (③) are next.
 
 ### Durability & storage (spec §8)
 - ✅ **Snapshots** — periodic fold checkpoints so long executions don't re-fold the whole log on
@@ -72,9 +72,13 @@ the task registry / standalone `resume(id)` (②) is next.
   other throwable after a cancel, including a bare `InterruptedException` from cleanup, still records
   `ExecutionFailed`. The interrupt is only a best-effort nudge to reach that boundary. Gated by the
   v0.2 Cancellation exit demo in CI.
-- 🔜 **Standalone `resume(id)` / task registry** (②) — today resume is driven by re-submitting the
-  task with its key; a task-type registry makes `runtime.resume(id)` work without the caller holding
-  the `Task`. *Next increment.*
+- ✅ **Standalone `resume(id)` / task registry** (②) — a `TaskRegistry` maps a recorded task type to
+  a `TaskFactory`, so `runtime.resume(id)` recovers an execution from its id alone — no idempotency
+  key, no re-submitted `Task` instance (the M0 recover-by-key path still works). Register types up
+  front via `Catalyst.builder().task(...)`. A non-terminal execution runs forward with every recorded
+  boundary substituted (zero duplicate side effects); a terminal one replays its recorded outcome
+  without re-running. Use named `Task` classes: a lambda's synthetic class name is not stable across
+  processes. Gated by the v0.2 Resume-by-id exit demo in CI.
 - **Per-execution locking** — replace the single coarse `synchronized execute` lock with per-id
   coordination to lift the throughput ceiling under concurrent load.
 - **Remaining built-in tools** — `HttpTool` and `FilesystemTool` (sandboxed to a root dir), per spec

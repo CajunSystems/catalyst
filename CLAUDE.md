@@ -53,6 +53,11 @@ intended source, but if `jitpack.io` is blocked, install Gumbo locally first:
   `inspect` folds from the latest snapshot forward (warm inspect reads only the log tail, not the whole
   log) and the snapshot fold matches a full re-fold exactly. The reducer is resumable via
   `Reducer.foldFrom(ReducerState, events)`; the `EventLog` seam is `readFrom` + `readSnapshot`/`writeSnapshot`.
+- **v0.2 Resume-by-id** — `ResumeByIdAcceptanceTest` + `Demo resumeid`: a crashed execution is recovered
+  from its id alone via a `TaskRegistry` (`runtime.resume(id)`) — no idempotency key, no re-submitted
+  `Task` — finishing with zero duplicate model calls. Register task types up front with
+  `Catalyst.builder().task(...)`; use named `Task` classes (lambda class names aren't stable across
+  processes). A terminal execution's `resume(id)` replays its recorded outcome without re-running.
 - **v0.2 Cancellation** — `Demo cancel`: a running task is cancelled cooperatively and folds to
   `CANCELLED` (not `FAILED`). `cancel(id)` records `ExecutionCancelled`; while the execution is in
   flight it trips a `CancellationToken` and interrupts the worker, which unwinds at its next live
