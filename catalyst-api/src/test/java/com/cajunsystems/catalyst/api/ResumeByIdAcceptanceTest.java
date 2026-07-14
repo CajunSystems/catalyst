@@ -122,6 +122,28 @@ class ResumeByIdAcceptanceTest {
     }
 
     @Test
+    void resumingATerminalExecutionNeedsNoRegistration(@TempDir Path dir) {
+        MockModel model = MockModel.scripted("SUMMARY", "FINAL");
+        ExecutionId id = recordStepOne(dir, model);
+
+        // Drive it to completion once (registered)...
+        try (CatalystRuntime runtime = Catalyst.builder()
+                .log(GumboEventLog.at(dir)).model(model).task(new TwoStepTask()).build()) {
+            assertThat((String) runtime.resume(id).result()).isEqualTo("SUMMARY|FINAL");
+        }
+        int callsAfterCompletion = model.callCount();
+
+        // ...then recover the recorded outcome from a fresh runtime with NO task registered: a terminal
+        // execution replays without re-running the task, so it is recoverable from the id alone.
+        try (CatalystRuntime runtime = Catalyst.builder()
+                .log(GumboEventLog.at(dir)).model(model).build()) {
+            assertThat((String) runtime.resume(id).result()).isEqualTo("SUMMARY|FINAL");
+            assertThat(runtime.inspect(id).status()).isEqualTo(Status.COMPLETED);
+            assertThat(model.callCount()).isEqualTo(callsAfterCompletion); // no re-run
+        }
+    }
+
+    @Test
     void resumingAterminalExecutionReplaysItsOutcomeWithoutRerunning(@TempDir Path dir) {
         MockModel model = MockModel.scripted("SUMMARY", "FINAL");
         ExecutionId id = recordStepOne(dir, model);

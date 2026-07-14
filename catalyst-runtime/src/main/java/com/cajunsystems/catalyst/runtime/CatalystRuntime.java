@@ -327,7 +327,8 @@ public final class CatalystRuntime implements AutoCloseable {
      * different path and (correctly) trips {@link NonDeterministicReplayException} under strict replay.
      *
      * @throws IllegalArgumentException if no execution with this id exists
-     * @throws IllegalStateException    if no task is registered for the execution's recorded task type
+     * @throws IllegalStateException    if the execution is non-terminal and no task is registered for
+     *                                  its recorded task type (a terminal execution needs no registration)
      */
     public synchronized ExecutionHandle<?> resume(ExecutionId id, ExecutionOptions opts) {
         // Already running here → attach to the in-flight attempt rather than scheduling a duplicate
@@ -342,14 +343,30 @@ public final class CatalystRuntime implements AutoCloseable {
         if (taskType == null) {
             throw new IllegalArgumentException("Cannot resume unknown execution: " + id);
         }
+
+        // A terminal execution replays its recorded outcome without ever re-running the task
+        // (runAttempt short-circuits REPLAY_TERMINAL before touching it), so it needs no registered
+        // factory — it is recoverable from the id alone. Only a live resume reconstructs the task.
+        if (state.isTerminal()) {
+            return scheduleAttempt(TERMINAL_REPLAY_TASK, id, taskType, opts, Mode.REPLAY_TERMINAL);
+        }
+
         TaskFactory factory = registry.lookup(taskType).orElseThrow(() -> new IllegalStateException(
                 "No task registered for type '" + taskType + "' to resume " + id
                         + "; register it with Catalyst.builder().task(...), or recover by re-submitting the"
                         + " task with its idempotency key via execute(task, ExecutionOptions.withKey(key))."));
 
-        Mode mode = state.isTerminal() ? Mode.REPLAY_TERMINAL : Mode.RESUME;
-        return scheduleAttempt(factory.create(), id, taskType, opts, mode);
+        return scheduleAttempt(factory.create(), id, taskType, opts, Mode.RESUME);
     }
+
+    /**
+     * Stand-in task for the {@code REPLAY_TERMINAL} path, which completes a handle from the recorded
+     * terminal outcome and never invokes the task. It exists only to satisfy {@code scheduleAttempt}'s
+     * signature; if it were ever executed that would be a bug, so it fails loudly.
+     */
+    private static final Task<?> TERMINAL_REPLAY_TASK = ctx -> {
+        throw new IllegalStateException("terminal replay must not run the task");
+    };
 
     /**
      * Forks a recorded execution at {@code atSeq} to explore an alternative (spec §7): the returned
