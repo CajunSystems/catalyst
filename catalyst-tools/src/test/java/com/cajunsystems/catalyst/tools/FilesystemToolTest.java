@@ -92,6 +92,16 @@ class FilesystemToolTest {
     }
 
     @Test
+    void insecureFallbackConstructorStillOperatesNormally(@TempDir Path root) throws Exception {
+        // On a SecureDirectoryStream platform (Linux CI) the secure path is used regardless of the flag;
+        // this just pins the opt-in constructor's normal behavior. The fail-closed branch only triggers
+        // where no SecureDirectoryStream is available, which cannot be forced on this platform.
+        FilesystemTool fs = new FilesystemTool(root, true);
+        fs.apply(FilesystemTool.Command.write("f.txt", "v"));
+        assertThat(fs.apply(FilesystemTool.Command.read("f.txt")).content()).isEqualTo("v");
+    }
+
+    @Test
     void writeDoesNotAutoCreateParentDirectories(@TempDir Path root) {
         FilesystemTool fs = new FilesystemTool(root);
         assertThatThrownBy(() -> fs.apply(FilesystemTool.Command.write("no/such/dir/file.txt", "x")))

@@ -38,9 +38,11 @@ import java.util.Set;
  * the parent directory's open file descriptor, each hop opened {@link LinkOption#NOFOLLOW_LINKS} — the
  * {@code openat(O_NOFOLLOW)} discipline. No intermediate <em>or</em> final symlink is ever followed, so
  * a concurrent local writer cannot swap a checked directory for a symlink between the check and the
- * operation (the classic TOCTOU escape). On platforms without a {@code SecureDirectoryStream}, the tool
- * falls back to a normalized-path check plus {@code NOFOLLOW} on the final component, which closes the
- * final-component swap but not an intermediate-directory race.
+ * operation (the classic TOCTOU escape). On platforms without a {@code SecureDirectoryStream} the tool
+ * <em>fails closed</em> by default — operations throw rather than drop to racy plain-path resolution;
+ * {@link #FilesystemTool(Path, boolean)} opts into a best-effort fallback (normalized-path check plus
+ * {@code NOFOLLOW} on the final component, which closes the final-component swap but not an
+ * intermediate-directory race).
  *
  * <p>{@link Action#WRITE} does <em>not</em> create missing parent directories: {@code createDirectories}
  * would resolve intermediate components with symlink-following semantics (a raced-in ancestor symlink
@@ -78,12 +80,29 @@ public final class FilesystemTool implements Tool<FilesystemTool.Command, Filesy
     public record Result(Action action, String path, boolean ok, String content, long size, boolean exists) {}
 
     private final Path root;
+    private final boolean allowInsecureFallback;
 
     /**
-     * Sandboxes the tool to {@code root}, which must be an existing directory. The root is canonicalized
-     * once (following any symlinks) so containment checks compare real paths.
+     * Sandboxes the tool to {@code root} and <em>fails closed</em> on platforms without a
+     * {@link SecureDirectoryStream}: rather than fall back to racy plain-path resolution that cannot
+     * guarantee containment, operations there throw. Use {@link #FilesystemTool(Path, boolean)} to opt
+     * into best-effort behavior on such platforms.
      */
     public FilesystemTool(Path root) {
+        this(root, false);
+    }
+
+    /**
+     * Sandboxes the tool to {@code root}, which must be an existing directory (canonicalized once so
+     * containment checks compare real paths).
+     *
+     * @param allowInsecureFallback when the platform provides no {@link SecureDirectoryStream}, whether
+     *     to fall back to plain-path operations. That fallback closes the final-component symlink swap
+     *     but not an intermediate-directory TOCTOU, so it is off by default (fail closed); pass
+     *     {@code true} only when the weaker guarantee is acceptable (e.g. a trusted single-writer sandbox
+     *     on a non-Unix filesystem).
+     */
+    public FilesystemTool(Path root, boolean allowInsecureFallback) {
         if (root == null) throw new IllegalArgumentException("root must not be null");
         if (!Files.isDirectory(root)) {
             throw new IllegalArgumentException("Sandbox root must be an existing directory: " + root);
@@ -93,6 +112,7 @@ public final class FilesystemTool implements Tool<FilesystemTool.Command, Filesy
         } catch (IOException e) {
             throw new UncheckedIOException("Failed to canonicalize sandbox root: " + root, e);
         }
+        this.allowInsecureFallback = allowInsecureFallback;
     }
 
     /** The canonicalized sandbox root every path is resolved against. */
@@ -193,6 +213,7 @@ public final class FilesystemTool implements Tool<FilesystemTool.Command, Filesy
             if (dir != null) {
                 for (Path entry : dir) names.add(entry.getFileName().toString());
             } else {
+                requireInsecureFallbackAllowed();
                 listFallback(target, rel, names);
             }
         }
@@ -229,7 +250,10 @@ public final class FilesystemTool implements Tool<FilesystemTool.Command, Filesy
         Deque<SecureDirectoryStream<Path>> chain = new ArrayDeque<>();
         try {
             SecureDirectoryStream<Path> cursor = openRootSecurely();
-            if (cursor == null) return fallback.run();
+            if (cursor == null) {
+                requireInsecureFallbackAllowed();
+                return fallback.run();
+            }
             chain.push(cursor);
             for (int i = 0; i < n - 1; i++) {
                 cursor = cursor.newDirectoryStream(relative.getName(i), LinkOption.NOFOLLOW_LINKS);
@@ -272,6 +296,19 @@ public final class FilesystemTool implements Tool<FilesystemTool.Command, Filesy
         }
         stream.close();
         return null; // platform does not support secure directory streams
+    }
+
+    /**
+     * Fails closed when secure traversal is unavailable and the insecure fallback was not opted into, so
+     * a platform without {@link SecureDirectoryStream} never silently drops to racy plain-path resolution.
+     */
+    private void requireInsecureFallbackAllowed() throws IOException {
+        if (!allowInsecureFallback) {
+            throw new IOException("SecureDirectoryStream is unavailable on this platform; refusing "
+                    + "plain-path traversal that cannot guarantee sandbox containment against a concurrent "
+                    + "symlink swap. Construct FilesystemTool(root, /* allowInsecureFallback */ true) to opt "
+                    + "into best-effort behavior.");
+        }
     }
 
     private static void closeQuietly(Deque<SecureDirectoryStream<Path>> chain) {
