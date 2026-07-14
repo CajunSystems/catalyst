@@ -315,6 +315,47 @@ class CatalystRuntimeTest {
     }
 
     @Test
+    void cancelDoesNotMaskABareInterruptedExceptionThrownOutsideABoundary() {
+        // After cancel(), a task can swallow the runtime's interrupt, do cleanup, and then have a
+        // blocking call throw its OWN bare InterruptedException before reaching the next Catalyst
+        // boundary. That is indistinguishable from a fresh interrupt failure — it is NOT the
+        // cooperative unwind (the CancellationSignal raised at a boundary), so it must fold to FAILED
+        // with the interrupted failure preserved, not be masked as a clean CANCELLED.
+        MockModel model = MockModel.alwaysReturn("pong");
+        CountDownLatch pastFirstBoundary = new CountDownLatch(1);
+        Task<String> throwsBareInterrupt = ctx -> {
+            ctx.model().complete(CompletionRequest.of(Prompt.builder().user("one").build())).message();
+            pastFirstBoundary.countDown();
+            try {
+                new CountDownLatch(1).await(); // parked until cancel() interrupts this
+                return "unreachable";
+            } catch (InterruptedException first) {
+                // Swallow the runtime's interrupt; a cleanup blocking call then raises its own.
+                throw new InterruptedException("blocking cleanup was interrupted");
+            }
+        };
+
+        try (CatalystRuntime runtime = CatalystRuntime.builder()
+                .log(EventLogs.inMemory()).model(model).build()) {
+
+            ExecutionHandle<String> handle = runtime.execute(throwsBareInterrupt, ExecutionOptions.withKey("k"));
+            try {
+                assertThat(pastFirstBoundary.await(5, java.util.concurrent.TimeUnit.SECONDS)).isTrue();
+            } catch (InterruptedException e) {
+                throw new AssertionError(e);
+            }
+
+            runtime.cancel(handle.id()); // interrupts the parked worker; the task rethrows a bare interrupt
+
+            assertThatThrownBy(handle::result)
+                    .isInstanceOf(java.util.concurrent.CompletionException.class)
+                    .hasRootCauseInstanceOf(InterruptedException.class);
+            assertThat(runtime.inspect(handle.id()).status()).isEqualTo(Status.FAILED);
+            assertThat(runtime.inspect(handle.id()).error()).contains("blocking cleanup was interrupted");
+        }
+    }
+
+    @Test
     void memoryGetRejectsWrongType() {
         Task<String> storeThenMisread = ctx -> {
             ctx.memory().put("n", 42); // an Integer

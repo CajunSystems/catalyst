@@ -491,16 +491,14 @@ public final class CatalystRuntime implements AutoCloseable {
                 // ExecutionPaused already recorded by the context; leave the execution paused.
                 future.completeExceptionally(pause);
             } catch (Throwable t) {
-                // A cancelled attempt folds to CANCELLED, not FAILED — but only when the throwable is
-                // *itself* the cooperative unwind: the context's CancellationSignal (raised at a live
-                // boundary once the token trips), or a bare InterruptedException propagating from the
-                // interrupt() we raised. Anything else thrown after a cancel request — including a real
-                // failure that merely *wraps* the interrupt as a cause (cleanup/adapter code reporting
-                // its own error) — is NOT masked: it records ExecutionFailed so the failure reaches the
-                // log and the caller's result.
-                boolean cancelled = t instanceof CancellationSignal
-                        || (runningAttempt.token.isCancelled() && t instanceof InterruptedException);
-                if (cancelled) {
+                // A cancelled attempt folds to CANCELLED only via the cooperative unwind itself: the
+                // CancellationSignal the context raises at the next live boundary once the token trips
+                // (that is, the task acknowledging cancellation). Every other throwable after a cancel
+                // request is preserved as ExecutionFailed — including a bare InterruptedException, which
+                // is indistinguishable from a fresh interrupt failure a blocking call raised during
+                // cleanup. The interrupt() we raise is only a best-effort nudge to reach that boundary
+                // promptly; it never, by itself, reclassifies a failure as a clean cancellation.
+                if (t instanceof CancellationSignal) {
                     String reason = runningAttempt.token.reason();
                     try {
                         log.append(id, new CatalystEvent.ExecutionCancelled(now(), reason, log.latestSeq(id)));
