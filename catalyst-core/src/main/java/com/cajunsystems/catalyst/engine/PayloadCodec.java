@@ -185,17 +185,31 @@ public final class PayloadCodec {
                 + " value type, or a collection/array of those.");
     }
 
-    /** Resolves and validates an array's component type: a primitive, or an allowlisted leaf/array type. */
+    /**
+     * Resolves and validates an array's component type. The component type is only used to
+     * <em>allocate</em> the array — each element is decoded through its own envelope and allowlisted
+     * individually — so besides primitives and allowlisted leaf types we also accept {@code Object},
+     * interfaces, and abstract types (the declared component of a heterogeneous array such as
+     * {@code Object[]} or {@code Number[]}). Concrete non-allowlisted classes are still refused, so a
+     * tampered log cannot name an arbitrary gadget class to load.
+     */
     private static Class<?> resolveArrayComponent(String componentType) throws ClassNotFoundException {
         Class<?> primitive = PRIMITIVES.get(componentType);
         if (primitive != null) return primitive;
         Class<?> type = Class.forName(componentType, false, PayloadCodec.class.getClassLoader());
-        Class<?> base = type;
-        while (base.isArray()) base = base.getComponentType();
-        if (base.isPrimitive() || base.isRecord() || base.isEnum() || SAFE_TYPES.contains(base)) {
+        if (isAllowedArrayComponent(type)) {
             return type;
         }
         throw new IllegalStateException("Refusing to deserialize non-allowlisted array component type: "
                 + componentType);
+    }
+
+    private static boolean isAllowedArrayComponent(Class<?> type) {
+        if (type.isArray()) return isAllowedArrayComponent(type.getComponentType());
+        if (type.isPrimitive() || type == Object.class) return true;
+        // A heterogeneous array's declared component is Object/an interface/an abstract type; the array
+        // is only allocated with it, while its concrete elements are allowlisted on decode.
+        if (type.isInterface() || java.lang.reflect.Modifier.isAbstract(type.getModifiers())) return true;
+        return type.isRecord() || type.isEnum() || SAFE_TYPES.contains(type);
     }
 }

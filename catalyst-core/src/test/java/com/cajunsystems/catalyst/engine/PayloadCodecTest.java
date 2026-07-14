@@ -92,6 +92,19 @@ class PayloadCodecTest {
     }
 
     @Test
+    void roundTripsHeterogeneousObjectAndAbstractComponentArrays() {
+        Object[] mixed = {"x", new Point(1, 2), Color.RED};
+        Object[] backMixed = roundTrip(mixed);
+        assertThat(backMixed).containsExactly("x", new Point(1, 2), Color.RED);
+        assertThat(backMixed.getClass().getComponentType()).isEqualTo(Object.class);
+
+        Number[] numbers = {1, 2L, 3.0};
+        Number[] backNumbers = roundTrip(numbers);
+        assertThat(backNumbers).containsExactly(1, 2L, 3.0);
+        assertThat(backNumbers.getClass().getComponentType()).isEqualTo(Number.class);
+    }
+
+    @Test
     void handlesNullsInsideCollections() {
         java.util.List<String> withNull = new java.util.ArrayList<>();
         withNull.add("x");
