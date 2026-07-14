@@ -81,6 +81,36 @@ class FilesystemToolTest {
     }
 
     @Test
+    void writesAndReadsThroughNestedRealDirectories(@TempDir Path root) throws Exception {
+        FilesystemTool fs = new FilesystemTool(root);
+        fs.apply(FilesystemTool.Command.write("a/b/c/deep.txt", "nested"));
+        assertThat(Files.readString(root.resolve("a/b/c/deep.txt"))).isEqualTo("nested");
+        assertThat(fs.apply(FilesystemTool.Command.read("a/b/c/deep.txt")).content()).isEqualTo("nested");
+        assertThat(fs.apply(FilesystemTool.Command.list("a/b")).content()).isEqualTo("c");
+    }
+
+    @Test
+    void rejectsAnIntermediateDirectorySymlinkEscape(@TempDir Path base) throws Exception {
+        Path root = Files.createDirectory(base.resolve("root"));
+        Path outside = Files.createDirectory(base.resolve("outside"));
+        Files.writeString(outside.resolve("secret.txt"), "top secret");
+
+        try {
+            Files.createSymbolicLink(root.resolve("link"), outside); // an *intermediate* component
+        } catch (IOException | UnsupportedOperationException e) {
+            assumeTrue(false, "symlinks unsupported on this platform");
+        }
+
+        FilesystemTool fs = new FilesystemTool(root);
+        // Reading/writing *through* the symlinked directory must be refused, existing target or not.
+        assertThatThrownBy(() -> fs.apply(FilesystemTool.Command.read("link/secret.txt")))
+                .isInstanceOf(IllegalArgumentException.class);
+        assertThatThrownBy(() -> fs.apply(FilesystemTool.Command.write("link/planted.txt", "x")))
+                .isInstanceOf(IllegalArgumentException.class);
+        assertThat(Files.exists(outside.resolve("planted.txt"))).isFalse();
+    }
+
+    @Test
     void rejectsSymlinkEscape(@TempDir Path base) throws Exception {
         Path root = Files.createDirectory(base.resolve("root"));
         Path outside = Files.createDirectory(base.resolve("outside"));

@@ -86,8 +86,9 @@ generic-collection payloads (④) are next.
   `java.net.http.HttpClient`, tests run offline; safe-by-default `TargetPolicy` blocks
   loopback/link-local/private/metadata targets and re-validates every redirect hop, with
   `allowAll()`/custom opt-outs) and `FilesystemTool` (sandboxed to a root dir; rejects `..`, absolute,
-  and symlink escapes, and opens final components `NOFOLLOW`). Both are non-deterministic recorded
-  boundaries: a
+  and symlink escapes, walking each path component `NOFOLLOW` via `SecureDirectoryStream` —
+  `openat(O_NOFOLLOW)` semantics — so intermediate-directory symlink swaps can't escape). Both are
+  non-deterministic recorded boundaries: a
   strict replay substitutes them, re-issuing no request and re-applying no write. Outputs are flat
   records (full header maps / structured listings await ④); large bodies inline until the blob store
   (⑤). Gated by the v0.2 Built-in-tools exit demo in CI. (`ShellTool` stays excluded until there's a
