@@ -35,8 +35,8 @@ first: **① cancellation event → ② task registry / `resume(id)` → ③ bui
 ④ generic-collection payloads → ⑤ blob store**, with schema evolution, retry semantics, the
 auto-capture agent, per-execution locking, streaming, and observability sequenced after. Order is a
 guide, not a contract — it flexes as we learn. Snapshots, the cancellation event (①), the task
-registry / standalone `resume(id)` (②), and the built-in HTTP + Filesystem tools (③) have shipped;
-generic-collection payloads (④) are next.
+registry / standalone `resume(id)` (②), the built-in HTTP + Filesystem tools (③), and
+generic-collection payloads (④) have shipped; the blob store (⑤) is next.
 
 ### Durability & storage (spec §8)
 - ✅ **Snapshots** — periodic fold checkpoints so long executions don't re-fold the whole log on
@@ -55,8 +55,13 @@ generic-collection payloads (④) are next.
 - **Auto-capture agent** (spec §6, v0.2 stretch) — a ByteBuddy agent that records `Instant.now()`,
   `Random`, and `UUID.randomUUID()` inside task code automatically, so users don't have to route
   every nondeterministic call through `ctx.effect(...)`.
-- **Generic-collection payloads** — extend `PayloadCodec` beyond records/enums/value-types to
-  `List`/`Map`/arrays with element-type fidelity (today they throw a clear "wrap in a record" error).
+- ✅ **Generic-collection payloads** (④) — `PayloadCodec` now encodes `List`/`Set`/`Map`/arrays
+  structurally, carrying each element in its own typed envelope (recursively), so element types survive
+  the round-trip (`List<Point>` comes back as records, not maps; `Map` keys may be non-`String`). Leaf
+  encoding is byte-identical to before, so existing logs interoperate, and the class allowlist is
+  enforced at every nested leaf and array component (gadget-safe). Collections rebuild as
+  `ArrayList`/`LinkedHashSet`/`LinkedHashMap` (equal by content). Gated by the v0.2 Collection-payloads
+  exit demo in CI.
 - **Streaming completions** (open question §13.1) — decide whether the `Model` SPI needs a streaming
   variant now; record the assembled completion, add token-level replay later.
 - **Retry semantics** (open question §13.3) — finalize retry-as-attempt (`RetryRequested` + attempt

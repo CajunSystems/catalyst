@@ -64,6 +64,11 @@ intended source, but if `jitpack.io` is blocked, install Gumbo locally first:
   strict replay substitutes both recorded boundaries — the request is not re-issued and the write is
   not re-applied. `FilesystemTool` is sandboxed to a root dir and rejects `..`/absolute/symlink
   escapes; both tools are non-`@Deterministic` (their outputs are recorded, not re-executed).
+- **v0.2 Collection payloads** — `CollectionPayloadAcceptanceTest` + `Demo collections`: a task captures a
+  `List`/`Map` of records (via `ctx.effect` or as its result); `PayloadCodec` encodes collections/arrays
+  structurally (each element in its own typed envelope, recursively) so element types survive the
+  round-trip, and a strict replay substitutes the recorded collection with fidelity intact. Leaf
+  encoding is unchanged (old logs interoperate); the allowlist holds at every nested leaf.
 - **v0.2 Cancellation** — `Demo cancel`: a running task is cancelled cooperatively and folds to
   `CANCELLED` (not `FAILED`). `cancel(id)` records `ExecutionCancelled`; while the execution is in
   flight it trips a `CancellationToken` and interrupts the worker, which unwinds at its next live

@@ -173,3 +173,19 @@ jobs:
           echo "$OUT" | grep -q "file write re-applied on replay: false" \
             || { echo "FAIL: replay re-applied the file write"; exit 1; }
           echo "v0.2 Built-in-tools exit criterion holds: HTTP + Filesystem calls substituted on replay."
+
+      # The v0.2 generic-collection payloads exit criterion (roadmap increment ④): a List/Map of records
+      # round-trips through the log with element-type fidelity and is substituted on replay.
+      - name: v0.2 Collection payloads exit demo (List<record> round-trips with element-type fidelity)
+        run: |
+          set -uo pipefail
+          CP="catalyst-api/target/classes:$(cat catalyst-api/target/cp.txt)"
+
+          echo "--- record then replay a task capturing a List<record> ---"
+          OUT="$(java -cp "$CP" com.cajunsystems.catalyst.api.Demo collections)"
+          echo "$OUT"
+          echo "$OUT" | grep -q "total 5" \
+            || { echo "FAIL: collection task did not compute the expected total"; exit 1; }
+          echo "$OUT" | grep -q "supplier calls during replay: 0" \
+            || { echo "FAIL: replay re-ran the effect supplier (collection not substituted)"; exit 1; }
+          echo "v0.2 Collection-payloads exit criterion holds: List<record> round-trips and substitutes on replay."

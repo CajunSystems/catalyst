@@ -90,6 +90,8 @@ public final class Demo {
             resumeByIdDemo(Files.createTempDirectory("catalyst-resumeid-"));
         } else if (args.length >= 1 && args[0].equals("tools")) {
             toolsDemo(Files.createTempDirectory("catalyst-tools-"));
+        } else if (args.length >= 1 && args[0].equals("collections")) {
+            collectionsDemo(Files.createTempDirectory("catalyst-collections-"));
         } else {
             Path dir = Files.createTempDirectory("catalyst-demo-");
             System.out.println("No args: running record + resume in-process under " + dir);
@@ -434,6 +436,45 @@ public final class Demo {
             if (writeReapplied) throw new AssertionError("replay re-applied the file write");
             System.out.println("[tools] built-in-tools criterion holds: HTTP + Filesystem calls recorded"
                     + " once and substituted on replay (zero re-execution).");
+        }
+    }
+
+    /** An item in the collections demo — a record carried inside a List payload. */
+    record Item(String sku, int qty) {}
+
+    /**
+     * The v0.2 generic-collection payloads exit demo (roadmap increment ④): a task captures a
+     * {@code List} of records through {@code ctx.effect(...)}. The list is recorded with element-type
+     * fidelity and substituted on replay — the supplier does not run again, and the reconstructed list
+     * still holds {@code Item} records (if they had decoded as maps, the typed stream would throw).
+     */
+    private static void collectionsDemo(Path dir) {
+        int[] supplierCalls = {0};
+        Task<Integer> task = ctx -> {
+            java.util.List<Item> cart = ctx.effect("load-cart", () -> {
+                supplierCalls[0]++;
+                return java.util.List.of(new Item("A", 2), new Item("B", 3));
+            });
+            return cart.stream().mapToInt(Item::qty).sum(); // ClassCastException if fidelity is lost
+        };
+
+        try (CatalystRuntime runtime = Catalyst.builder().log(GumboEventLog.at(dir)).build()) {
+            ExecutionHandle<Integer> handle = runtime.execute(task);
+            int total = handle.result();
+            ExecutionId id = handle.id();
+            System.out.println("[collections] recorded execution " + id.value() + " -> total " + total
+                    + " (supplier calls: " + supplierCalls[0] + ")");
+
+            ExecutionState replayed = runtime.replay(id, task);
+            int externalSupplierCalls = supplierCalls[0] - 1;
+            System.out.println("[collections] replayed -> " + replayed.status()
+                    + "; supplier calls during replay: " + externalSupplierCalls
+                    + " (the List<Item> was substituted from the log with element types intact)");
+
+            if (total != 5) throw new AssertionError("expected total 5, got " + total);
+            if (externalSupplierCalls != 0) throw new AssertionError("replay re-ran the effect supplier");
+            System.out.println("[collections] generic-collection criterion holds: List<record> round-trips"
+                    + " and is substituted on replay with element-type fidelity.");
         }
     }
 
