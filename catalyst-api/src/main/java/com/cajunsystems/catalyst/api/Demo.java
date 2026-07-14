@@ -88,6 +88,8 @@ public final class Demo {
             cancelDemo(Files.createTempDirectory("catalyst-cancel-"));
         } else if (args.length >= 1 && args[0].equals("resumeid")) {
             resumeByIdDemo(Files.createTempDirectory("catalyst-resumeid-"));
+        } else if (args.length >= 1 && args[0].equals("tools")) {
+            toolsDemo(Files.createTempDirectory("catalyst-tools-"));
         } else {
             Path dir = Files.createTempDirectory("catalyst-demo-");
             System.out.println("No args: running record + resume in-process under " + dir);
@@ -380,6 +382,58 @@ public final class Demo {
             }
             System.out.println("[resume-id] resume-by-id criterion holds: recovered from the id alone,"
                     + " zero duplicate model calls.");
+        }
+    }
+
+    /**
+     * The v0.2 built-in-tools exit demo (roadmap increment ③): a task fetches over HTTP and writes the
+     * response to a sandboxed filesystem, both through {@code ctx.call(...)}. A strict replay
+     * substitutes both boundaries — the HTTP request is not re-issued and the file write is not
+     * re-applied — which is exactly what makes external I/O safe inside a resumable/replayable
+     * execution. Uses a fake HTTP sender so the demo needs no network.
+     */
+    private static void toolsDemo(Path dir) throws Exception {
+        Path logDir = Files.createDirectory(dir.resolve("log"));
+        Path sandbox = Files.createDirectory(dir.resolve("sandbox"));
+
+        int[] httpCalls = {0};
+        com.cajunsystems.catalyst.tools.HttpTool http =
+                new com.cajunsystems.catalyst.tools.HttpTool(req -> {
+                    httpCalls[0]++;
+                    return new com.cajunsystems.catalyst.tools.HttpTool.Response(200, "{\"answer\":42}", "application/json");
+                });
+        com.cajunsystems.catalyst.tools.FilesystemTool fs =
+                new com.cajunsystems.catalyst.tools.FilesystemTool(sandbox);
+
+        Task<String> fetchAndSave = ctx -> {
+            var resp = ctx.call(http, com.cajunsystems.catalyst.tools.HttpTool.Request.get("https://api.example/data"));
+            ctx.call(fs, com.cajunsystems.catalyst.tools.FilesystemTool.Command.write("data.json", resp.body()));
+            return "status=" + resp.status();
+        };
+
+        try (CatalystRuntime runtime = Catalyst.builder().log(GumboEventLog.at(logDir)).build()) {
+            ExecutionHandle<String> handle = runtime.execute(fetchAndSave);
+            String result = handle.result();
+            ExecutionId id = handle.id();
+            String saved = Files.readString(sandbox.resolve("data.json"));
+            System.out.println("[tools] recorded execution " + id.value() + " -> " + result);
+            System.out.println("[tools] HTTP calls during record: " + httpCalls[0]
+                    + "; file data.json written: " + saved);
+
+            // Externally delete the written file — if replay re-applied the write, it would reappear.
+            Files.delete(sandbox.resolve("data.json"));
+
+            ExecutionState replayed = runtime.replay(id, fetchAndSave);
+            int externalHttp = httpCalls[0] - 1;
+            boolean writeReapplied = Files.exists(sandbox.resolve("data.json"));
+            System.out.println("[tools] replayed -> " + replayed.status()
+                    + "; HTTP calls during replay: " + externalHttp
+                    + "; file write re-applied on replay: " + writeReapplied);
+
+            if (externalHttp != 0) throw new AssertionError("replay re-issued the HTTP request");
+            if (writeReapplied) throw new AssertionError("replay re-applied the file write");
+            System.out.println("[tools] built-in-tools criterion holds: HTTP + Filesystem calls recorded"
+                    + " once and substituted on replay (zero re-execution).");
         }
     }
 

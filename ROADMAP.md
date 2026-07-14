@@ -34,8 +34,9 @@ every step. Snapshots was the first. Planned order of the remaining increments �
 first: **① cancellation event → ② task registry / `resume(id)` → ③ built-in HTTP + Filesystem tools →
 ④ generic-collection payloads → ⑤ blob store**, with schema evolution, retry semantics, the
 auto-capture agent, per-execution locking, streaming, and observability sequenced after. Order is a
-guide, not a contract — it flexes as we learn. Snapshots, the cancellation event (①), and the task
-registry / standalone `resume(id)` (②) have shipped; built-in HTTP + Filesystem tools (③) are next.
+guide, not a contract — it flexes as we learn. Snapshots, the cancellation event (①), the task
+registry / standalone `resume(id)` (②), and the built-in HTTP + Filesystem tools (③) have shipped;
+generic-collection payloads (④) are next.
 
 ### Durability & storage (spec §8)
 - ✅ **Snapshots** — periodic fold checkpoints so long executions don't re-fold the whole log on
@@ -81,8 +82,17 @@ registry / standalone `resume(id)` (②) have shipped; built-in HTTP + Filesyste
   processes. Gated by the v0.2 Resume-by-id exit demo in CI.
 - **Per-execution locking** — replace the single coarse `synchronized execute` lock with per-id
   coordination to lift the throughput ceiling under concurrent load.
-- **Remaining built-in tools** — `HttpTool` and `FilesystemTool` (sandboxed to a root dir), per spec
-  §4. (`ShellTool` stays excluded until there's a policy story.)
+- ✅ **Remaining built-in tools** (③) — `HttpTool` (pluggable `Sender` seam; default wraps
+  `java.net.http.HttpClient`, tests run offline; safe-by-default `TargetPolicy` blocks
+  loopback/link-local/private/metadata targets and re-validates every redirect hop, with
+  `allowAll()`/custom opt-outs) and `FilesystemTool` (sandboxed to a root dir; rejects `..`, absolute,
+  and symlink escapes, walking each path component `NOFOLLOW` via `SecureDirectoryStream` —
+  `openat(O_NOFOLLOW)` semantics — so intermediate-directory symlink swaps can't escape). Both are
+  non-deterministic recorded boundaries: a
+  strict replay substitutes them, re-issuing no request and re-applying no write. Outputs are flat
+  records (full header maps / structured listings await ④); large bodies inline until the blob store
+  (⑤). Gated by the v0.2 Built-in-tools exit demo in CI. (`ShellTool` stays excluded until there's a
+  policy story.)
 
 ### Observability (spec §12)
 - **OTel exporter** — one span per event, execution = trace; the log already *is* the trace, so this

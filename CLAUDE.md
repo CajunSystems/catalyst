@@ -29,7 +29,8 @@ intended source, but if `jitpack.io` is blocked, install Gumbo locally first:
   `InMemoryEventLog`.
 - `catalyst-gumbo` — `GumboEventLog`: one Gumbo `LogTag` per execution; Gumbo `localId` == Catalyst
   `seq`; durable KV for the idempotency index.
-- `catalyst-tools`, `catalyst-api` — built-in tools and the `Catalyst` facade.
+- `catalyst-tools`, `catalyst-api` — built-in tools (`ClockTool`, `CalculatorTool`, `HttpTool`,
+  `FilesystemTool`) and the `Catalyst` facade.
 - `catalyst-langchain4j` — `LangChain4jModel`: wraps any LangChain4j `ChatModel` (real providers).
   Depends only on `langchain4j-core`; the app supplies the provider. Tested offline with a fake
   `ChatModel` (override `doChat`).
@@ -58,6 +59,11 @@ intended source, but if `jitpack.io` is blocked, install Gumbo locally first:
   `Task` — finishing with zero duplicate model calls. Register task types up front with
   `Catalyst.builder().task(...)`; use named `Task` classes (lambda class names aren't stable across
   processes). A terminal execution's `resume(id)` replays its recorded outcome without re-running.
+- **v0.2 Built-in tools** — `ToolsAcceptanceTest` + `Demo tools`: a task fetches over HTTP (`HttpTool`,
+  with a pluggable `Sender` seam so tests run offline) and writes to a sandboxed `FilesystemTool`; a
+  strict replay substitutes both recorded boundaries — the request is not re-issued and the write is
+  not re-applied. `FilesystemTool` is sandboxed to a root dir and rejects `..`/absolute/symlink
+  escapes; both tools are non-`@Deterministic` (their outputs are recorded, not re-executed).
 - **v0.2 Cancellation** — `Demo cancel`: a running task is cancelled cooperatively and folds to
   `CANCELLED` (not `FAILED`). `cancel(id)` records `ExecutionCancelled`; while the execution is in
   flight it trips a `CancellationToken` and interrupts the worker, which unwinds at its next live
