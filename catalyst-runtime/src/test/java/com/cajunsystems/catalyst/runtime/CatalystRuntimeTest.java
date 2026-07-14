@@ -277,6 +277,44 @@ class CatalystRuntimeTest {
     }
 
     @Test
+    void cancelDoesNotMaskAFailureThatWrapsTheInterrupt() {
+        // A task interrupted by cancel() may catch the InterruptedException and throw its OWN real
+        // failure that carries the interrupt as a cause (e.g. cleanup/adapter code). That is a genuine
+        // failure, not the cooperative unwind — it must fold to FAILED, not be masked as CANCELLED.
+        MockModel model = MockModel.alwaysReturn("pong");
+        CountDownLatch pastFirstBoundary = new CountDownLatch(1);
+        Task<String> wrapsInterrupt = ctx -> {
+            ctx.model().complete(CompletionRequest.of(Prompt.builder().user("one").build())).message();
+            pastFirstBoundary.countDown();
+            try {
+                new CountDownLatch(1).await(); // block until cancel() interrupts the worker
+                return "unreachable";
+            } catch (InterruptedException e) {
+                throw new IllegalStateException("adapter failed during cancel", e); // wraps the interrupt
+            }
+        };
+
+        try (CatalystRuntime runtime = CatalystRuntime.builder()
+                .log(EventLogs.inMemory()).model(model).build()) {
+
+            ExecutionHandle<String> handle = runtime.execute(wrapsInterrupt, ExecutionOptions.withKey("k"));
+            try {
+                assertThat(pastFirstBoundary.await(5, java.util.concurrent.TimeUnit.SECONDS)).isTrue();
+            } catch (InterruptedException e) {
+                throw new AssertionError(e);
+            }
+
+            runtime.cancel(handle.id()); // interrupts the parked worker; the task rethrows a real error
+
+            assertThatThrownBy(handle::result)
+                    .isInstanceOf(IllegalStateException.class)
+                    .hasMessageContaining("adapter failed during cancel");
+            assertThat(runtime.inspect(handle.id()).status()).isEqualTo(Status.FAILED);
+            assertThat(runtime.inspect(handle.id()).error()).contains("adapter failed during cancel");
+        }
+    }
+
+    @Test
     void memoryGetRejectsWrongType() {
         Task<String> storeThenMisread = ctx -> {
             ctx.memory().put("n", 42); // an Integer
