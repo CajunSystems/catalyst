@@ -176,6 +176,186 @@ class CatalystRuntimeTest {
     }
 
     @Test
+    void cancelOutOfBandFoldsToCancelledNotFailed() {
+        // An execution that exists but is not running in this process (e.g. crashed/paused, or created
+        // by another node) is cancelled by appending ExecutionCancelled directly — it folds to
+        // CANCELLED, and attaching to it surfaces a CancellationException (not ExecutionFailedException).
+        InMemoryEventLog log = new InMemoryEventLog();
+        ExecutionId id = ExecutionId.random();
+        Instant t = Instant.now();
+        log.putKey("k", id);
+        log.append(id, new CatalystEvent.ExecutionCreated(t, ONE_SHOT.getClass().getName(), "h", "cfg", "k"));
+        log.append(id, new CatalystEvent.ExecutionStarted(t, 1, "node-0"));
+
+        try (CatalystRuntime runtime = CatalystRuntime.builder()
+                .log(log).model(MockModel.alwaysReturn("pong")).build()) {
+            runtime.cancel(id);
+            assertThat(runtime.inspect(id).status()).isEqualTo(Status.CANCELLED);
+            assertThat(runtime.log().read(id)).last()
+                    .extracting(se -> se.event().getClass().getSimpleName())
+                    .isEqualTo("ExecutionCancelled");
+
+            // Re-submitting the key attaches to the cancelled execution: a CancellationException, and
+            // the model is never called (the cancelled prefix substitutes cleanly).
+            MockModel model = MockModel.alwaysReturn("pong");
+            try (CatalystRuntime runtime2 = CatalystRuntime.builder().log(log).model(model).build()) {
+                assertThatThrownBy(() -> runtime2.execute(ONE_SHOT, ExecutionOptions.withKey("k")).result())
+                        .isInstanceOf(java.util.concurrent.CancellationException.class);
+                assertThat(model.callCount()).isEqualTo(0);
+            }
+        }
+    }
+
+    @Test
+    void cancelCooperativelyStopsARunningTaskAndFoldsToCancelled() throws Exception {
+        MockModel model = MockModel.alwaysReturn("pong");
+        CountDownLatch pastFirstBoundary = new CountDownLatch(1);
+        CountDownLatch release = new CountDownLatch(1);
+        // Two boundaries with a park between them. Cancellation is requested while parked; the second
+        // boundary must unwind cooperatively rather than run — so the model is called exactly once.
+        Task<String> twoStep = ctx -> {
+            String first = ctx.model().complete(CompletionRequest.of(Prompt.builder().user("one").build())).message();
+            pastFirstBoundary.countDown();
+            try { release.await(); } catch (InterruptedException e) { Thread.currentThread().interrupt(); }
+            return ctx.model().complete(CompletionRequest.of(Prompt.builder().user("two").build())).message() + first;
+        };
+
+        try (CatalystRuntime runtime = CatalystRuntime.builder()
+                .log(EventLogs.inMemory()).model(model).build()) {
+
+            ExecutionHandle<String> handle = runtime.execute(twoStep, ExecutionOptions.withKey("k"));
+            assertThat(pastFirstBoundary.await(5, java.util.concurrent.TimeUnit.SECONDS)).isTrue();
+
+            runtime.cancel(handle.id());  // trips the token + interrupts the parked worker
+            release.countDown();          // (belt-and-braces: also let the park return normally)
+
+            assertThatThrownBy(handle::result).isInstanceOf(java.util.concurrent.CancellationException.class);
+            assertThat(runtime.inspect(handle.id()).status()).isEqualTo(Status.CANCELLED);
+            // Only the first boundary ran live; the second unwound before calling the model.
+            assertThat(model.callCount()).isEqualTo(1);
+        }
+    }
+
+    @Test
+    void cancelDoesNotMaskARealErrorThrownBeforeTheNextBoundary() {
+        // A task that swallows the cancel interrupt, does non-boundary work, and then throws a genuine
+        // error before reaching another ctx boundary must fold to FAILED (with the real error), not be
+        // masked as a clean CANCELLED just because a cancel was requested.
+        MockModel model = MockModel.alwaysReturn("pong");
+        CountDownLatch pastFirstBoundary = new CountDownLatch(1);
+        CountDownLatch proceed = new CountDownLatch(1);
+        Task<String> throwsAfterCancel = ctx -> {
+            ctx.model().complete(CompletionRequest.of(Prompt.builder().user("one").build())).message();
+            pastFirstBoundary.countDown();
+            // Wait until the test has requested cancellation, tolerating (swallowing) the interrupt.
+            while (true) {
+                try { proceed.await(); break; }
+                catch (InterruptedException e) { /* swallow the cancel interrupt and keep going */ }
+            }
+            throw new IllegalStateException("real bug after cancel");
+        };
+
+        try (CatalystRuntime runtime = CatalystRuntime.builder()
+                .log(EventLogs.inMemory()).model(model).build()) {
+
+            ExecutionHandle<String> handle = runtime.execute(throwsAfterCancel, ExecutionOptions.withKey("k"));
+            try {
+                assertThat(pastFirstBoundary.await(5, java.util.concurrent.TimeUnit.SECONDS)).isTrue();
+            } catch (InterruptedException e) {
+                throw new AssertionError(e);
+            }
+
+            runtime.cancel(handle.id()); // trips the token + interrupts, but the task throws a real error
+            proceed.countDown();
+
+            assertThatThrownBy(handle::result)
+                    .isInstanceOf(IllegalStateException.class)
+                    .hasMessageContaining("real bug after cancel");
+            assertThat(runtime.inspect(handle.id()).status()).isEqualTo(Status.FAILED);
+            assertThat(runtime.inspect(handle.id()).error()).contains("real bug after cancel");
+        }
+    }
+
+    @Test
+    void cancelDoesNotMaskAFailureThatWrapsTheInterrupt() {
+        // A task interrupted by cancel() may catch the InterruptedException and throw its OWN real
+        // failure that carries the interrupt as a cause (e.g. cleanup/adapter code). That is a genuine
+        // failure, not the cooperative unwind — it must fold to FAILED, not be masked as CANCELLED.
+        MockModel model = MockModel.alwaysReturn("pong");
+        CountDownLatch pastFirstBoundary = new CountDownLatch(1);
+        Task<String> wrapsInterrupt = ctx -> {
+            ctx.model().complete(CompletionRequest.of(Prompt.builder().user("one").build())).message();
+            pastFirstBoundary.countDown();
+            try {
+                new CountDownLatch(1).await(); // block until cancel() interrupts the worker
+                return "unreachable";
+            } catch (InterruptedException e) {
+                throw new IllegalStateException("adapter failed during cancel", e); // wraps the interrupt
+            }
+        };
+
+        try (CatalystRuntime runtime = CatalystRuntime.builder()
+                .log(EventLogs.inMemory()).model(model).build()) {
+
+            ExecutionHandle<String> handle = runtime.execute(wrapsInterrupt, ExecutionOptions.withKey("k"));
+            try {
+                assertThat(pastFirstBoundary.await(5, java.util.concurrent.TimeUnit.SECONDS)).isTrue();
+            } catch (InterruptedException e) {
+                throw new AssertionError(e);
+            }
+
+            runtime.cancel(handle.id()); // interrupts the parked worker; the task rethrows a real error
+
+            assertThatThrownBy(handle::result)
+                    .isInstanceOf(IllegalStateException.class)
+                    .hasMessageContaining("adapter failed during cancel");
+            assertThat(runtime.inspect(handle.id()).status()).isEqualTo(Status.FAILED);
+            assertThat(runtime.inspect(handle.id()).error()).contains("adapter failed during cancel");
+        }
+    }
+
+    @Test
+    void cancelDoesNotMaskABareInterruptedExceptionThrownOutsideABoundary() {
+        // After cancel(), a task can swallow the runtime's interrupt, do cleanup, and then have a
+        // blocking call throw its OWN bare InterruptedException before reaching the next Catalyst
+        // boundary. That is indistinguishable from a fresh interrupt failure — it is NOT the
+        // cooperative unwind (the CancellationSignal raised at a boundary), so it must fold to FAILED
+        // with the interrupted failure preserved, not be masked as a clean CANCELLED.
+        MockModel model = MockModel.alwaysReturn("pong");
+        CountDownLatch pastFirstBoundary = new CountDownLatch(1);
+        Task<String> throwsBareInterrupt = ctx -> {
+            ctx.model().complete(CompletionRequest.of(Prompt.builder().user("one").build())).message();
+            pastFirstBoundary.countDown();
+            try {
+                new CountDownLatch(1).await(); // parked until cancel() interrupts this
+                return "unreachable";
+            } catch (InterruptedException first) {
+                // Swallow the runtime's interrupt; a cleanup blocking call then raises its own.
+                throw new InterruptedException("blocking cleanup was interrupted");
+            }
+        };
+
+        try (CatalystRuntime runtime = CatalystRuntime.builder()
+                .log(EventLogs.inMemory()).model(model).build()) {
+
+            ExecutionHandle<String> handle = runtime.execute(throwsBareInterrupt, ExecutionOptions.withKey("k"));
+            try {
+                assertThat(pastFirstBoundary.await(5, java.util.concurrent.TimeUnit.SECONDS)).isTrue();
+            } catch (InterruptedException e) {
+                throw new AssertionError(e);
+            }
+
+            runtime.cancel(handle.id()); // interrupts the parked worker; the task rethrows a bare interrupt
+
+            assertThatThrownBy(handle::result)
+                    .isInstanceOf(java.util.concurrent.CompletionException.class)
+                    .hasRootCauseInstanceOf(InterruptedException.class);
+            assertThat(runtime.inspect(handle.id()).status()).isEqualTo(Status.FAILED);
+            assertThat(runtime.inspect(handle.id()).error()).contains("blocking cleanup was interrupted");
+        }
+    }
+
+    @Test
     void memoryGetRejectsWrongType() {
         Task<String> storeThenMisread = ctx -> {
             ctx.memory().put("n", 42); // an Integer

@@ -39,6 +39,7 @@ import java.time.Instant;
         @JsonSubTypes.Type(value = CatalystEvent.ExecutionBranched.class, name = "ExecutionBranched"),
         @JsonSubTypes.Type(value = CatalystEvent.ExecutionCompleted.class, name = "ExecutionCompleted"),
         @JsonSubTypes.Type(value = CatalystEvent.ExecutionFailed.class, name = "ExecutionFailed"),
+        @JsonSubTypes.Type(value = CatalystEvent.ExecutionCancelled.class, name = "ExecutionCancelled"),
 })
 public sealed interface CatalystEvent {
 
@@ -65,6 +66,13 @@ public sealed interface CatalystEvent {
 
     /** Execution failed. {@code failedSeq} points at the boundary that raised. */
     record ExecutionFailed(Instant at, String error, long failedSeq) implements CatalystEvent {}
+
+    /**
+     * Execution was cancelled by request — a clean, deliberate stop that folds to {@code CANCELLED}
+     * rather than {@code FAILED}. {@code atSeq} points at the boundary reached when cancellation was
+     * observed (the log tail for an out-of-band cancel, or the live boundary a running task unwound at).
+     */
+    record ExecutionCancelled(Instant at, String reason, long atSeq) implements CatalystEvent {}
 
     // ── Model boundary ───────────────────────────────────────────────────────
 

@@ -53,5 +53,11 @@ intended source, but if `jitpack.io` is blocked, install Gumbo locally first:
   `inspect` folds from the latest snapshot forward (warm inspect reads only the log tail, not the whole
   log) and the snapshot fold matches a full re-fold exactly. The reducer is resumable via
   `Reducer.foldFrom(ReducerState, events)`; the `EventLog` seam is `readFrom` + `readSnapshot`/`writeSnapshot`.
+- **v0.2 Cancellation** — `Demo cancel`: a running task is cancelled cooperatively and folds to
+  `CANCELLED` (not `FAILED`). `cancel(id)` records `ExecutionCancelled`; while the execution is in
+  flight it trips a `CancellationToken` and interrupts the worker, which unwinds at its next live
+  boundary (checked in `ReplayingContext.requireAppendable`) and records the event itself — so no other
+  thread ever appends to a running execution's stream. Attaching to a cancelled execution surfaces a
+  `CancellationException`.
 
-CI (`.github/workflows/ci.yml`) runs all four exit demos as gates — it is the source of truth per phase.
+CI (`.github/workflows/ci.yml`) runs all five exit demos as gates — it is the source of truth per phase.

@@ -119,6 +119,12 @@ public final class Reducer {
                     error = f.error();
                     timeline.add(new TimelineStep(se.seq(), TimelineStep.Kind.FAILED, f.error(), f.at(), 0, null));
                 }
+                case ExecutionCancelled c -> {
+                    status = Status.CANCELLED;
+                    endedAt = c.at();
+                    error = c.reason();
+                    timeline.add(new TimelineStep(se.seq(), TimelineStep.Kind.CANCELLED, c.reason(), c.at(), 0, null));
+                }
             }
         }
 

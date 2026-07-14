@@ -72,6 +72,8 @@ public final class ReplayingContext implements Context {
     private final Clock clock;
     private final Logger logger;
     private final boolean appendEnabled;
+    /** Nullable: present only for a live attempt the runtime may cancel cooperatively. */
+    private final CancellationToken cancellation;
 
     /** Result-bearing recorded boundaries, in order, consumed as the task replays its prefix. */
     private final Deque<Boundary> boundaries = new ArrayDeque<>();
@@ -90,6 +92,17 @@ public final class ReplayingContext implements Context {
                             InDoubtPolicy inDoubtPolicy, CostModel costModel, ReplayMode replayMode,
                             BranchSpec branchSpec, Clock clock, Logger logger,
                             List<SequencedEvent> recorded, boolean appendEnabled) {
+        this(id, log, realModel, info, vars, eventMapper, payloads, inDoubtPolicy, costModel, replayMode,
+                branchSpec, clock, logger, recorded, appendEnabled, null);
+    }
+
+    public ReplayingContext(ExecutionId id, EventLog log, Model realModel, ExecutionInfo info,
+                            Map<String, Object> vars, ObjectMapper eventMapper, PayloadCodec payloads,
+                            InDoubtPolicy inDoubtPolicy, CostModel costModel, ReplayMode replayMode,
+                            BranchSpec branchSpec, Clock clock, Logger logger,
+                            List<SequencedEvent> recorded, boolean appendEnabled,
+                            CancellationToken cancellation) {
+        this.cancellation = cancellation;
         this.id = id;
         this.log = log;
         this.realModel = realModel;
@@ -430,6 +443,11 @@ public final class ReplayingContext implements Context {
             throw new NonDeterministicReplayException(-1,
                     "recorded boundary", "live execution at " + what
                     + " (pure replay ran past the recorded log — nondeterministic task code?)");
+        }
+        // Cooperative cancellation is observed only at live boundaries — never mid-replay, so a
+        // cancelled resume still substitutes its recorded prefix intact before unwinding here.
+        if (cancellation != null && cancellation.isCancelled()) {
+            throw new CancellationSignal(cancellation.reason());
         }
     }
 
