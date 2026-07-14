@@ -237,6 +237,46 @@ class CatalystRuntimeTest {
     }
 
     @Test
+    void cancelDoesNotMaskARealErrorThrownBeforeTheNextBoundary() {
+        // A task that swallows the cancel interrupt, does non-boundary work, and then throws a genuine
+        // error before reaching another ctx boundary must fold to FAILED (with the real error), not be
+        // masked as a clean CANCELLED just because a cancel was requested.
+        MockModel model = MockModel.alwaysReturn("pong");
+        CountDownLatch pastFirstBoundary = new CountDownLatch(1);
+        CountDownLatch proceed = new CountDownLatch(1);
+        Task<String> throwsAfterCancel = ctx -> {
+            ctx.model().complete(CompletionRequest.of(Prompt.builder().user("one").build())).message();
+            pastFirstBoundary.countDown();
+            // Wait until the test has requested cancellation, tolerating (swallowing) the interrupt.
+            while (true) {
+                try { proceed.await(); break; }
+                catch (InterruptedException e) { /* swallow the cancel interrupt and keep going */ }
+            }
+            throw new IllegalStateException("real bug after cancel");
+        };
+
+        try (CatalystRuntime runtime = CatalystRuntime.builder()
+                .log(EventLogs.inMemory()).model(model).build()) {
+
+            ExecutionHandle<String> handle = runtime.execute(throwsAfterCancel, ExecutionOptions.withKey("k"));
+            try {
+                assertThat(pastFirstBoundary.await(5, java.util.concurrent.TimeUnit.SECONDS)).isTrue();
+            } catch (InterruptedException e) {
+                throw new AssertionError(e);
+            }
+
+            runtime.cancel(handle.id()); // trips the token + interrupts, but the task throws a real error
+            proceed.countDown();
+
+            assertThatThrownBy(handle::result)
+                    .isInstanceOf(IllegalStateException.class)
+                    .hasMessageContaining("real bug after cancel");
+            assertThat(runtime.inspect(handle.id()).status()).isEqualTo(Status.FAILED);
+            assertThat(runtime.inspect(handle.id()).error()).contains("real bug after cancel");
+        }
+    }
+
+    @Test
     void memoryGetRejectsWrongType() {
         Task<String> storeThenMisread = ctx -> {
             ctx.memory().put("n", 42); // an Integer

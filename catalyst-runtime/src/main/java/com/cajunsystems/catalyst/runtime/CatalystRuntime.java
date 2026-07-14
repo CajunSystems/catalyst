@@ -491,10 +491,14 @@ public final class CatalystRuntime implements AutoCloseable {
                 // ExecutionPaused already recorded by the context; leave the execution paused.
                 future.completeExceptionally(pause);
             } catch (Throwable t) {
-                // A cancelled attempt folds to CANCELLED, not FAILED — whether the task unwound on the
-                // context's CancellationSignal or on the interrupt we raised (surfacing as some other
-                // throwable). Either way the token is tripped, so treat the whole run as cancelled.
-                if (runningAttempt.token.isCancelled() || t instanceof CancellationSignal) {
+                // A cancelled attempt folds to CANCELLED, not FAILED — but only when the throwable is
+                // *itself* the cancellation: the context's CancellationSignal (raised at a live boundary
+                // once the token trips), or an interruption from the interrupt() we raised. A real error
+                // thrown after a cancel request but before the next boundary is NOT masked as a clean
+                // cancellation — it still records ExecutionFailed so the failure reaches the log/caller.
+                boolean cancelled = t instanceof CancellationSignal
+                        || (runningAttempt.token.isCancelled() && causedByInterruption(t));
+                if (cancelled) {
                     String reason = runningAttempt.token.reason();
                     try {
                         log.append(id, new CatalystEvent.ExecutionCancelled(now(), reason, log.latestSeq(id)));
@@ -530,6 +534,19 @@ public final class CatalystRuntime implements AutoCloseable {
 
     private Instant now() {
         return clock.instant();
+    }
+
+    /**
+     * Whether {@code t} was caused by a thread interruption — our {@link Thread#interrupt()} on a
+     * cancelled worker surfacing as an {@link InterruptedException} (directly or wrapped). This is the
+     * only case, alongside a {@link CancellationSignal}, where a cancelled attempt's throwable is the
+     * cancellation itself rather than an unrelated error thrown after the cancel was requested.
+     */
+    private static boolean causedByInterruption(Throwable t) {
+        for (Throwable c = t; c != null; c = c.getCause()) {
+            if (c instanceof InterruptedException) return true;
+        }
+        return false;
     }
 
     @Override
