@@ -67,7 +67,10 @@ the task registry / standalone `resume(id)` (②) is next.
   `CancellationToken` and interrupts the worker, which unwinds at its next live boundary and records
   the event itself (so no other thread ever writes to a running execution's stream). A task not
   running in this process records the event directly; attaching to a cancelled execution surfaces a
-  `CancellationException`. Gated by the v0.2 Cancellation exit demo in CI.
+  `CancellationException`. Cancellation never masks a real failure — only the cooperative unwind
+  itself (a `CancellationSignal`, or a bare `InterruptedException` from the interrupt) folds to
+  `CANCELLED`; any other error thrown after a cancel still records `ExecutionFailed`. Gated by the
+  v0.2 Cancellation exit demo in CI.
 - 🔜 **Standalone `resume(id)` / task registry** (②) — today resume is driven by re-submitting the
   task with its key; a task-type registry makes `runtime.resume(id)` work without the caller holding
   the `Task`. *Next increment.*
