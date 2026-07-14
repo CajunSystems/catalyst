@@ -139,3 +139,20 @@ jobs:
           echo "$OUT" | grep -q "model calls before cancel: 1" \
             || { echo "FAIL: the post-cancel boundary executed (or the pre-cancel one did not)"; exit 1; }
           echo "v0.2 Cancellation exit criterion holds: cooperative cancel folded to CANCELLED, no wasted call."
+
+      # The v0.2 resume-by-id exit criterion (roadmap increment ②): recover a crashed execution from
+      # its id alone via the task registry — no idempotency key, no re-submitted task — finishing with
+      # zero duplicate model calls.
+      - name: v0.2 Resume-by-id exit demo (standalone resume(id) via the task registry)
+        run: |
+          set -uo pipefail
+          CP="catalyst-api/target/classes:$(cat catalyst-api/target/cp.txt)"
+
+          echo "--- resume a crashed execution from its id alone ---"
+          OUT="$(java -cp "$CP" com.cajunsystems.catalyst.api.Demo resumeid)"
+          echo "$OUT"
+          echo "$OUT" | grep -q "result: SUMMARY|FINAL" \
+            || { echo "FAIL: resume(id) did not complete correctly"; exit 1; }
+          echo "$OUT" | grep -q "model calls THIS run: 2" \
+            || { echo "FAIL: resume(id) made a duplicate model call"; exit 1; }
+          echo "v0.2 Resume-by-id exit criterion holds: recovered from the id alone, zero duplicate calls."
