@@ -12,7 +12,7 @@
 
     <artifactId>catalyst-tools</artifactId>
     <name>Catalyst Tools</name>
-    <description>Built-in tools: ClockTool, CalculatorTool.</description>
+    <description>Built-in tools: ClockTool, CalculatorTool, HttpTool, FilesystemTool.</description>
 
     <dependencies>
         <dependency>
