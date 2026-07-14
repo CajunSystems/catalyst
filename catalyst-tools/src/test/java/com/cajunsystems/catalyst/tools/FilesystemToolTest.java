@@ -16,6 +16,7 @@ class FilesystemToolTest {
     @Test
     void writeReadRoundTrip(@TempDir Path root) throws Exception {
         FilesystemTool fs = new FilesystemTool(root);
+        Files.createDirectory(root.resolve("notes")); // WRITE does not auto-create parents
 
         FilesystemTool.Result written = fs.apply(FilesystemTool.Command.write("notes/a.txt", "hello"));
         assertThat(written.ok()).isTrue();
@@ -83,10 +84,19 @@ class FilesystemToolTest {
     @Test
     void writesAndReadsThroughNestedRealDirectories(@TempDir Path root) throws Exception {
         FilesystemTool fs = new FilesystemTool(root);
+        Files.createDirectories(root.resolve("a/b/c")); // WRITE does not auto-create parents
         fs.apply(FilesystemTool.Command.write("a/b/c/deep.txt", "nested"));
         assertThat(Files.readString(root.resolve("a/b/c/deep.txt"))).isEqualTo("nested");
         assertThat(fs.apply(FilesystemTool.Command.read("a/b/c/deep.txt")).content()).isEqualTo("nested");
         assertThat(fs.apply(FilesystemTool.Command.list("a/b")).content()).isEqualTo("c");
+    }
+
+    @Test
+    void writeDoesNotAutoCreateParentDirectories(@TempDir Path root) {
+        FilesystemTool fs = new FilesystemTool(root);
+        assertThatThrownBy(() -> fs.apply(FilesystemTool.Command.write("no/such/dir/file.txt", "x")))
+                .isInstanceOf(java.nio.file.NoSuchFileException.class);
+        assertThat(Files.exists(root.resolve("no"))).isFalse();
     }
 
     @Test

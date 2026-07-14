@@ -42,6 +42,12 @@ import java.util.Set;
  * falls back to a normalized-path check plus {@code NOFOLLOW} on the final component, which closes the
  * final-component swap but not an intermediate-directory race.
  *
+ * <p>{@link Action#WRITE} does <em>not</em> create missing parent directories: {@code createDirectories}
+ * would resolve intermediate components with symlink-following semantics (a raced-in ancestor symlink
+ * could create directories outside the root), and the JDK exposes no FD-relative {@code mkdirat} to do
+ * it safely. A write whose parent does not already exist fails with {@link NoSuchFileException}; create
+ * the directory structure through the owning application.
+ *
  * <p>Payload note: {@link Action#LIST} returns its entries as a newline-joined string (with the count
  * in {@code size}) because generic-collection payloads are a later increment (roadmap ④). Bodies are
  * UTF-8.
@@ -136,15 +142,23 @@ public final class FilesystemTool implements Tool<FilesystemTool.Command, Filesy
 
     private Result write(Path target, String rel, String content) throws IOException {
         byte[] bytes = (content == null ? "" : content).getBytes(StandardCharsets.UTF_8);
-        Path parentPath = target.getParent();
-        if (parentPath != null) Files.createDirectories(parentPath);
-        withParentDir(target, (parent, leaf) -> {
-            try (SeekableByteChannel ch = parent.newByteChannel(leaf, Set.of(StandardOpenOption.CREATE,
-                    StandardOpenOption.WRITE, StandardOpenOption.TRUNCATE_EXISTING, LinkOption.NOFOLLOW_LINKS))) {
-                ch.write(ByteBuffer.wrap(bytes));
-            }
-            return null;
-        }, () -> writeFallback(target, bytes));
+        // No auto-creation of parent directories: Files.createDirectories resolves intermediate
+        // components with symlink-following semantics, so a raced-in ancestor symlink could create
+        // directories outside the root. The JDK has no FD-relative mkdir (openat/mkdirat) to do it
+        // safely, so WRITE requires the parent to already exist — enforced by the secure NOFOLLOW walk,
+        // which throws NoSuchFileException if any parent component is missing.
+        try {
+            withParentDir(target, (parent, leaf) -> {
+                try (SeekableByteChannel ch = parent.newByteChannel(leaf, Set.of(StandardOpenOption.CREATE,
+                        StandardOpenOption.WRITE, StandardOpenOption.TRUNCATE_EXISTING, LinkOption.NOFOLLOW_LINKS))) {
+                    ch.write(ByteBuffer.wrap(bytes));
+                }
+                return null;
+            }, () -> writeFallback(target, bytes));
+        } catch (NoSuchFileException e) {
+            throw new NoSuchFileException(rel, null,
+                    "parent directory does not exist; FilesystemTool does not auto-create nested directories");
+        }
         return new Result(Action.WRITE, rel, true, null, bytes.length, true);
     }
 
