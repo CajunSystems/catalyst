@@ -34,7 +34,8 @@ every step. Snapshots was the first. Planned order of the remaining increments �
 first: **① cancellation event → ② task registry / `resume(id)` → ③ built-in HTTP + Filesystem tools →
 ④ generic-collection payloads → ⑤ blob store**, with schema evolution, retry semantics, the
 auto-capture agent, per-execution locking, streaming, and observability sequenced after. Order is a
-guide, not a contract — it flexes as we learn.
+guide, not a contract — it flexes as we learn. Snapshots and the cancellation event (①) have shipped;
+the task registry / standalone `resume(id)` (②) is next.
 
 ### Durability & storage (spec §8)
 - ✅ **Snapshots** — periodic fold checkpoints so long executions don't re-fold the whole log on
@@ -61,12 +62,15 @@ guide, not a contract — it flexes as we learn.
   counter, already in the schema) vs. child execution, and wire a retry policy.
 
 ### Runtime ergonomics & scale
-- 🔜 **Dedicated cancellation event** (①, open question §13, review follow-up) — add
-  `ExecutionCancelled` so `cancel()` folds to `CANCELLED` instead of `FAILED`; wire cooperative
-  cancellation of a running task (ties into `WAITING`). *Next increment.*
-- **Standalone `resume(id)` / task registry** (②) — today resume is driven by re-submitting the task
-  with its key; a task-type registry makes `runtime.resume(id)` work without the caller holding the
-  `Task`.
+- ✅ **Dedicated cancellation event** (①) — `ExecutionCancelled` folds `cancel()` to `CANCELLED`
+  instead of `FAILED`. Cancellation of a running task is now cooperative: `cancel(id)` trips a
+  `CancellationToken` and interrupts the worker, which unwinds at its next live boundary and records
+  the event itself (so no other thread ever writes to a running execution's stream). A task not
+  running in this process records the event directly; attaching to a cancelled execution surfaces a
+  `CancellationException`. Gated by the v0.2 Cancellation exit demo in CI.
+- 🔜 **Standalone `resume(id)` / task registry** (②) — today resume is driven by re-submitting the
+  task with its key; a task-type registry makes `runtime.resume(id)` work without the caller holding
+  the `Task`. *Next increment.*
 - **Per-execution locking** — replace the single coarse `synchronized execute` lock with per-id
   coordination to lift the throughput ceiling under concurrent load.
 - **Remaining built-in tools** — `HttpTool` and `FilesystemTool` (sandboxed to a root dir), per spec

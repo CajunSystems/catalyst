@@ -33,7 +33,8 @@ class EventCodecTest {
                 new RetryRequested(t, "timeout", 1000),
                 new ExecutionBranched(t, "exec-parent", 12, "model"),
                 new ExecutionCompleted(t, new TextNode("result")),
-                new ExecutionFailed(t, "boom", 9));
+                new ExecutionFailed(t, "boom", 9),
+                new ExecutionCancelled(t, "cancelled by request", 7));
 
         for (CatalystEvent e : all) {
             byte[] bytes = codec.encode(e);

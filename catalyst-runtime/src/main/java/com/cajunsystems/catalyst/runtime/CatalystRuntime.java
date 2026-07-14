@@ -7,6 +7,8 @@ import com.cajunsystems.catalyst.ReplayMode;
 import com.cajunsystems.catalyst.Task;
 import com.cajunsystems.catalyst.Cost;
 import com.cajunsystems.catalyst.engine.BranchSpec;
+import com.cajunsystems.catalyst.engine.CancellationSignal;
+import com.cajunsystems.catalyst.engine.CancellationToken;
 import com.cajunsystems.catalyst.engine.CostModel;
 import com.cajunsystems.catalyst.engine.ExecutionFailedException;
 import com.cajunsystems.catalyst.engine.ExecutionPausedSignal;
@@ -39,6 +41,7 @@ import java.util.HashMap;
 import java.util.List;
 import java.util.Map;
 import java.util.Optional;
+import java.util.concurrent.CancellationException;
 import java.util.concurrent.CompletableFuture;
 import java.util.concurrent.ConcurrentHashMap;
 import java.util.concurrent.ExecutorService;
@@ -70,6 +73,20 @@ public final class CatalystRuntime implements AutoCloseable {
      * stream): a re-submission of a still-running execution attaches to the in-flight attempt instead.
      */
     private final ConcurrentHashMap<ExecutionId, CompletableFuture<?>> inFlight = new ConcurrentHashMap<>();
+
+    /**
+     * Cancellation handles for attempts running in this process. {@code cancel(id)} trips the token and
+     * interrupts the worker; the worker observes it at its next live boundary (or on interrupt) and
+     * records {@link CatalystEvent.ExecutionCancelled} itself — so no other thread ever appends to a
+     * running execution's stream (the same invariant the in-flight guard protects for pause).
+     */
+    private final ConcurrentHashMap<ExecutionId, RunningAttempt> running = new ConcurrentHashMap<>();
+
+    /** A running attempt's cancellation token plus its worker thread (set once the worker starts). */
+    private static final class RunningAttempt {
+        final CancellationToken token = new CancellationToken();
+        volatile Thread thread;
+    }
 
     private enum Mode { FRESH, RESUME, REPLAY_TERMINAL }
 
@@ -128,9 +145,14 @@ public final class CatalystRuntime implements AutoCloseable {
         final ExecutionId execId = id;
         final Mode runMode = mode;
         CompletableFuture<R> future = new CompletableFuture<>();
+        RunningAttempt attempt = new RunningAttempt();
         inFlight.put(execId, future);
-        future.whenComplete((r, t) -> inFlight.remove(execId, future));
-        executor.execute(() -> runAttempt(task, execId, taskType, opts, runMode, future));
+        running.put(execId, attempt);
+        future.whenComplete((r, t) -> {
+            inFlight.remove(execId, future);
+            running.remove(execId, attempt);
+        });
+        executor.execute(() -> runAttempt(task, execId, taskType, opts, runMode, future, attempt));
         return new FutureExecutionHandle<>(execId, future);
     }
 
@@ -375,17 +397,31 @@ public final class CatalystRuntime implements AutoCloseable {
     }
 
     /**
-     * Requests cancellation. A no-op on an already-terminal execution, and refused while the
-     * execution is in flight in this process (see {@link #pause}). Note: the v0 event schema (spec §5)
-     * has no dedicated cancellation event, so this records a failure marked "cancelled" (open
-     * question §13). Folds to FAILED.
+     * Requests cancellation. A no-op on an already-terminal execution. Records
+     * {@link CatalystEvent.ExecutionCancelled}, so the execution folds to {@code CANCELLED} (not
+     * {@code FAILED}).
+     *
+     * <p>Cancellation is cooperative for a running task: when the execution is in flight in this
+     * process this trips its {@link CancellationToken} and interrupts the worker rather than appending
+     * from this thread (which would race the worker's own appends). The worker observes the token at
+     * its next live boundary — a model/tool/effect/memory call — unwinds, and records the
+     * {@code ExecutionCancelled} itself. A task making no further boundary calls cannot be unwound this
+     * way and runs to completion; cancellation of an already-completed run is then a no-op. When the
+     * execution is <em>not</em> running here (crashed, paused, or never started in this process) the
+     * event is appended directly, since there is no concurrent writer.
      */
     public synchronized void cancel(ExecutionId id) {
         if (inspect(id).isTerminal()) return;      // terminal (incl. just-completed) → no-op
-        if (inFlight.containsKey(id)) {
-            throw new IllegalStateException("Cannot cancel an execution running in this process: " + id);
+        RunningAttempt attempt = running.get(id);
+        if (attempt != null) {
+            // Cooperative: the worker thread — the only writer for a running execution — records the
+            // ExecutionCancelled when it observes the trip. Interrupt to unblock a task parked in I/O.
+            attempt.token.cancel("cancelled by request");
+            Thread worker = attempt.thread;
+            if (worker != null) worker.interrupt();
+            return;
         }
-        log.append(id, new CatalystEvent.ExecutionFailed(now(), "cancelled by request", log.latestSeq(id)));
+        log.append(id, new CatalystEvent.ExecutionCancelled(now(), "cancelled by request", log.latestSeq(id)));
     }
 
     public EventLog log() {
@@ -414,7 +450,9 @@ public final class CatalystRuntime implements AutoCloseable {
     }
 
     private <R> void runAttempt(Task<R> task, ExecutionId id, String taskType,
-                                ExecutionOptions opts, Mode mode, CompletableFuture<R> future) {
+                                ExecutionOptions opts, Mode mode, CompletableFuture<R> future,
+                                RunningAttempt runningAttempt) {
+        runningAttempt.thread = Thread.currentThread();
         // Everything is inside a try that always completes the future — including the setup below
         // (log I/O, fold, lifecycle appends, context construction). If any of that throws, the caller
         // must see the failure rather than block forever on handle.result().
@@ -442,7 +480,8 @@ public final class CatalystRuntime implements AutoCloseable {
             Logger logger = LoggerFactory.getLogger("catalyst.exec." + id.value());
 
             ReplayingContext ctx = new ReplayingContext(id, log, defaultModel, info, opts.vars(),
-                    eventMapper, payloads, inDoubtPolicy, costModel, replayMode, null, clock, logger, recorded, /* appendEnabled */ true);
+                    eventMapper, payloads, inDoubtPolicy, costModel, replayMode, null, clock, logger,
+                    recorded, /* appendEnabled */ true, runningAttempt.token);
 
             try {
                 R result = task.execute(ctx);
@@ -452,12 +491,25 @@ public final class CatalystRuntime implements AutoCloseable {
                 // ExecutionPaused already recorded by the context; leave the execution paused.
                 future.completeExceptionally(pause);
             } catch (Throwable t) {
-                try {
-                    log.append(id, new CatalystEvent.ExecutionFailed(now(), String.valueOf(t), log.latestSeq(id)));
-                } catch (RuntimeException ignored) {
-                    // best-effort failure record; the future still completes exceptionally below
+                // A cancelled attempt folds to CANCELLED, not FAILED — whether the task unwound on the
+                // context's CancellationSignal or on the interrupt we raised (surfacing as some other
+                // throwable). Either way the token is tripped, so treat the whole run as cancelled.
+                if (runningAttempt.token.isCancelled() || t instanceof CancellationSignal) {
+                    String reason = runningAttempt.token.reason();
+                    try {
+                        log.append(id, new CatalystEvent.ExecutionCancelled(now(), reason, log.latestSeq(id)));
+                    } catch (RuntimeException ignored) {
+                        // best-effort cancellation record; the future still completes exceptionally below
+                    }
+                    future.completeExceptionally(new CancellationException(reason));
+                } else {
+                    try {
+                        log.append(id, new CatalystEvent.ExecutionFailed(now(), String.valueOf(t), log.latestSeq(id)));
+                    } catch (RuntimeException ignored) {
+                        // best-effort failure record; the future still completes exceptionally below
+                    }
+                    future.completeExceptionally(t);
                 }
-                future.completeExceptionally(t);
             }
         } catch (Throwable setupFailure) {
             future.completeExceptionally(setupFailure);
@@ -469,7 +521,8 @@ public final class CatalystRuntime implements AutoCloseable {
     private <R> void completeFromTerminalState(ExecutionId id, ExecutionState state, CompletableFuture<R> future) {
         switch (state.status()) {
             case COMPLETED -> future.complete((R) payloads.fromTree(state.result()));
-            case FAILED, CANCELLED -> future.completeExceptionally(new ExecutionFailedException(id, state.error()));
+            case CANCELLED -> future.completeExceptionally(new CancellationException(state.error()));
+            case FAILED -> future.completeExceptionally(new ExecutionFailedException(id, state.error()));
             default -> future.completeExceptionally(
                     new IllegalStateException("Execution " + id + " is not terminal: " + state.status()));
         }

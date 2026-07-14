@@ -123,3 +123,19 @@ jobs:
           [ -n "$COLD" ] && [ -n "$WARM" ] && [ "$WARM" -lt "$COLD" ] \
             || { echo "FAIL: warm inspect did not fold fewer events than cold ($WARM vs $COLD)"; exit 1; }
           echo "v0.2 Snapshot exit criterion holds: warm fold read $WARM events vs $COLD cold, results identical."
+
+      # The v0.2 cancellation exit criterion (roadmap increment ①): a running task is cancelled
+      # cooperatively, folds to CANCELLED (not FAILED), and the post-cancel boundary never runs.
+      - name: v0.2 Cancellation exit demo (cooperative cancel folds to CANCELLED)
+        run: |
+          set -uo pipefail
+          CP="catalyst-api/target/classes:$(cat catalyst-api/target/cp.txt)"
+
+          echo "--- cancel a running execution cooperatively ---"
+          OUT="$(java -cp "$CP" com.cajunsystems.catalyst.api.Demo cancel)"
+          echo "$OUT"
+          echo "$OUT" | grep -q -- "-> CANCELLED" \
+            || { echo "FAIL: cancelled execution did not fold to CANCELLED"; exit 1; }
+          echo "$OUT" | grep -q "model calls before cancel: 1" \
+            || { echo "FAIL: the post-cancel boundary executed (or the pre-cancel one did not)"; exit 1; }
+          echo "v0.2 Cancellation exit criterion holds: cooperative cancel folded to CANCELLED, no wasted call."

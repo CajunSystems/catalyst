@@ -176,6 +176,67 @@ class CatalystRuntimeTest {
     }
 
     @Test
+    void cancelOutOfBandFoldsToCancelledNotFailed() {
+        // An execution that exists but is not running in this process (e.g. crashed/paused, or created
+        // by another node) is cancelled by appending ExecutionCancelled directly — it folds to
+        // CANCELLED, and attaching to it surfaces a CancellationException (not ExecutionFailedException).
+        InMemoryEventLog log = new InMemoryEventLog();
+        ExecutionId id = ExecutionId.random();
+        Instant t = Instant.now();
+        log.putKey("k", id);
+        log.append(id, new CatalystEvent.ExecutionCreated(t, ONE_SHOT.getClass().getName(), "h", "cfg", "k"));
+        log.append(id, new CatalystEvent.ExecutionStarted(t, 1, "node-0"));
+
+        try (CatalystRuntime runtime = CatalystRuntime.builder()
+                .log(log).model(MockModel.alwaysReturn("pong")).build()) {
+            runtime.cancel(id);
+            assertThat(runtime.inspect(id).status()).isEqualTo(Status.CANCELLED);
+            assertThat(runtime.log().read(id)).last()
+                    .extracting(se -> se.event().getClass().getSimpleName())
+                    .isEqualTo("ExecutionCancelled");
+
+            // Re-submitting the key attaches to the cancelled execution: a CancellationException, and
+            // the model is never called (the cancelled prefix substitutes cleanly).
+            MockModel model = MockModel.alwaysReturn("pong");
+            try (CatalystRuntime runtime2 = CatalystRuntime.builder().log(log).model(model).build()) {
+                assertThatThrownBy(() -> runtime2.execute(ONE_SHOT, ExecutionOptions.withKey("k")).result())
+                        .isInstanceOf(java.util.concurrent.CancellationException.class);
+                assertThat(model.callCount()).isEqualTo(0);
+            }
+        }
+    }
+
+    @Test
+    void cancelCooperativelyStopsARunningTaskAndFoldsToCancelled() throws Exception {
+        MockModel model = MockModel.alwaysReturn("pong");
+        CountDownLatch pastFirstBoundary = new CountDownLatch(1);
+        CountDownLatch release = new CountDownLatch(1);
+        // Two boundaries with a park between them. Cancellation is requested while parked; the second
+        // boundary must unwind cooperatively rather than run — so the model is called exactly once.
+        Task<String> twoStep = ctx -> {
+            String first = ctx.model().complete(CompletionRequest.of(Prompt.builder().user("one").build())).message();
+            pastFirstBoundary.countDown();
+            try { release.await(); } catch (InterruptedException e) { Thread.currentThread().interrupt(); }
+            return ctx.model().complete(CompletionRequest.of(Prompt.builder().user("two").build())).message() + first;
+        };
+
+        try (CatalystRuntime runtime = CatalystRuntime.builder()
+                .log(EventLogs.inMemory()).model(model).build()) {
+
+            ExecutionHandle<String> handle = runtime.execute(twoStep, ExecutionOptions.withKey("k"));
+            assertThat(pastFirstBoundary.await(5, java.util.concurrent.TimeUnit.SECONDS)).isTrue();
+
+            runtime.cancel(handle.id());  // trips the token + interrupts the parked worker
+            release.countDown();          // (belt-and-braces: also let the park return normally)
+
+            assertThatThrownBy(handle::result).isInstanceOf(java.util.concurrent.CancellationException.class);
+            assertThat(runtime.inspect(handle.id()).status()).isEqualTo(Status.CANCELLED);
+            // Only the first boundary ran live; the second unwound before calling the model.
+            assertThat(model.callCount()).isEqualTo(1);
+        }
+    }
+
+    @Test
     void memoryGetRejectsWrongType() {
         Task<String> storeThenMisread = ctx -> {
             ctx.memory().put("n", 42); // an Integer

@@ -61,6 +61,23 @@ class ReducerTest {
     }
 
     @Test
+    void foldsCancellation() {
+        Instant t = Instant.EPOCH;
+        List<SequencedEvent> events = seq(List.of(
+                new ExecutionCreated(t, "TaskA", "h", "cfg", ""),
+                new ExecutionStarted(t, 1, "node-0"),
+                new ExecutionCancelled(t, "cancelled by request", 1)));
+
+        ExecutionState state = Reducer.fold(id, events);
+
+        assertThat(state.status()).isEqualTo(Status.CANCELLED);
+        assertThat(state.isTerminal()).isTrue();
+        assertThat(state.error()).isEqualTo("cancelled by request");
+        assertThat(state.trajectory()).extracting(TimelineStep::kind)
+                .contains(TimelineStep.Kind.CANCELLED);
+    }
+
+    @Test
     void foldFromSnapshotEqualsFullFoldAtEverySplit() {
         Instant t = Instant.parse("2026-01-01T00:00:00Z");
         // A stream whose tool request (seq 4) and its completion (seq 5) straddle any split taken

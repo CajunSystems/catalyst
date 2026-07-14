@@ -69,6 +69,8 @@ public final class Demo {
             branchDemo(Files.createTempDirectory("catalyst-branch-"));
         } else if (args.length >= 1 && args[0].equals("snapshot")) {
             snapshotDemo(Files.createTempDirectory("catalyst-snapshot-"));
+        } else if (args.length >= 1 && args[0].equals("cancel")) {
+            cancelDemo(Files.createTempDirectory("catalyst-cancel-"));
         } else {
             Path dir = Files.createTempDirectory("catalyst-demo-");
             System.out.println("No args: running record + resume in-process under " + dir);
@@ -253,6 +255,59 @@ public final class Demo {
                 if (warmFolded >= coldFolded) throw new AssertionError("warm fold did not use the snapshot");
                 if (!matches) throw new AssertionError("snapshot fold diverged from full fold");
                 System.out.println("[snapshot] cold=" + cold.status() + " warm=" + warm.status());
+            }
+        }
+    }
+
+    /**
+     * The v0.2 cancellation exit demo (roadmap increment ①): a running task is cancelled cooperatively
+     * and folds to {@code CANCELLED} — a clean, deliberate stop, distinct from {@code FAILED} — with the
+     * post-cancel boundary never executed (zero wasted model calls after the cancel).
+     */
+    private static void cancelDemo(Path dir) throws Exception {
+        MockModel model = answerModel("FINAL");
+        java.util.concurrent.CountDownLatch pastFirstBoundary = new java.util.concurrent.CountDownLatch(1);
+        java.util.concurrent.CountDownLatch release = new java.util.concurrent.CountDownLatch(1);
+
+        // Two model boundaries with a park between them; cancellation is requested while parked.
+        Task<String> twoStep = ctx -> {
+            String first = ctx.model().complete(STEP1).message();
+            pastFirstBoundary.countDown();
+            try { release.await(); } catch (InterruptedException e) { Thread.currentThread().interrupt(); }
+            return first + "|" + ctx.model().complete(STEP2).message();
+        };
+
+        try (CatalystRuntime runtime = Catalyst.builder()
+                .log(GumboEventLog.at(dir)).model(model).build()) {
+
+            ExecutionHandle<String> handle = runtime.execute(twoStep, ExecutionOptions.withKey(KEY));
+            if (!pastFirstBoundary.await(5, java.util.concurrent.TimeUnit.SECONDS)) {
+                throw new AssertionError("task never reached the first boundary");
+            }
+
+            runtime.cancel(handle.id()); // cooperative: trip the token + interrupt the parked worker
+            release.countDown();
+
+            String outcome;
+            try {
+                handle.result();
+                outcome = "COMPLETED (unexpected)";
+            } catch (java.util.concurrent.CancellationException e) {
+                outcome = "CancellationException";
+            }
+
+            ExecutionState state = runtime.inspect(handle.id());
+            System.out.println("[cancel] execution " + handle.id().value() + " -> " + state.status());
+            System.out.println("[cancel] handle completed with: " + outcome);
+            System.out.println("[cancel] model calls before cancel: " + model.callCount()
+                    + " (the post-cancel boundary was not executed)");
+            System.out.println("[cancel] terminal? " + state.isTerminal() + "; reason: " + state.error());
+
+            if (state.status() != com.cajunsystems.catalyst.Status.CANCELLED) {
+                throw new AssertionError("expected CANCELLED, got " + state.status());
+            }
+            if (model.callCount() != 1) {
+                throw new AssertionError("expected exactly 1 model call, got " + model.callCount());
             }
         }
     }
