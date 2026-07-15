@@ -92,6 +92,8 @@ public final class Demo {
             toolsDemo(Files.createTempDirectory("catalyst-tools-"));
         } else if (args.length >= 1 && args[0].equals("collections")) {
             collectionsDemo(Files.createTempDirectory("catalyst-collections-"));
+        } else if (args.length >= 1 && args[0].equals("blob")) {
+            blobDemo(Files.createTempDirectory("catalyst-blob-"));
         } else {
             Path dir = Files.createTempDirectory("catalyst-demo-");
             System.out.println("No args: running record + resume in-process under " + dir);
@@ -437,6 +439,59 @@ public final class Demo {
             System.out.println("[tools] built-in-tools criterion holds: HTTP + Filesystem calls recorded"
                     + " once and substituted on replay (zero re-execution).");
         }
+    }
+
+    /**
+     * The v0.2 blob-store exit demo (roadmap increment ⑤): a payload larger than the 64 KiB offload
+     * threshold is stored out-of-line in a content-addressed blob store, with the durable event stream
+     * carrying only a small reference. Inspect/replay rehydrate it transparently — the task never sees a
+     * reference.
+     */
+    private static void blobDemo(Path dir) throws Exception {
+        String bigDocument = "LOREM-".repeat(30_000); // ~180 KB, well over the 64 KiB threshold
+
+        Task<Integer> task = ctx -> ctx.effect("fetch-document", () -> bigDocument).length();
+
+        try (CatalystRuntime runtime = Catalyst.builder().log(GumboEventLog.at(dir)).build()) {
+            ExecutionHandle<Integer> handle = runtime.execute(task);
+            int length = handle.result();
+            ExecutionId id = handle.id();
+
+            Path blobsDir = dir.resolve("blobs");
+            long blobFiles;
+            try (var walk = Files.walk(blobsDir)) {
+                blobFiles = walk.filter(Files::isRegularFile).count();
+            }
+            boolean inlinedInLog = logInlinesDocument(dir, "LOREM-LOREM-LOREM-");
+
+            System.out.println("[blob] recorded execution " + id.value() + " -> document length " + length);
+            System.out.println("[blob] blob files stored out-of-line: " + blobFiles
+                    + "; big payload inlined in the event log: " + inlinedInLog);
+
+            ExecutionState replayed = runtime.replay(id, task);
+            System.out.println("[blob] replayed -> " + replayed.status()
+                    + " (the payload was rehydrated from the blob store transparently)");
+
+            if (length != bigDocument.length()) throw new AssertionError("wrong document length");
+            if (blobFiles < 1) throw new AssertionError("payload was not offloaded to the blob store");
+            if (inlinedInLog) throw new AssertionError("payload was inlined in the event log");
+            System.out.println("[blob] blob-store criterion holds: large payload stored out-of-line and"
+                    + " rehydrated on replay.");
+        }
+    }
+
+    /** True if a non-blob file under {@code dir} inlines {@code needle}. */
+    private static boolean logInlinesDocument(Path dir, String needle) throws Exception {
+        Path blobs = dir.resolve("blobs");
+        try (var walk = Files.walk(dir)) {
+            for (Path p : (Iterable<Path>) walk.filter(Files::isRegularFile)::iterator) {
+                if (p.startsWith(blobs)) continue;
+                if (new String(Files.readAllBytes(p), java.nio.charset.StandardCharsets.UTF_8).contains(needle)) {
+                    return true;
+                }
+            }
+        }
+        return false;
     }
 
     /** An item in the collections demo — a record carried inside a List payload. */

@@ -189,3 +189,20 @@ jobs:
           echo "$OUT" | grep -q "supplier calls during replay: 0" \
             || { echo "FAIL: replay re-ran the effect supplier (collection not substituted)"; exit 1; }
           echo "v0.2 Collection-payloads exit criterion holds: List<record> round-trips and substitutes on replay."
+
+      # The v0.2 blob-store exit criterion (roadmap increment ⑤): a payload over the 64 KiB threshold is
+      # stored out-of-line in a content-addressed blob store, not inlined in the event stream, and
+      # rehydrated transparently on replay.
+      - name: v0.2 Blob store exit demo (large payload stored out-of-line, rehydrated on replay)
+        run: |
+          set -uo pipefail
+          CP="catalyst-api/target/classes:$(cat catalyst-api/target/cp.txt)"
+
+          echo "--- record then replay a task with a >64 KiB payload ---"
+          OUT="$(java -cp "$CP" com.cajunsystems.catalyst.api.Demo blob)"
+          echo "$OUT"
+          echo "$OUT" | grep -q "big payload inlined in the event log: false" \
+            || { echo "FAIL: large payload was inlined in the event log"; exit 1; }
+          echo "$OUT" | grep -q "blob-store criterion holds" \
+            || { echo "FAIL: blob-store demo did not pass its assertions"; exit 1; }
+          echo "v0.2 Blob-store exit criterion holds: large payload stored out-of-line and rehydrated on replay."

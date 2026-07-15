@@ -20,7 +20,8 @@ intended source, but if `jitpack.io` is blocked, install Gumbo locally first:
 
 ## Architecture (where things live)
 
-- `catalyst-events` — sealed `CatalystEvent` hierarchy + `EventCodec` (Jackson). Schema-stable; keep
+- `catalyst-events` — sealed `CatalystEvent` hierarchy + `EventCodec` (Jackson) + `BlobStore`
+  (content-addressed offload of large payload fields, in-memory + `FileBlobStore`). Schema-stable; keep
   changes additive.
 - `catalyst-core` — SPIs (`Task`, `Context`, `Model`, `Tool`, `Memory`, `EventLog`), the pure
   `Reducer` fold, and `ReplayingContext` — the record/substitute engine that makes resume/replay
@@ -64,6 +65,11 @@ intended source, but if `jitpack.io` is blocked, install Gumbo locally first:
   strict replay substitutes both recorded boundaries — the request is not re-issued and the write is
   not re-applied. `FilesystemTool` is sandboxed to a root dir and rejects `..`/absolute/symlink
   escapes; both tools are non-`@Deterministic` (their outputs are recorded, not re-executed).
+- **v0.2 Blob store** — `BlobStoreAcceptanceTest` + `Demo blob`: a payload over the offload threshold
+  (default 64 KiB) is stored out-of-line in a content-addressed `BlobStore` (durable `FileBlobStore` under
+  `path/blobs`, SHA-256 refs, dedup) and rehydrated transparently on inspect/replay — offloading lives at
+  the `EventCodec` seam (`encode` externalizes large top-level payload fields, `decode` inlines them), so
+  the core only ever sees fully-inlined events. Small events stay byte-identical (old logs interoperate).
 - **v0.2 Collection payloads** — `CollectionPayloadAcceptanceTest` + `Demo collections`: a task captures a
   `List`/`Map` of records (via `ctx.effect` or as its result); `PayloadCodec` encodes collections/arrays
   structurally (each element in its own typed envelope, recursively) so element types survive the
