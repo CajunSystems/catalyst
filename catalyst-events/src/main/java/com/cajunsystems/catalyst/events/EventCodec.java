@@ -3,6 +3,7 @@ package com.cajunsystems.catalyst.events;
 import com.fasterxml.jackson.core.JsonProcessingException;
 import com.fasterxml.jackson.databind.JsonNode;
 import com.fasterxml.jackson.databind.ObjectMapper;
+import com.fasterxml.jackson.databind.node.ArrayNode;
 import com.fasterxml.jackson.databind.node.ObjectNode;
 
 import java.io.UncheckedIOException;
@@ -17,18 +18,24 @@ import java.util.Map;
  *
  * <p><strong>Blob offloading (spec §8).</strong> When constructed with a {@link BlobStore}, a large
  * payload field (a completion, tool result, or document that would otherwise be inlined) is lifted out
- * to the content-addressed store and replaced in the event by a small reference; {@link #decode}
+ * to the content-addressed store and its field value is replaced by a string reference; {@link #decode}
  * rehydrates it transparently. The threshold is per top-level field, so only genuinely large payloads
  * are externalized and small events stay byte-identical to the no-blob encoding. The rest of the system
  * only ever sees fully-inlined {@link CatalystEvent}s — offloading lives entirely at this seam.
+ *
+ * <p>Which fields were offloaded is recorded in a reserved <em>event-level</em> field
+ * {@code "$catalystBlobs"} (an array of field names), not by sniffing payload shape — so a user payload
+ * that happens to look like a reference can never be mistaken for one. The key lives in the event's own
+ * namespace (a task payload is always the <em>value</em> of a field, nested a level below), so it never
+ * collides with user data; it is reserved and must not be emitted as an event field name.
  */
 public final class EventCodec {
 
     /** Default size above which a top-level payload field is offloaded to the blob store: 64 KiB. */
     public static final int DEFAULT_BLOB_THRESHOLD_BYTES = 64 * 1024;
 
-    /** Marker key of a blob-reference node: {@code {"$catalystBlob":"sha256:..."}}. */
-    private static final String BLOB_REF_KEY = "$catalystBlob";
+    /** Reserved event-level field listing the names of offloaded fields. Never a real event field. */
+    private static final String BLOB_FIELDS_KEY = "$catalystBlobs";
     /** The discriminator field, never offloaded. */
     private static final String TYPE_KEY = "@type";
 
@@ -46,6 +53,9 @@ public final class EventCodec {
 
     /** A codec that offloads payload fields larger than {@code blobThresholdBytes} to {@code blobStore}. */
     public EventCodec(ObjectMapper mapper, BlobStore blobStore, int blobThresholdBytes) {
+        if (blobStore != null && blobThresholdBytes <= 0) {
+            throw new IllegalArgumentException("blobThresholdBytes must be positive, got: " + blobThresholdBytes);
+        }
         this.mapper = mapper;
         this.blobStore = blobStore;
         this.blobThresholdBytes = blobThresholdBytes;
@@ -55,15 +65,20 @@ public final class EventCodec {
         try {
             byte[] full = mapper.writeValueAsBytes(event);
             // No blob store, or the whole event is small: keep the direct (byte-identical) encoding.
+            // This fast path is the common case and avoids the tree round-trip entirely.
             if (blobStore == null || full.length < blobThresholdBytes) {
                 return full;
             }
-            ObjectNode tree = (ObjectNode) mapper.valueToTree(event);
-            if (offloadLargeFields(tree)) {
-                return mapper.writeValueAsBytes(tree);
+            // Large event: reuse the bytes we just produced (parse, don't re-serialize the event).
+            ObjectNode tree = (ObjectNode) mapper.readTree(full);
+            List<String> offloaded = offloadLargeFields(tree);
+            if (offloaded.isEmpty()) {
+                return full; // large event, but no single field crossed the threshold — leave it inline
             }
-            return full; // large event, but no single field crossed the threshold — leave it inline
-        } catch (JsonProcessingException e) {
+            ArrayNode names = tree.putArray(BLOB_FIELDS_KEY);
+            offloaded.forEach(names::add);
+            return mapper.writeValueAsBytes(tree);
+        } catch (java.io.IOException e) {
             throw new UncheckedIOException("Failed to encode event: " + event, e);
         }
     }
@@ -74,50 +89,45 @@ public final class EventCodec {
                 return mapper.readValue(data, CatalystEvent.class);
             }
             JsonNode tree = mapper.readTree(data);
-            inlineBlobRefs(tree);
+            if (tree instanceof ObjectNode obj && obj.has(BLOB_FIELDS_KEY)) {
+                inlineBlobRefs(obj);
+            }
             return mapper.treeToValue(tree, CatalystEvent.class);
         } catch (Exception e) {
             throw new UncheckedIOException("Failed to decode event", asIO(e));
         }
     }
 
-    /** Replaces each top-level field whose serialized size meets the threshold with a blob reference. */
-    private boolean offloadLargeFields(ObjectNode tree) throws JsonProcessingException {
+    /**
+     * Replaces each top-level field whose serialized size meets the threshold with its blob reference
+     * (a string) and returns the names of the fields that were offloaded.
+     */
+    private List<String> offloadLargeFields(ObjectNode tree) throws JsonProcessingException {
         List<Map.Entry<String, JsonNode>> fields = new ArrayList<>();
         tree.fields().forEachRemaining(fields::add);
-        boolean offloaded = false;
+        List<String> offloaded = new ArrayList<>();
         for (Map.Entry<String, JsonNode> field : fields) {
             if (field.getKey().equals(TYPE_KEY)) continue;
-            JsonNode value = field.getValue();
-            byte[] bytes = mapper.writeValueAsBytes(value);
+            byte[] bytes = mapper.writeValueAsBytes(field.getValue());
             if (bytes.length >= blobThresholdBytes) {
-                String ref = blobStore.put(bytes);
-                ObjectNode refNode = mapper.createObjectNode();
-                refNode.put(BLOB_REF_KEY, ref);
-                tree.set(field.getKey(), refNode);
-                offloaded = true;
+                tree.put(field.getKey(), blobStore.put(bytes)); // field value becomes the string ref
+                offloaded.add(field.getKey());
             }
         }
         return offloaded;
     }
 
-    /** Resolves each top-level blob reference back to its stored payload. */
-    private void inlineBlobRefs(JsonNode tree) throws java.io.IOException {
-        if (!(tree instanceof ObjectNode obj)) return;
-        List<Map.Entry<String, JsonNode>> fields = new ArrayList<>();
-        obj.fields().forEachRemaining(fields::add);
-        for (Map.Entry<String, JsonNode> field : fields) {
-            JsonNode value = field.getValue();
-            if (isBlobRef(value)) {
-                String ref = value.get(BLOB_REF_KEY).textValue();
-                obj.set(field.getKey(), mapper.readTree(blobStore.get(ref)));
+    /** Resolves the offloaded fields listed in {@code $catalystBlobs} back to their stored payloads. */
+    private void inlineBlobRefs(ObjectNode obj) throws java.io.IOException {
+        JsonNode names = obj.remove(BLOB_FIELDS_KEY);
+        if (names == null || !names.isArray()) return;
+        for (JsonNode nameNode : names) {
+            String field = nameNode.textValue();
+            JsonNode ref = field == null ? null : obj.get(field);
+            if (ref != null && ref.isTextual()) {
+                obj.set(field, mapper.readTree(blobStore.get(ref.textValue())));
             }
         }
-    }
-
-    private static boolean isBlobRef(JsonNode node) {
-        return node != null && node.isObject() && node.size() == 1
-                && node.has(BLOB_REF_KEY) && node.get(BLOB_REF_KEY).isTextual();
     }
 
     private static java.io.IOException asIO(Exception e) {

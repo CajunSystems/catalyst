@@ -31,8 +31,11 @@ public final class FileBlobStore implements BlobStore {
         Path target = fileFor(ref);
         if (Files.exists(target)) return ref; // content-addressed: identical bytes already stored
         try {
-            Files.createDirectories(target.getParent()); // root + shard dir
-            Path tmp = Files.createTempFile(root, "blob-", ".tmp");
+            Path shard = target.getParent();
+            Files.createDirectories(shard); // root + shard dir
+            // Temp file lives in the shard dir so the atomic move never crosses directories (some NFS/
+            // CIFS mounts reject cross-directory ATOMIC_MOVE).
+            Path tmp = Files.createTempFile(shard, "blob-", ".tmp");
             try {
                 Files.write(tmp, content);
                 try {

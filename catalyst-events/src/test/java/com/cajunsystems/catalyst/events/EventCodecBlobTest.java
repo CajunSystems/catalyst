@@ -1,12 +1,14 @@
 package com.cajunsystems.catalyst.events;
 
 import com.fasterxml.jackson.databind.JsonNode;
+import com.fasterxml.jackson.databind.node.ObjectNode;
 import org.junit.jupiter.api.Test;
 
 import java.nio.charset.StandardCharsets;
 import java.time.Instant;
 
 import static org.assertj.core.api.Assertions.assertThat;
+import static org.assertj.core.api.Assertions.assertThatThrownBy;
 
 class EventCodecBlobTest {
 
@@ -26,16 +28,38 @@ class EventCodecBlobTest {
 
         byte[] stored = codec.encode(event);
 
-        // The event bytes no longer inline the payload — it lives in the blob store instead.
-        assertThat(new String(stored, StandardCharsets.UTF_8)).doesNotContain(big).contains("$catalystBlob");
+        // The event bytes no longer inline the payload — it lives in the blob store instead. The event
+        // records which fields were offloaded in the reserved $catalystBlobs sidecar.
+        assertThat(new String(stored, StandardCharsets.UTF_8)).doesNotContain(big).contains("$catalystBlobs");
         assertThat(stored.length).isLessThan(big.length());
-        assertThat(blobs.has(firstRef(stored))).isTrue();
+        assertThat(blobs.has(resultRef(stored))).isTrue();
 
         // Decode rehydrates the payload transparently — the event is fully inlined again.
         CatalystEvent back = codec.decode(stored);
         assertThat(back).isInstanceOf(CatalystEvent.ExecutionCompleted.class);
         assertThat(((CatalystEvent.ExecutionCompleted) back).result().textValue()).isEqualTo(big);
         assertThat(back).isEqualTo(event);
+    }
+
+    @Test
+    void aPayloadThatLooksLikeAReferenceIsNotMistakenForOne() {
+        // A small payload containing the reserved marker key nested inside it must round-trip untouched:
+        // the offload decision is driven by the event-level $catalystBlobs sidecar, not payload shape.
+        ObjectNode lookalike = EventJson.newMapper().createObjectNode();
+        lookalike.put("$catalystBlobs", "sha256:deadbeef");
+        lookalike.put("$catalystBlob", "sha256:cafe");
+        CatalystEvent event = new CatalystEvent.EffectRecorded(
+                Instant.parse("2026-01-01T00:00:00Z"), "label", lookalike);
+
+        assertThat(codec.decode(codec.encode(event))).isEqualTo(event);
+    }
+
+    @Test
+    void rejectsNonPositiveThreshold() {
+        assertThatThrownBy(() -> new EventCodec(EventJson.shared(), blobs, 0))
+                .isInstanceOf(IllegalArgumentException.class);
+        assertThatThrownBy(() -> new EventCodec(EventJson.shared(), blobs, -1))
+                .isInstanceOf(IllegalArgumentException.class);
     }
 
     @Test
@@ -55,13 +79,13 @@ class EventCodecBlobTest {
         assertThat(codec.decode(inlined)).isEqualTo(event);
     }
 
-    private String firstRef(byte[] stored) {
-        JsonNode tree;
+    private String resultRef(byte[] stored) {
         try {
-            tree = EventJson.shared().readTree(stored);
+            JsonNode tree = EventJson.shared().readTree(stored);
+            assertThat(tree.get("$catalystBlobs").toString()).contains("result"); // offloaded field listed
+            return tree.get("result").textValue(); // the field value is now the string ref
         } catch (Exception e) {
             throw new RuntimeException(e);
         }
-        return tree.get("result").get("$catalystBlob").textValue();
     }
 }
