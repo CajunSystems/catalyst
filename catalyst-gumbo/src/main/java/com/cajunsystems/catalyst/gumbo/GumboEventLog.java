@@ -1,8 +1,11 @@
 package com.cajunsystems.catalyst.gumbo;
 
 import com.cajunsystems.catalyst.ExecutionId;
+import com.cajunsystems.catalyst.events.BlobStore;
 import com.cajunsystems.catalyst.events.CatalystEvent;
 import com.cajunsystems.catalyst.events.EventCodec;
+import com.cajunsystems.catalyst.events.EventJson;
+import com.cajunsystems.catalyst.events.FileBlobStore;
 import com.cajunsystems.catalyst.events.SequencedEvent;
 import com.cajunsystems.catalyst.log.EventLog;
 import com.cajunsystems.catalyst.log.Snapshot;
@@ -49,29 +52,42 @@ public final class GumboEventLog implements EventLog {
     private final LogView indexView;
     private final LogView snapshotView;
 
-    private GumboEventLog(SharedLogService service) {
+    private GumboEventLog(SharedLogService service, EventCodec codec) {
         this.service = service;
-        this.serializer = new EventLogSerializer(new EventCodec());
+        this.serializer = new EventLogSerializer(codec);
         this.indexView = service.getView(INDEX_TAG);
         this.snapshotView = service.getView(SNAPSHOT_TAG);
     }
 
-    /** Opens (or creates) an embedded, file-backed durable log rooted at {@code path}. */
+    /**
+     * Opens (or creates) an embedded, file-backed durable log rooted at {@code path}. Payloads larger
+     * than {@link EventCodec#DEFAULT_BLOB_THRESHOLD_BYTES} are offloaded to a content-addressed
+     * {@link FileBlobStore} under {@code path/blobs}, so oversized completions/tool results are stored
+     * out-of-line and rehydrated transparently on read (spec §8).
+     */
     public static GumboEventLog at(Path path) {
-        return open(new FileBasedPersistenceAdapter(path.toString()));
+        BlobStore blobs = FileBlobStore.at(path.resolve("blobs"));
+        return at(path, blobs, EventCodec.DEFAULT_BLOB_THRESHOLD_BYTES);
     }
 
-    /** A Gumbo-backed log with in-memory persistence — for fast tests that still exercise Gumbo. */
+    /** As {@link #at(Path)}, with a caller-supplied blob store and offload threshold. */
+    public static GumboEventLog at(Path path, BlobStore blobStore, int blobThresholdBytes) {
+        return open(new FileBasedPersistenceAdapter(path.toString()), blobStore, blobThresholdBytes);
+    }
+
+    /** A Gumbo-backed log with in-memory persistence and an in-memory blob store — for fast tests. */
     public static GumboEventLog inMemory() {
-        return open(new InMemoryPersistenceAdapter());
+        return open(new InMemoryPersistenceAdapter(), BlobStore.inMemory(),
+                EventCodec.DEFAULT_BLOB_THRESHOLD_BYTES);
     }
 
-    private static GumboEventLog open(PersistenceAdapter adapter) {
+    private static GumboEventLog open(PersistenceAdapter adapter, BlobStore blobStore, int blobThresholdBytes) {
         try {
             SharedLogConfig config = SharedLogConfig.builder()
                     .persistenceAdapter(adapter)
                     .build();
-            return new GumboEventLog(SharedLogService.open(config));
+            EventCodec codec = new EventCodec(EventJson.shared(), blobStore, blobThresholdBytes);
+            return new GumboEventLog(SharedLogService.open(config), codec);
         } catch (IOException e) {
             throw new UncheckedIOException("Failed to open Gumbo log", e);
         }

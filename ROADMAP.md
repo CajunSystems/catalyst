@@ -35,8 +35,9 @@ first: **① cancellation event → ② task registry / `resume(id)` → ③ bui
 ④ generic-collection payloads → ⑤ blob store**, with schema evolution, retry semantics, the
 auto-capture agent, per-execution locking, streaming, and observability sequenced after. Order is a
 guide, not a contract — it flexes as we learn. Snapshots, the cancellation event (①), the task
-registry / standalone `resume(id)` (②), the built-in HTTP + Filesystem tools (③), and
-generic-collection payloads (④) have shipped; the blob store (⑤) is next.
+registry / standalone `resume(id)` (②), the built-in HTTP + Filesystem tools (③), generic-collection
+payloads (④), and the blob store (⑤) have shipped; the remaining v0.2 work (schema evolution, retry
+semantics, the auto-capture agent, per-execution locking, streaming, observability) is unsequenced.
 
 ### Durability & storage (spec §8)
 - ✅ **Snapshots** — periodic fold checkpoints so long executions don't re-fold the whole log on
@@ -45,9 +46,13 @@ generic-collection payloads (④) have shipped; the blob store (⑤) is next.
   `ReducerState`) and folds *from* the latest snapshot forward. The runtime checkpoints
   opportunistically every `snapshotInterval` events (builder-configurable, default 100; `0` disables).
   Gated by the v0.2 Snapshot exit demo in CI.
-- **Blob store** — content-addressed payloads > 64 KB referenced from events (completions and tool
-  results can be megabytes). Lifts the current "everything inlined" limitation and unblocks large
-  generic-collection / document payloads.
+- ✅ **Blob store** (⑤) — a content-addressed `BlobStore` (in-memory + durable `FileBlobStore`, SHA-256
+  refs, dedup) offloads any event payload field over a threshold (default 64 KiB) at the `EventCodec`
+  seam and rehydrates it on decode, so oversized completions/tool results/documents are stored
+  out-of-line and the rest of the system only ever sees fully-inlined events. Small events stay
+  byte-identical to the no-blob encoding, and a blob-backed codec still reads legacy inlined logs.
+  `GumboEventLog.at(path)` wires a `FileBlobStore` under `path/blobs` by default. Gated by the v0.2
+  Blob-store exit demo in CI.
 - **Schema evolution** (open question §13.4) — pick a strategy before a public release: tolerant
   reader vs. upcasters. Events live forever; this must be decided while the schema is still small.
 
