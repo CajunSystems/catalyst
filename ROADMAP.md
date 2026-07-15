@@ -36,7 +36,7 @@ first: **① cancellation event → ② task registry / `resume(id)` → ③ bui
 auto-capture agent, per-execution locking, streaming, and observability sequenced after. Order is a
 guide, not a contract — it flexes as we learn. Snapshots, the cancellation event (①), the task
 registry / standalone `resume(id)` (②), the built-in HTTP + Filesystem tools (③), generic-collection
-payloads (④), and the blob store (⑤) have shipped; the remaining v0.2 work (schema evolution, retry
+payloads (④), the blob store (⑤), and schema evolution have shipped; the remaining v0.2 work (retry
 semantics, the auto-capture agent, per-execution locking, streaming, observability) is unsequenced.
 
 ### Durability & storage (spec §8)
@@ -52,9 +52,18 @@ semantics, the auto-capture agent, per-execution locking, streaming, observabili
   out-of-line and the rest of the system only ever sees fully-inlined events. Small events stay
   byte-identical to the no-blob encoding, and a blob-backed codec still reads legacy inlined logs.
   `GumboEventLog.at(path)` wires a `FileBlobStore` under `path/blobs` by default. Gated by the v0.2
-  Blob-store exit demo in CI.
-- **Schema evolution** (open question §13.4) — pick a strategy before a public release: tolerant
-  reader vs. upcasters. Events live forever; this must be decided while the schema is still small.
+  Blob-store exit demo in CI. *Swappability follow-up (noted): the `BlobStore` SPI is already
+  injectable with an opaque ref contract (a custom S3/GCS/Redis store just returns its own refs), but
+  two additive ergonomics remain for remote backends — make `BlobStore extends AutoCloseable` (default
+  no-op) so `GumboEventLog.close()` can close it, and add a `.blobStore(...)` convenience to
+  `Catalyst.builder()` instead of only the log factory.*
+- ✅ **Schema evolution** (open question §13.4) — strategy chosen and documented in
+  [`docs/schema-evolution.md`](docs/schema-evolution.md): **tolerant reader** for additive changes
+  (the shared mapper ignores unknown fields and defaults missing ones) + an **`EventUpcaster`** chain
+  applied on decode for structural changes (rename field/type, change type, split). Upcasters compose,
+  see fully-inlined events, and are registered via `EventCodec.builder()` / `GumboEventLog.at(path,
+  upcasters)`. An explicit schema version is deferred until the first breaking change (absent ⇒ v1), so
+  today's logs stay byte-identical. Gated by the v0.2 Schema-evolution exit demo in CI.
 
 ### Determinism & correctness
 - **Auto-capture agent** (spec §6, v0.2 stretch) — a ByteBuddy agent that records `Instant.now()`,

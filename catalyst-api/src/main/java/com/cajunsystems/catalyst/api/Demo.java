@@ -94,6 +94,8 @@ public final class Demo {
             collectionsDemo(Files.createTempDirectory("catalyst-collections-"));
         } else if (args.length >= 1 && args[0].equals("blob")) {
             blobDemo(Files.createTempDirectory("catalyst-blob-"));
+        } else if (args.length >= 1 && args[0].equals("schema")) {
+            schemaDemo();
         } else {
             Path dir = Files.createTempDirectory("catalyst-demo-");
             System.out.println("No args: running record + resume in-process under " + dir);
@@ -439,6 +441,55 @@ public final class Demo {
             System.out.println("[tools] built-in-tools criterion holds: HTTP + Filesystem calls recorded"
                     + " once and substituted on replay (zero re-execution).");
         }
+    }
+
+    /**
+     * The v0.2 schema-evolution exit demo (roadmap — spec §13.4): a log recorded under an <em>older</em>
+     * schema — an event type that has since been renamed, plus a field that has since been renamed — is
+     * read through the current codec with {@code EventUpcaster}s and folds correctly, proving that events
+     * written before a schema change still replay after it. Additive changes (an unknown field a newer
+     * writer added) ride the tolerant reader with no upcaster at all.
+     */
+    private static void schemaDemo() {
+        // Bytes as they would sit in an old log: "TaskCompleted" was later renamed to "ExecutionCompleted",
+        // "ExecutionFailed.message" to "error", and a stray field a newer writer would add is present.
+        byte[][] legacyLog = {
+            bytes("{\"@type\":\"ExecutionCreated\",\"at\":\"2026-01-01T00:00:00Z\",\"taskType\":\"Demo\","
+                    + "\"argsHash\":\"h\",\"configFingerprint\":\"cfg\",\"idempotencyKey\":\"k\"}"),
+            bytes("{\"@type\":\"ExecutionStarted\",\"at\":\"2026-01-01T00:00:01Z\",\"attempt\":1,"
+                    + "\"nodeId\":\"node-0\",\"futureFieldAddedLater\":true}"), // unknown field → tolerated
+            bytes("{\"@type\":\"TaskCompleted\",\"at\":\"2026-01-01T00:00:02Z\",\"result\":42}"), // renamed type
+        };
+
+        com.cajunsystems.catalyst.events.EventCodec codec =
+                com.cajunsystems.catalyst.events.EventCodec.builder()
+                        .upcaster(com.cajunsystems.catalyst.events.EventUpcaster.renameType("TaskCompleted", "ExecutionCompleted"))
+                        .upcaster(com.cajunsystems.catalyst.events.EventUpcaster.renameField("ExecutionFailed", "message", "error"))
+                        .build();
+
+        java.util.List<com.cajunsystems.catalyst.events.SequencedEvent> events = new java.util.ArrayList<>();
+        for (int i = 0; i < legacyLog.length; i++) {
+            events.add(new com.cajunsystems.catalyst.events.SequencedEvent(i, codec.decode(legacyLog[i])));
+        }
+
+        ExecutionId id = ExecutionId.random();
+        ExecutionState state = com.cajunsystems.catalyst.engine.Reducer.fold(id, events);
+
+        System.out.println("[schema] decoded " + events.size() + " events recorded under an older schema");
+        System.out.println("[schema] folded status: " + state.status()
+                + "; result: " + (state.result() == null ? "null" : state.result()));
+        if (state.status() != com.cajunsystems.catalyst.Status.COMPLETED) {
+            throw new AssertionError("expected COMPLETED, got " + state.status());
+        }
+        if (state.result() == null || state.result().asInt() != 42) {
+            throw new AssertionError("expected result 42, got " + state.result());
+        }
+        System.out.println("[schema] schema-evolution criterion holds: a legacy-schema log (renamed type +"
+                + " field, plus an unknown field) reads and folds under the current schema.");
+    }
+
+    private static byte[] bytes(String json) {
+        return json.getBytes(java.nio.charset.StandardCharsets.UTF_8);
     }
 
     /**

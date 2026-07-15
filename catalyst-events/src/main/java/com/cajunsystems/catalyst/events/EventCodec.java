@@ -42,6 +42,7 @@ public final class EventCodec {
     private final ObjectMapper mapper;
     private final BlobStore blobStore;   // null → inline everything (legacy behavior)
     private final int blobThresholdBytes;
+    private final List<EventUpcaster> upcasters;
 
     public EventCodec() {
         this(EventJson.shared());
@@ -53,12 +54,22 @@ public final class EventCodec {
 
     /** A codec that offloads payload fields larger than {@code blobThresholdBytes} to {@code blobStore}. */
     public EventCodec(ObjectMapper mapper, BlobStore blobStore, int blobThresholdBytes) {
+        this(mapper, blobStore, blobThresholdBytes, List.of());
+    }
+
+    private EventCodec(ObjectMapper mapper, BlobStore blobStore, int blobThresholdBytes,
+                       List<EventUpcaster> upcasters) {
         if (blobStore != null && blobThresholdBytes <= 0) {
             throw new IllegalArgumentException("blobThresholdBytes must be positive, got: " + blobThresholdBytes);
         }
         this.mapper = mapper;
         this.blobStore = blobStore;
         this.blobThresholdBytes = blobThresholdBytes;
+        this.upcasters = List.copyOf(upcasters);
+    }
+
+    public static Builder builder() {
+        return new Builder();
     }
 
     public byte[] encode(CatalystEvent event) {
@@ -85,12 +96,18 @@ public final class EventCodec {
 
     public CatalystEvent decode(byte[] data) {
         try {
-            if (blobStore == null) {
+            // Fast path: nothing to rehydrate or migrate, bind directly.
+            if (blobStore == null && upcasters.isEmpty()) {
                 return mapper.readValue(data, CatalystEvent.class);
             }
             JsonNode tree = mapper.readTree(data);
-            if (tree instanceof ObjectNode obj && obj.has(BLOB_FIELDS_KEY)) {
+            // Rehydrate blobs first so upcasters always see a fully-inlined event (plain JSON only).
+            if (blobStore != null && tree instanceof ObjectNode obj && obj.has(BLOB_FIELDS_KEY)) {
                 inlineBlobRefs(obj);
+            }
+            // Then migrate old shapes to the current schema (spec §13.4) before binding.
+            for (EventUpcaster upcaster : upcasters) {
+                tree = upcaster.upcast(tree);
             }
             return mapper.treeToValue(tree, CatalystEvent.class);
         } catch (Exception e) {
@@ -137,5 +154,40 @@ public final class EventCodec {
     /** The mapper backing this codec, for callers that need to (de)serialize opaque payloads. */
     public ObjectMapper mapper() {
         return mapper;
+    }
+
+    /** Assembles an {@link EventCodec} with optional blob offloading and schema-evolution upcasters. */
+    public static final class Builder {
+        private ObjectMapper mapper = EventJson.shared();
+        private BlobStore blobStore;
+        private int blobThresholdBytes = DEFAULT_BLOB_THRESHOLD_BYTES;
+        private final List<EventUpcaster> upcasters = new ArrayList<>();
+
+        public Builder mapper(ObjectMapper mapper) {
+            this.mapper = mapper;
+            return this;
+        }
+
+        /** Offload payload fields at/over {@code thresholdBytes} to {@code blobStore}. */
+        public Builder blobStore(BlobStore blobStore, int thresholdBytes) {
+            this.blobStore = blobStore;
+            this.blobThresholdBytes = thresholdBytes;
+            return this;
+        }
+
+        /** Appends an upcaster applied (in registration order) to migrate old events on decode. */
+        public Builder upcaster(EventUpcaster upcaster) {
+            this.upcasters.add(upcaster);
+            return this;
+        }
+
+        public Builder upcasters(List<EventUpcaster> upcasters) {
+            this.upcasters.addAll(upcasters);
+            return this;
+        }
+
+        public EventCodec build() {
+            return new EventCodec(mapper, blobStore, blobThresholdBytes, upcasters);
+        }
     }
 }
