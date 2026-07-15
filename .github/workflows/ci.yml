@@ -206,3 +206,20 @@ jobs:
           echo "$OUT" | grep -q "blob-store criterion holds" \
             || { echo "FAIL: blob-store demo did not pass its assertions"; exit 1; }
           echo "v0.2 Blob-store exit criterion holds: large payload stored out-of-line and rehydrated on replay."
+
+      # The v0.2 schema-evolution exit criterion (spec §13.4): a log recorded under an older schema
+      # (renamed event type + field, plus an unknown field) reads and folds under the current schema
+      # via the tolerant reader + upcasters.
+      - name: v0.2 Schema evolution exit demo (legacy-schema log reads under the current schema)
+        run: |
+          set -uo pipefail
+          CP="catalyst-api/target/classes:$(cat catalyst-api/target/cp.txt)"
+
+          echo "--- decode and fold a legacy-schema log ---"
+          OUT="$(java -cp "$CP" com.cajunsystems.catalyst.api.Demo schema)"
+          echo "$OUT"
+          echo "$OUT" | grep -q "folded status: COMPLETED; result: 42" \
+            || { echo "FAIL: legacy-schema log did not fold to the expected state"; exit 1; }
+          echo "$OUT" | grep -q "schema-evolution criterion holds" \
+            || { echo "FAIL: schema-evolution demo did not pass its assertions"; exit 1; }
+          echo "v0.2 Schema-evolution exit criterion holds: legacy-schema log reads under the current schema."

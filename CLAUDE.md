@@ -65,6 +65,12 @@ intended source, but if `jitpack.io` is blocked, install Gumbo locally first:
   strict replay substitutes both recorded boundaries — the request is not re-issued and the write is
   not re-applied. `FilesystemTool` is sandboxed to a root dir and rejects `..`/absolute/symlink
   escapes; both tools are non-`@Deterministic` (their outputs are recorded, not re-executed).
+- **v0.2 Schema evolution** — `SchemaEvolutionTest` + `SchemaEvolutionAcceptanceTest` + `Demo schema`: a
+  log recorded under an older schema (renamed `@type` + field, plus an unknown field) reads and folds
+  under the current schema. Policy (`docs/schema-evolution.md`): tolerant reader for additive changes +
+  an `EventUpcaster` chain (applied on decode, after blob rehydration) for structural changes, wired via
+  `EventCodec.builder()` / `GumboEventLog.at(path, upcasters)`. Version stamping deferred until the first
+  breaking change (absent ⇒ v1).
 - **v0.2 Blob store** — `BlobStoreAcceptanceTest` + `Demo blob`: a payload over the offload threshold
   (default 64 KiB) is stored out-of-line in a content-addressed `BlobStore` (durable `FileBlobStore` under
   `path/blobs`, SHA-256 refs, dedup) and rehydrated transparently on inspect/replay — offloading lives at
