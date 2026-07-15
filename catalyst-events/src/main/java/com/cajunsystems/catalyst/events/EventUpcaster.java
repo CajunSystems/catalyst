@@ -60,7 +60,7 @@ public interface EventUpcaster {
     static EventUpcaster defaultField(String type, String field, JsonNode defaultValue) {
         return event -> {
             if (event instanceof ObjectNode obj && isType(obj, type) && !obj.has(field)) {
-                obj.set(field, defaultValue);
+                obj.set(field, defaultValue.deepCopy()); // isolate each insertion from the shared node
             }
             return event;
         };

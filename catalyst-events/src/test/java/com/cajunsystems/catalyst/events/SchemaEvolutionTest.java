@@ -78,6 +78,23 @@ class SchemaEvolutionTest {
     }
 
     @Test
+    void defaultFieldInsertsAnIsolatedCopyPerEvent() {
+        // A mutable default node must not be shared across events: mutating it afterward, or one event's
+        // copy, must not affect another's.
+        ObjectNode mutableDefault = mapper.createObjectNode().put("v", 1);
+        EventUpcaster up = EventUpcaster.defaultField("ExecutionStarted", "nodeId", mutableDefault);
+
+        ObjectNode e1 = (ObjectNode) up.upcast(mapper.createObjectNode()
+                .put("@type", "ExecutionStarted").put("at", "2026-01-01T00:00:00Z").put("attempt", 1));
+        mutableDefault.put("v", 999); // mutate the source after the first insertion
+        ObjectNode e2 = (ObjectNode) up.upcast(mapper.createObjectNode()
+                .put("@type", "ExecutionStarted").put("at", "2026-01-01T00:00:00Z").put("attempt", 2));
+
+        assertThat(e1.get("nodeId").get("v").asInt()).isEqualTo(1);   // unaffected by the later mutation
+        assertThat(e2.get("nodeId").get("v").asInt()).isEqualTo(999); // gets the current source value
+    }
+
+    @Test
     void upcastersAreIdempotentOnCurrentShape() {
         // A current-shape event handed to a rename upcaster must round-trip unchanged.
         EventCodec codec = EventCodec.builder()

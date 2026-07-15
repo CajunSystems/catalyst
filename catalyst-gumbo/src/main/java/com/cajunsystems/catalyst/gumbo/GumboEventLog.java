@@ -4,6 +4,7 @@ import com.cajunsystems.catalyst.ExecutionId;
 import com.cajunsystems.catalyst.events.BlobStore;
 import com.cajunsystems.catalyst.events.CatalystEvent;
 import com.cajunsystems.catalyst.events.EventCodec;
+import com.cajunsystems.catalyst.events.EventUpcaster;
 import com.cajunsystems.catalyst.events.FileBlobStore;
 import com.cajunsystems.catalyst.events.SequencedEvent;
 import com.cajunsystems.catalyst.log.EventLog;
@@ -77,7 +78,7 @@ public final class GumboEventLog implements EventLog {
      * As {@link #at(Path)}, registering schema-evolution {@code upcasters} that migrate older recorded
      * events to the current schema on read (spec §13.4). Keeps the default {@code path/blobs} store.
      */
-    public static GumboEventLog at(Path path, java.util.List<com.cajunsystems.catalyst.events.EventUpcaster> upcasters) {
+    public static GumboEventLog at(Path path, java.util.List<EventUpcaster> upcasters) {
         BlobStore blobs = FileBlobStore.at(path.resolve("blobs"));
         return at(path, EventCodec.builder()
                 .blobStore(blobs, EventCodec.DEFAULT_BLOB_THRESHOLD_BYTES)
