@@ -36,8 +36,8 @@ first: **① cancellation event → ② task registry / `resume(id)` → ③ bui
 auto-capture agent, per-execution locking, streaming, and observability sequenced after. Order is a
 guide, not a contract — it flexes as we learn. Snapshots, the cancellation event (①), the task
 registry / standalone `resume(id)` (②), the built-in HTTP + Filesystem tools (③), generic-collection
-payloads (④), the blob store (⑤), and schema evolution have shipped; the remaining v0.2 work (retry
-semantics, the auto-capture agent, per-execution locking, streaming, observability) is unsequenced.
+payloads (④), the blob store (⑤), schema evolution, and per-execution locking have shipped; the
+remaining v0.2 work (retry semantics, the auto-capture agent, streaming, observability) is unsequenced.
 
 ### Durability & storage (spec §8)
 - ✅ **Snapshots** — periodic fold checkpoints so long executions don't re-fold the whole log on
@@ -99,8 +99,21 @@ semantics, the auto-capture agent, per-execution locking, streaming, observabili
   boundary substituted (zero duplicate side effects); a terminal one replays its recorded outcome
   without re-running. Use named `Task` classes: a lambda's synthetic class name is not stable across
   processes. Gated by the v0.2 Resume-by-id exit demo in CI.
-- **Per-execution locking** — replace the single coarse `synchronized execute` lock with per-id
-  coordination to lift the throughput ceiling under concurrent load.
+- ✅ **Per-execution locking** — the coarse instance-wide `synchronized` on
+  `execute`/`resume`/`pause`/`cancel` (each of which does log I/O + a full fold before it schedules) is
+  replaced by a reentrant, reference-counted `KeyedLock` seam with two domains: `byExecution` (keyed by
+  `ExecutionId`) guards the schedule-attempt decision, and `byIdempotencyKey` (keyed by the key string)
+  keeps the `findByKey → putKey → createExecution` window atomic so concurrent same-key submits still
+  create exactly one execution. Lock order is key → id (no cycle). Unrelated executions no longer
+  serialize on each other's log I/O or folds. Idle keys hold no lock (evicted at refcount zero). Covered
+  by `KeyedLockTest` + new `CatalystRuntimeTest` concurrency cases (the isolation test is verified to
+  deadlock if the old global lock is restored). *Distribution follow-up (noted): the in-process
+  single-writer invariant (`inFlight` + `KeyedLock`) holds within one JVM only. Cluster-wide
+  single-writer-per-execution wants a cluster-singleton actor per `ExecutionId` across **Cajun** nodes
+  (see v1 distributed execution) — an actor mailbox **is** per-execution locking expressed as a queue.
+  `KeyedLock` is deliberately the single seam that swap replaces; it was chosen over an actor here
+  because the critical section is tiny and in-process, where a mailbox would add latency and a
+  request/response round-trip to the synchronous `execute`/`pause` API for no in-process gain.*
 - ✅ **Remaining built-in tools** (③) — `HttpTool` (pluggable `Sender` seam; default wraps
   `java.net.http.HttpClient`, tests run offline; safe-by-default `TargetPolicy` blocks
   loopback/link-local/private/metadata targets and re-validates every redirect hop, with

@@ -85,6 +85,32 @@ public final class CatalystRuntime implements AutoCloseable {
      */
     private final ConcurrentHashMap<ExecutionId, RunningAttempt> running = new ConcurrentHashMap<>();
 
+    /**
+     * Per-execution mutual exclusion. Every section that decides <em>whether to schedule an attempt</em>
+     * — {@code execute}, {@code resume}, {@code pause}, {@code cancel} — reads the log, folds state and
+     * then acts on it, so it must be atomic against another caller doing the same for the same
+     * execution. Scoping that to the id (rather than the whole runtime, as the coarse
+     * {@code synchronized} used to) means unrelated executions no longer serialize on each other's log
+     * I/O and folds.
+     *
+     * <p>Only the scheduling decision is held under this lock; the task itself runs on its own virtual
+     * thread with no lock held.
+     */
+    private final KeyedLock<ExecutionId> byExecution = new KeyedLock<>();
+
+    /**
+     * Per-idempotency-key mutual exclusion, guarding the {@code findByKey} → {@code putKey} →
+     * {@code createExecution} window: without it two concurrent submissions of the same key could both
+     * miss the lookup and create two executions for one key. A separate domain from
+     * {@link #byExecution} because the id is not yet known when the window opens — that is the whole
+     * reason the key must be locked.
+     *
+     * <p><strong>Lock order: key → id, never the reverse.</strong> {@code execute} is the only path that
+     * takes both, and it always takes the key lock first; {@code resume}/{@code pause}/{@code cancel}
+     * take only the id lock. No cycle, so no deadlock.
+     */
+    private final KeyedLock<String> byIdempotencyKey = new KeyedLock<>();
+
     /** A running attempt's cancellation token plus its worker thread (set once the worker starts). */
     private static final class RunningAttempt {
         final CancellationToken token = new CancellationToken();
@@ -116,44 +142,48 @@ public final class CatalystRuntime implements AutoCloseable {
     // ── Runtime API (spec §7) ────────────────────────────────────────────────
 
     /** Starts a new execution, or attaches/resumes an existing one when an idempotency key matches. */
-    public synchronized <R> ExecutionHandle<R> execute(Task<R> task, ExecutionOptions opts) {
+    public <R> ExecutionHandle<R> execute(Task<R> task, ExecutionOptions opts) {
         String taskType = task.getClass().getName();
         Optional<String> key = opts.idempotencyKey();
 
-        ExecutionId id;
-        Mode mode;
-        if (key.isPresent()) {
-            Optional<ExecutionId> existing = log.findByKey(key.get());
-            if (existing.isPresent()) {
-                id = existing.get();
-                // If an attempt for this execution is already running in this process, attach to it
-                // rather than scheduling a duplicate attempt that would corrupt the event stream.
-                CompletableFuture<?> running = inFlight.get(id);
-                if (running != null) {
-                    return new FutureExecutionHandle<>(id, cast(running));
-                }
-                ExecutionState state = foldState(id);
-                mode = state.isTerminal() ? Mode.REPLAY_TERMINAL : Mode.RESUME;
-            } else {
-                id = ExecutionId.random();
-                log.putKey(key.get(), id);
-                createExecution(id, taskType, key.get(), opts);
-                mode = Mode.FRESH;
-            }
-        } else {
-            id = ExecutionId.random();
+        // No key → a fresh random id nobody else can name yet, so only the id lock is needed.
+        if (key.isEmpty()) {
+            ExecutionId id = ExecutionId.random();
             createExecution(id, taskType, "", opts);
-            mode = Mode.FRESH;
+            return byExecution.withLock(id, () -> scheduleAttempt(task, id, taskType, opts, Mode.FRESH));
         }
 
-        return scheduleAttempt(task, id, taskType, opts, mode);
+        // Keyed: hold the key lock across the whole decision — resolving the key, creating the
+        // execution and scheduling its attempt. Releasing it once the id is known would leave a window
+        // where a same-key submission resolves to that id and schedules a second attempt for it before
+        // this one has registered its future. Lock order is key → id (see byIdempotencyKey).
+        return byIdempotencyKey.withLock(key.get(), () -> {
+            Optional<ExecutionId> existing = log.findByKey(key.get());
+            if (existing.isEmpty()) {
+                ExecutionId id = ExecutionId.random();
+                log.putKey(key.get(), id);
+                createExecution(id, taskType, key.get(), opts);
+                return byExecution.withLock(id, () -> scheduleAttempt(task, id, taskType, opts, Mode.FRESH));
+            }
+            ExecutionId id = existing.get();
+            return byExecution.withLock(id, () -> {
+                // If an attempt for this execution is already running in this process, attach to it
+                // rather than scheduling a duplicate attempt that would corrupt the event stream.
+                CompletableFuture<?> live = inFlight.get(id);
+                if (live != null) {
+                    return new FutureExecutionHandle<>(id, CatalystRuntime.<R>cast(live));
+                }
+                Mode mode = foldState(id).isTerminal() ? Mode.REPLAY_TERMINAL : Mode.RESUME;
+                return scheduleAttempt(task, id, taskType, opts, mode);
+            });
+        });
     }
 
     /**
      * Schedules an attempt for {@code id} on a virtual thread and returns its handle. Registers the
-     * in-flight future and cancellation handle under the monitor held by the caller ({@code execute} /
-     * {@code resume} are both {@code synchronized}), so a second concurrent attempt for the same
-     * execution can be detected and attached to rather than scheduled.
+     * in-flight future and cancellation handle while the caller holds this execution's lock (every
+     * caller — {@code execute} / {@code resume} — takes {@code byExecution} first), so a second
+     * concurrent attempt for the same execution is detected and attached to rather than scheduled.
      */
     private <R> ExecutionHandle<R> scheduleAttempt(Task<R> task, ExecutionId id, String taskType,
                                                    ExecutionOptions opts, Mode mode) {
@@ -330,33 +360,35 @@ public final class CatalystRuntime implements AutoCloseable {
      * @throws IllegalStateException    if the execution is non-terminal and no task is registered for
      *                                  its recorded task type (a terminal execution needs no registration)
      */
-    public synchronized ExecutionHandle<?> resume(ExecutionId id, ExecutionOptions opts) {
-        // Already running here → attach to the in-flight attempt rather than scheduling a duplicate
-        // that would interleave events and corrupt the stream (same guard as execute()).
-        CompletableFuture<?> live = inFlight.get(id);
-        if (live != null) {
-            return new FutureExecutionHandle<>(id, live);
-        }
+    public ExecutionHandle<?> resume(ExecutionId id, ExecutionOptions opts) {
+        return byExecution.withLock(id, () -> {
+            // Already running here → attach to the in-flight attempt rather than scheduling a duplicate
+            // that would interleave events and corrupt the stream (same guard as execute()).
+            CompletableFuture<?> live = inFlight.get(id);
+            if (live != null) {
+                return new FutureExecutionHandle<>(id, live);
+            }
 
-        ExecutionState state = foldState(id);
-        String taskType = state.taskType();
-        if (taskType == null) {
-            throw new IllegalArgumentException("Cannot resume unknown execution: " + id);
-        }
+            ExecutionState state = foldState(id);
+            String taskType = state.taskType();
+            if (taskType == null) {
+                throw new IllegalArgumentException("Cannot resume unknown execution: " + id);
+            }
 
-        // A terminal execution replays its recorded outcome without ever re-running the task
-        // (runAttempt short-circuits REPLAY_TERMINAL before touching it), so it needs no registered
-        // factory — it is recoverable from the id alone. Only a live resume reconstructs the task.
-        if (state.isTerminal()) {
-            return scheduleAttempt(TERMINAL_REPLAY_TASK, id, taskType, opts, Mode.REPLAY_TERMINAL);
-        }
+            // A terminal execution replays its recorded outcome without ever re-running the task
+            // (runAttempt short-circuits REPLAY_TERMINAL before touching it), so it needs no registered
+            // factory — it is recoverable from the id alone. Only a live resume reconstructs the task.
+            if (state.isTerminal()) {
+                return scheduleAttempt(TERMINAL_REPLAY_TASK, id, taskType, opts, Mode.REPLAY_TERMINAL);
+            }
 
-        TaskFactory factory = registry.lookup(taskType).orElseThrow(() -> new IllegalStateException(
-                "No task registered for type '" + taskType + "' to resume " + id
-                        + "; register it with Catalyst.builder().task(...), or recover by re-submitting the"
-                        + " task with its idempotency key via execute(task, ExecutionOptions.withKey(key))."));
+            TaskFactory factory = registry.lookup(taskType).orElseThrow(() -> new IllegalStateException(
+                    "No task registered for type '" + taskType + "' to resume " + id
+                            + "; register it with Catalyst.builder().task(...), or recover by re-submitting the"
+                            + " task with its idempotency key via execute(task, ExecutionOptions.withKey(key))."));
 
-        return scheduleAttempt(factory.create(), id, taskType, opts, Mode.RESUME);
+            return scheduleAttempt(factory.create(), id, taskType, opts, Mode.RESUME);
+        });
     }
 
     /**
@@ -448,17 +480,19 @@ public final class CatalystRuntime implements AutoCloseable {
 
     /**
      * Pauses an execution. A no-op on an already-terminal execution (never reopens a closed log).
-     * {@code synchronized} + the in-flight guard avoid a race: an execution running in this process
+     * This execution's lock + the in-flight guard avoid a race: an execution running in this process
      * appends its own events on a worker thread, so injecting a pause event concurrently could land
      * after {@code ExecutionCompleted}. Refuse while it is in flight here. (v0.1 has no live
      * pause/cancel of a running task — that lands with the reserved WAITING/signal APIs in v1.)
      */
-    public synchronized void pause(ExecutionId id) {
-        if (inspect(id).isTerminal()) return;      // terminal (incl. just-completed) → no-op
-        if (inFlight.containsKey(id)) {
-            throw new IllegalStateException("Cannot pause an execution running in this process: " + id);
-        }
-        log.append(id, new CatalystEvent.ExecutionPaused(now(), "paused by request"));
+    public void pause(ExecutionId id) {
+        byExecution.withLock(id, () -> {
+            if (inspect(id).isTerminal()) return;  // terminal (incl. just-completed) → no-op
+            if (inFlight.containsKey(id)) {
+                throw new IllegalStateException("Cannot pause an execution running in this process: " + id);
+            }
+            log.append(id, new CatalystEvent.ExecutionPaused(now(), "paused by request"));
+        });
     }
 
     /**
@@ -475,18 +509,20 @@ public final class CatalystRuntime implements AutoCloseable {
      * execution is <em>not</em> running here (crashed, paused, or never started in this process) the
      * event is appended directly, since there is no concurrent writer.
      */
-    public synchronized void cancel(ExecutionId id) {
-        if (inspect(id).isTerminal()) return;      // terminal (incl. just-completed) → no-op
-        RunningAttempt attempt = running.get(id);
-        if (attempt != null) {
-            // Cooperative: the worker thread — the only writer for a running execution — records the
-            // ExecutionCancelled when it observes the trip. Interrupt to unblock a task parked in I/O.
-            attempt.token.cancel("cancelled by request");
-            Thread worker = attempt.thread;
-            if (worker != null) worker.interrupt();
-            return;
-        }
-        log.append(id, new CatalystEvent.ExecutionCancelled(now(), "cancelled by request", log.latestSeq(id)));
+    public void cancel(ExecutionId id) {
+        byExecution.withLock(id, () -> {
+            if (inspect(id).isTerminal()) return;  // terminal (incl. just-completed) → no-op
+            RunningAttempt attempt = running.get(id);
+            if (attempt != null) {
+                // Cooperative: the worker thread — the only writer for a running execution — records the
+                // ExecutionCancelled when it observes the trip. Interrupt to unblock a task parked in I/O.
+                attempt.token.cancel("cancelled by request");
+                Thread worker = attempt.thread;
+                if (worker != null) worker.interrupt();
+                return;
+            }
+            log.append(id, new CatalystEvent.ExecutionCancelled(now(), "cancelled by request", log.latestSeq(id)));
+        });
     }
 
     public EventLog log() {
