@@ -1,0 +1,19 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 256 256" width="256" height="256" role="img" aria-labelledby="catalyst-mark-title">
+  <title id="catalyst-mark-title">Catalyst</title>
+  <!-- Single-colour variant: inherits `color` from context via currentColor. -->
+  <polyline points="190.73,68.17 142.88,44.14 80.39,66.87 54.00,128.00 80.39,189.13 142.88,211.86 190.73,187.83"
+            fill="none" stroke="currentColor" stroke-width="12" stroke-linecap="butt" stroke-linejoin="round"/>
+
+  <g fill="currentColor">
+    <circle cx="142.88" cy="44.14"  r="17"/>
+    <circle cx="80.39"  cy="66.87"  r="17"/>
+    <circle cx="54.00"  cy="128.00" r="17"/>
+    <circle cx="80.39"  cy="189.13" r="17"/>
+    <circle cx="142.88" cy="211.86" r="17"/>
+  </g>
+
+  <g fill="none" stroke="currentColor" stroke-width="8">
+    <circle cx="202.35" cy="74.00"  r="13"/>
+    <circle cx="202.35" cy="182.00" r="13"/>
+  </g>
+</svg>

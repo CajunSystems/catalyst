@@ -1,3 +1,7 @@
+<p align="center">
+  <img src="docs/assets/catalyst-logo.svg" alt="" width="112" height="112">
+</p>
+
 # Catalyst
 
 [![CI](https://github.com/CajunSystems/catalyst/actions/workflows/ci.yml/badge.svg)](https://github.com/CajunSystems/catalyst/actions/workflows/ci.yml)

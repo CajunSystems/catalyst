@@ -1,0 +1,45 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 256 256" width="256" height="256" role="img" aria-labelledby="catalyst-logo-title">
+  <title id="catalyst-logo-title">Catalyst</title>
+  <!-- Nodes sit on a 280deg arc (r=84, centre 138,128); the two open ends are rings.
+       Terminal connectors stop at the ring centreline so the holes stay clear. -->
+  <defs>
+    <linearGradient id="cg0" gradientUnits="userSpaceOnUse" x1="190.73" y1="68.17" x2="142.88" y2="44.14">
+      <stop offset="0" stop-color="#312E81"/><stop offset="1" stop-color="#5B21B6"/>
+    </linearGradient>
+    <linearGradient id="cg1" gradientUnits="userSpaceOnUse" x1="142.88" y1="44.14" x2="80.39" y2="66.87">
+      <stop offset="0" stop-color="#5B21B6"/><stop offset="1" stop-color="#7C3AED"/>
+    </linearGradient>
+    <linearGradient id="cg2" gradientUnits="userSpaceOnUse" x1="80.39" y1="66.87" x2="54.00" y2="128.00">
+      <stop offset="0" stop-color="#7C3AED"/><stop offset="1" stop-color="#5567F0"/>
+    </linearGradient>
+    <linearGradient id="cg3" gradientUnits="userSpaceOnUse" x1="54.00" y1="128.00" x2="80.39" y2="189.13">
+      <stop offset="0" stop-color="#5567F0"/><stop offset="1" stop-color="#2E9BF5"/>
+    </linearGradient>
+    <linearGradient id="cg4" gradientUnits="userSpaceOnUse" x1="80.39" y1="189.13" x2="142.88" y2="211.86">
+      <stop offset="0" stop-color="#2E9BF5"/><stop offset="1" stop-color="#22C5F0"/>
+    </linearGradient>
+    <linearGradient id="cg5" gradientUnits="userSpaceOnUse" x1="142.88" y1="211.86" x2="190.73" y2="187.83">
+      <stop offset="0" stop-color="#22C5F0"/><stop offset="1" stop-color="#22D3EE"/>
+    </linearGradient>
+  </defs>
+
+  <g fill="none" stroke-width="12" stroke-linecap="butt">
+    <line x1="190.73" y1="68.17"  x2="142.88" y2="44.14"  stroke="url(#cg0)"/>
+    <line x1="142.88" y1="44.14"  x2="80.39"  y2="66.87"  stroke="url(#cg1)"/>
+    <line x1="80.39"  y1="66.87"  x2="54.00"  y2="128.00" stroke="url(#cg2)"/>
+    <line x1="54.00"  y1="128.00" x2="80.39"  y2="189.13" stroke="url(#cg3)"/>
+    <line x1="80.39"  y1="189.13" x2="142.88" y2="211.86" stroke="url(#cg4)"/>
+    <line x1="142.88" y1="211.86" x2="190.73" y2="187.83" stroke="url(#cg5)"/>
+  </g>
+
+  <circle cx="142.88" cy="44.14"  r="17" fill="#5B21B6"/>
+  <circle cx="80.39"  cy="66.87"  r="17" fill="#7C3AED"/>
+  <circle cx="54.00"  cy="128.00" r="17" fill="#5567F0"/>
+  <circle cx="80.39"  cy="189.13" r="17" fill="#2E9BF5"/>
+  <circle cx="142.88" cy="211.86" r="17" fill="#22C5F0"/>
+
+  <g fill="none" stroke-width="8">
+    <circle cx="202.35" cy="74.00"  r="13" stroke="#312E81"/>
+    <circle cx="202.35" cy="182.00" r="13" stroke="#22D3EE"/>
+  </g>
+</svg>
