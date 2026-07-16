@@ -64,7 +64,15 @@ final class KeyedLock<K> {
 
     private void release(K key, Entry entry) {
         entry.lock.unlock();
-        entries.compute(key, (k, existing) -> --existing.refs == 0 ? null : existing);
+        entries.compute(key, (k, existing) -> {
+            // Our own ref keeps the entry alive until this compute runs, so a missing entry means the
+            // acquire/release pairing has been broken. Fail loudly rather than as an NPE from inside
+            // compute, which would surface far from the cause.
+            if (existing == null) {
+                throw new IllegalStateException("release of an untracked key: " + key);
+            }
+            return --existing.refs == 0 ? null : existing;
+        });
     }
 
     /** Live entry count — for tests asserting that locks do not leak. */
