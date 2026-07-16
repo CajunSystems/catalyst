@@ -11,6 +11,7 @@ import com.cajunsystems.catalyst.engine.InDoubtPolicy;
 import com.cajunsystems.catalyst.engine.NonDeterministicReplayException;
 import com.cajunsystems.catalyst.events.CatalystEvent;
 import com.cajunsystems.catalyst.events.EventJson;
+import com.cajunsystems.catalyst.events.SequencedEvent;
 import com.cajunsystems.catalyst.log.EventLog;
 import com.cajunsystems.catalyst.model.CompletionRequest;
 import com.cajunsystems.catalyst.model.Prompt;
@@ -20,7 +21,16 @@ import com.fasterxml.jackson.databind.node.TextNode;
 import org.junit.jupiter.api.Test;
 
 import java.time.Instant;
+import java.util.ArrayList;
+import java.util.HashSet;
+import java.util.List;
+import java.util.Set;
 import java.util.concurrent.CountDownLatch;
+import java.util.concurrent.CyclicBarrier;
+import java.util.concurrent.ExecutorService;
+import java.util.concurrent.Executors;
+import java.util.concurrent.Future;
+import java.util.concurrent.TimeUnit;
 
 import static org.assertj.core.api.Assertions.assertThat;
 import static org.assertj.core.api.Assertions.assertThatThrownBy;
@@ -133,6 +143,114 @@ class CatalystRuntimeTest {
             assertThat(runtime.inspect(h1.id()).trajectory())
                     .filteredOn(step -> step.kind() == com.cajunsystems.catalyst.engine.TimelineStep.Kind.COMPLETED)
                     .hasSize(1);
+        }
+    }
+
+    @Test
+    void unrelatedExecutionsDoNotSerializeOnEachOther() throws Exception {
+        // The point of per-execution locking. execute() does log I/O and a fold before scheduling; with
+        // the old runtime-wide `synchronized` those sections ran one at a time, so two submissions with
+        // different keys could never be inside execute() together. A barrier proves they now can: the
+        // first submission parks mid-append until a second arrives, which under a global lock could
+        // never happen (the second would block at the monitor and the barrier would time out).
+        InMemoryEventLog delegate = new InMemoryEventLog();
+        CyclicBarrier bothCreating = new CyclicBarrier(2);
+        EventLog gated = new EventLog() {
+            public long append(ExecutionId id, CatalystEvent event) {
+                if (event instanceof CatalystEvent.ExecutionCreated) {
+                    try {
+                        bothCreating.await(10, TimeUnit.SECONDS); // only the create path is gated
+                    } catch (Exception e) {
+                        throw new RuntimeException("execute() serialized on an unrelated execution", e);
+                    }
+                }
+                return delegate.append(id, event);
+            }
+            public java.util.List<SequencedEvent> read(ExecutionId id) { return delegate.read(id); }
+            public java.util.List<SequencedEvent> readFrom(ExecutionId id, long after) { return delegate.readFrom(id, after); }
+            public long latestSeq(ExecutionId id) { return delegate.latestSeq(id); }
+            public java.util.Optional<ExecutionId> findByKey(String k) { return delegate.findByKey(k); }
+            public void putKey(String k, ExecutionId id) { delegate.putKey(k, id); }
+            public void close() { delegate.close(); }
+        };
+
+        try (CatalystRuntime runtime = CatalystRuntime.builder()
+                .log(gated).model(MockModel.alwaysReturn("pong")).build();
+             ExecutorService pool = Executors.newFixedThreadPool(2)) {
+
+            Future<String> a = pool.submit(() -> runtime.executeAndWait(ONE_SHOT, ExecutionOptions.withKey("a")));
+            Future<String> b = pool.submit(() -> runtime.executeAndWait(ONE_SHOT, ExecutionOptions.withKey("b")));
+
+            assertThat(a.get(20, TimeUnit.SECONDS)).isEqualTo("pong");
+            assertThat(b.get(20, TimeUnit.SECONDS)).isEqualTo("pong");
+        }
+    }
+
+    @Test
+    void manyConcurrentSameKeySubmissionsCreateExactlyOneExecution() throws Exception {
+        // Finer-grained locking must not weaken the idempotency-key invariant: the findByKey → putKey →
+        // createExecution window is still atomic per key, so a burst of same-key submissions resolves to
+        // one execution with one attempt — not N executions racing the lookup.
+        MockModel model = MockModel.alwaysReturn("pong");
+        int threads = 12;
+        CountDownLatch start = new CountDownLatch(1);
+
+        try (CatalystRuntime runtime = CatalystRuntime.builder()
+                .log(EventLogs.inMemory()).model(model).build();
+             ExecutorService pool = Executors.newFixedThreadPool(threads)) {
+
+            List<Future<ExecutionHandle<String>>> futures = new ArrayList<>();
+            for (int i = 0; i < threads; i++) {
+                futures.add(pool.submit(() -> {
+                    start.await();
+                    return runtime.execute(ONE_SHOT, ExecutionOptions.withKey("shared"));
+                }));
+            }
+            start.countDown();
+
+            Set<ExecutionId> ids = new HashSet<>();
+            for (Future<ExecutionHandle<String>> f : futures) {
+                ExecutionHandle<String> handle = f.get(20, TimeUnit.SECONDS);
+                assertThat(handle.result()).isEqualTo("pong");
+                ids.add(handle.id());
+            }
+
+            // One id, one model call, one ExecutionCreated, one ExecutionCompleted.
+            assertThat(ids).hasSize(1);
+            assertThat(model.callCount()).isEqualTo(1);
+            List<SequencedEvent> events = runtime.log().read(ids.iterator().next());
+            assertThat(events).filteredOn(se -> se.event() instanceof CatalystEvent.ExecutionCreated).hasSize(1);
+            assertThat(events).filteredOn(se -> se.event() instanceof CatalystEvent.ExecutionCompleted).hasSize(1);
+        }
+    }
+
+    @Test
+    void cancelOfOneExecutionDoesNotBlockAnother() throws Exception {
+        // cancel() folds state under the target's lock. Scoped per id, cancelling a parked execution
+        // must not hold up an unrelated one's progress.
+        MockModel model = MockModel.alwaysReturn("pong");
+        CountDownLatch parked = new CountDownLatch(1);
+        CountDownLatch release = new CountDownLatch(1);
+        Task<String> slow = ctx -> {
+            String r = ctx.model().complete(CompletionRequest.of(Prompt.builder().user("hi").build())).message();
+            parked.countDown();
+            try { release.await(); } catch (InterruptedException e) { Thread.currentThread().interrupt(); }
+            return ctx.model().complete(CompletionRequest.of(Prompt.builder().user("again").build())).message() + r;
+        };
+
+        try (CatalystRuntime runtime = CatalystRuntime.builder()
+                .log(EventLogs.inMemory()).model(model).build()) {
+
+            ExecutionHandle<String> blocked = runtime.execute(slow, ExecutionOptions.withKey("slow"));
+            assertThat(parked.await(5, TimeUnit.SECONDS)).isTrue();
+
+            // An unrelated execution completes while `slow` is still parked mid-flight.
+            assertThat(runtime.executeAndWait(ONE_SHOT, ExecutionOptions.withKey("other"))).isEqualTo("pong");
+
+            runtime.cancel(blocked.id());
+            release.countDown();
+            assertThatThrownBy(blocked::result).isInstanceOf(java.util.concurrent.CancellationException.class);
+            assertThat(runtime.inspect(blocked.id()).status()).isEqualTo(Status.CANCELLED);
         }
     }
 
