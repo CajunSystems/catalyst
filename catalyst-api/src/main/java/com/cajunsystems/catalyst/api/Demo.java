@@ -22,8 +22,17 @@ import com.cajunsystems.catalyst.model.CompletionRequest;
 import com.cajunsystems.catalyst.model.Message;
 import com.cajunsystems.catalyst.model.Prompt;
 import com.cajunsystems.catalyst.mock.MockModel;
+import com.cajunsystems.catalyst.otel.CatalystTracer;
 import com.cajunsystems.catalyst.runtime.CatalystRuntime;
 import com.cajunsystems.catalyst.runtime.ExecutionHandle;
+import io.opentelemetry.api.trace.SpanKind;
+import io.opentelemetry.api.trace.StatusCode;
+import io.opentelemetry.api.trace.Tracer;
+import io.opentelemetry.sdk.common.CompletableResultCode;
+import io.opentelemetry.sdk.trace.SdkTracerProvider;
+import io.opentelemetry.sdk.trace.data.SpanData;
+import io.opentelemetry.sdk.trace.export.SimpleSpanProcessor;
+import io.opentelemetry.sdk.trace.export.SpanExporter;
 import org.slf4j.LoggerFactory;
 
 import java.nio.file.Files;
@@ -99,6 +108,8 @@ public final class Demo {
             collectionsDemo(Files.createTempDirectory("catalyst-collections-"));
         } else if (args.length >= 1 && args[0].equals("retry")) {
             retryDemo(Files.createTempDirectory("catalyst-retry-"));
+        } else if (args.length >= 1 && args[0].equals("otel")) {
+            otelDemo(Files.createTempDirectory("catalyst-otel-"));
         } else if (args.length >= 1 && args[0].equals("blob")) {
             blobDemo(Files.createTempDirectory("catalyst-blob-"));
         } else if (args.length >= 1 && args[0].equals("schema")) {
@@ -458,6 +469,80 @@ public final class Demo {
 
         System.out.println("[retry] retry criterion holds: bounded retry-as-attempt, "
                 + "prefix substituted, replay exact, opt-in.");
+    }
+
+    /** A SpanExporter that keeps exported spans in memory, so the demo can inspect them in-process. */
+    private static final class CollectingExporter implements SpanExporter {
+        final java.util.List<SpanData> spans = new java.util.concurrent.CopyOnWriteArrayList<>();
+        @Override public CompletableResultCode export(java.util.Collection<SpanData> batch) {
+            spans.addAll(batch);
+            return CompletableResultCode.ofSuccess();
+        }
+        @Override public CompletableResultCode flush() { return CompletableResultCode.ofSuccess(); }
+        @Override public CompletableResultCode shutdown() { return CompletableResultCode.ofSuccess(); }
+    }
+
+    /**
+     * The v0.2 observability exit demo (spec §12): an execution's event log folds into an OpenTelemetry
+     * trace — one root span for the run, a child span per boundary (model / tool), and lifecycle moments
+     * (here, a retry) as annotations on the root. Emitted through a real OTel SDK into an in-process
+     * exporter, so it runs fully offline.
+     */
+    private static void otelDemo(Path dir) throws Exception {
+        MockModel model = answerModel("FINAL");
+        FlakyTool flaky = new FlakyTool(1); // fails once, then succeeds — produces a retry annotation
+        Task<String> task = ctx -> {
+            String m = ctx.model().complete(STEP1).message();
+            return m + "|" + ctx.call(flaky, new FlakyIn("x"));
+        };
+
+        CollectingExporter collector = new CollectingExporter();
+        SdkTracerProvider provider = SdkTracerProvider.builder()
+                .addSpanProcessor(SimpleSpanProcessor.create(collector))
+                .build();
+        Tracer tracer = provider.get("catalyst-demo");
+
+        String result;
+        try (CatalystRuntime runtime = Catalyst.builder()
+                .log(GumboEventLog.at(dir))
+                .model(model)
+                .retryPolicy(com.cajunsystems.catalyst.engine.RetryPolicy.maxRetries(2, java.time.Duration.ofMillis(10)))
+                .build()) {
+
+            ExecutionHandle<String> handle = runtime.execute(task, ExecutionOptions.withKey(KEY));
+            result = handle.result();
+
+            // The log IS the trace: fold the recorded events into spans.
+            new CatalystTracer(tracer).export(handle.id(), runtime.log().read(handle.id()));
+        }
+        provider.close(); // flush the SimpleSpanProcessor
+
+        java.util.List<SpanData> spans = collector.spans;
+        long roots = spans.stream().filter(s -> !s.getParentSpanContext().isValid()).count();
+        long modelSpans = spans.stream().filter(s -> s.getName().equals("model")).count();
+        long toolSpans = spans.stream().filter(s -> s.getKind() == SpanKind.CLIENT
+                && "TOOL".equals(s.getAttributes().get(io.opentelemetry.api.common.AttributeKey.stringKey("catalyst.kind")))).count();
+        SpanData root = spans.stream().filter(s -> !s.getParentSpanContext().isValid()).findFirst().orElseThrow();
+        boolean retryAnnotated = root.getEvents().stream().anyMatch(ev -> ev.getName().equals("retry"));
+        boolean rootOk = root.getStatus().getStatusCode() == StatusCode.OK;
+
+        System.out.println("[otel] result: " + result);
+        System.out.println("[otel] spans exported: " + spans.size());
+        System.out.println("[otel] root spans (traces): " + roots);
+        System.out.println("[otel] root status OK: " + rootOk);
+        System.out.println("[otel] model spans: " + modelSpans);
+        System.out.println("[otel] tool spans: " + toolSpans);
+        System.out.println("[otel] retry annotation on root: " + retryAnnotated);
+
+        if (roots != 1) throw new AssertionError("expected exactly 1 root span (trace), got " + roots);
+        if (spans.size() != 4) throw new AssertionError("expected 4 spans (root + model + 2 tool), got " + spans.size());
+        if (modelSpans != 1) throw new AssertionError("expected 1 model span, got " + modelSpans);
+        if (toolSpans != 2) throw new AssertionError("expected 2 tool spans, got " + toolSpans);
+        if (!retryAnnotated) throw new AssertionError("expected a retry annotation on the root span");
+        if (!rootOk) throw new AssertionError("expected root span status OK");
+
+        System.out.println("[otel] otel criterion holds: execution folded into one trace with "
+                + "semantic spans and a retry annotation.");
     }
 
     /**

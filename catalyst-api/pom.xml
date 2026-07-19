@@ -31,5 +31,19 @@
             <groupId>com.cajunsystems</groupId>
             <artifactId>catalyst-tools</artifactId>
         </dependency>
+        <dependency>
+            <groupId>com.cajunsystems</groupId>
+            <artifactId>catalyst-otel</artifactId>
+        </dependency>
+        <!-- The OTel exit demo builds a real SDK to collect the exported spans in-process. -->
+        <dependency>
+            <groupId>io.opentelemetry</groupId>
+            <artifactId>opentelemetry-sdk</artifactId>
+        </dependency>
+        <dependency>
+            <groupId>io.opentelemetry</groupId>
+            <artifactId>opentelemetry-sdk-testing</artifactId>
+            <scope>test</scope>
+        </dependency>
     </dependencies>
 </project>
