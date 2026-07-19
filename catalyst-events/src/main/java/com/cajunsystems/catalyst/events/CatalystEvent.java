@@ -107,8 +107,18 @@ public sealed interface CatalystEvent {
     /** A working-memory write. */
     record MemoryWritten(Instant at, String key, JsonNode value) implements CatalystEvent {}
 
-    /** A retry was requested (reserved: attempt counter model). */
-    record RetryRequested(Instant at, String cause, long backoffMillis) implements CatalystEvent {}
+    /**
+     * A failed attempt will be retried as a new attempt on the same stream (retry-as-attempt). Appended
+     * instead of {@link ExecutionFailed} when a retry policy elects to retry; the retry then re-enters
+     * the task with the recorded prefix substituted (an {@link ExecutionResumed} follows).
+     *
+     * <p>{@code failedSeq} is the seq of the recorded boundary whose live failure triggered the retry —
+     * today a {@code ToolCompleted} carrying an error — or {@code -1} when the failure was not an
+     * unhandled recorded boundary (a model/effect failure records no result, and a failure the task
+     * caught and rethrew is not attributable to a boundary). The replay seeder drops that boundary so the
+     * retry re-runs it live instead of substituting the recorded failure.
+     */
+    record RetryRequested(Instant at, String cause, long backoffMillis, long failedSeq) implements CatalystEvent {}
 
     /** One execution forked into many at a branch point (reserved for M2 branching). */
     record ExecutionBranched(Instant at, String parentId, long branchPointSeq,

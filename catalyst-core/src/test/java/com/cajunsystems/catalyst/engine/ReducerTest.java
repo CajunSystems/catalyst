@@ -78,6 +78,47 @@ class ReducerTest {
     }
 
     @Test
+    void foldsRetryAsAttemptWithCrashSafeBudget() {
+        Instant t = Instant.EPOCH;
+        // A tool fails (recorded with an error), a retry is elected (RetryRequested), and the execution
+        // resumes as attempt 2 and completes. `retries` counts the failure retry; `attempt` counts the
+        // resume. The two must not be conflated — a crash resume must not burn retry budget.
+        List<SequencedEvent> events = seq(List.of(
+                new ExecutionCreated(t, "TaskA", "h", "cfg", "key-1"),
+                new ExecutionStarted(t, 1, "node-0"),
+                new ToolRequested(t, "flaky", new TextNode("in")),
+                new ToolCompleted(t, null, "boom", 1),
+                new RetryRequested(t, "boom", 10, 3),
+                new ExecutionResumed(t, 2),
+                new ToolRequested(t, "flaky", new TextNode("in")),
+                new ToolCompleted(t, new TextNode("ok"), null, 1),
+                new ExecutionCompleted(t, new TextNode("done"))));
+
+        ExecutionState state = Reducer.fold(id, events);
+
+        assertThat(state.status()).isEqualTo(Status.COMPLETED);
+        assertThat(state.retries()).as("one failure retry folded").isEqualTo(1);
+        assertThat(state.attempt()).as("two attempts (start + resume)").isEqualTo(2);
+        assertThat(state.trajectory()).extracting(TimelineStep::kind)
+                .contains(TimelineStep.Kind.RETRY, TimelineStep.Kind.RESUMED);
+    }
+
+    @Test
+    void resumeDoesNotBurnRetryBudget() {
+        Instant t = Instant.EPOCH;
+        // A crash resume (no preceding RetryRequested) advances `attempt` but leaves `retries` at 0.
+        List<SequencedEvent> events = seq(List.of(
+                new ExecutionCreated(t, "TaskA", "h", "cfg", ""),
+                new ExecutionStarted(t, 1, "node-0"),
+                new ExecutionResumed(t, 2)));
+
+        ExecutionState state = Reducer.fold(id, events);
+
+        assertThat(state.attempt()).isEqualTo(2);
+        assertThat(state.retries()).isEqualTo(0);
+    }
+
+    @Test
     void foldFromSnapshotEqualsFullFoldAtEverySplit() {
         Instant t = Instant.parse("2026-01-01T00:00:00Z");
         // A stream whose tool request (seq 4) and its completion (seq 5) straddle any split taken

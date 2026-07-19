@@ -11,6 +11,10 @@ import java.util.List;
 /**
  * The immutable, folded state of an execution: exactly what you get by reducing its events (spec
  * §5). Returned by {@code runtime.inspect(id)} and used internally to decide resume vs. done.
+ *
+ * <p>{@code attempt} counts every (re)start of the execution — including crash resumes; {@code retries}
+ * counts only failure retries elected by a retry policy. They differ deliberately: a crash resume must
+ * not consume the retry budget. Both are folded from the log, so the budget is crash-safe.
  */
 public record ExecutionState(
         ExecutionId id,
@@ -18,6 +22,7 @@ public record ExecutionState(
         String taskType,
         String idempotencyKey,
         int attempt,
+        int retries,
         Instant startedAt,
         Instant endedAt,
         Cost cost,
