@@ -35,6 +35,10 @@ intended source, but if `jitpack.io` is blocked, install Gumbo locally first:
 - `catalyst-langchain4j` — `LangChain4jModel`: wraps any LangChain4j `ChatModel` (real providers).
   Depends only on `langchain4j-core`; the app supplies the provider. Tested offline with a fake
   `ChatModel` (override `doChat`).
+- `catalyst-otel` — `CatalystTracer`: folds an execution's event log into an OpenTelemetry trace
+  (root span + per-boundary child spans + lifecycle annotations). Read-only, post-hoc, no runtime hook.
+  Depends on the OpenTelemetry **API** only; the app supplies the SDK + exporter. Tested offline with
+  the SDK's `InMemorySpanExporter`.
 
 ## Key invariants
 
@@ -98,5 +102,12 @@ intended source, but if `jitpack.io` is blocked, install Gumbo locally first:
   runtime (`isRetryable`: excludes `NonDeterministicReplayException`, `InDoubtException`,
   `InterruptedException`, `Error`) before the policy is consulted. Whole-task, not per-tool. A retried
   log still replays exactly.
+- **v0.2 Observability / OTel exporter** — `OtelAcceptanceTest` + `Demo otel`: an execution's event log
+  folds into one OpenTelemetry trace via `catalyst-otel`'s `CatalystTracer.export(id, events)` — a root
+  span for the run, a child span per boundary (model/tool/effect/memory; model/tool carry real latency,
+  model spans carry that call's tokens/cost/finish reason), and lifecycle moments (retry, pause, etc.)
+  as span events on the root. Root status is OK/ERROR from the folded terminal state. Read-only and
+  post-hoc (consumes `runtime.log().read(id)`), so the log *is* the trace. The module depends on the
+  OTel **API** only; tests drive a real SDK into an in-memory exporter offline.
 
 CI (`.github/workflows/ci.yml`) runs all exit demos as gates — it is the source of truth per phase.

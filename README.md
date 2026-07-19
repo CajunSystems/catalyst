@@ -70,6 +70,7 @@ Deferred to later milestones (schema slots already reserved so no breaking chang
 | `catalyst-gumbo` | `GumboEventLog`: durable `EventLog` over the Gumbo shared log |
 | `catalyst-tools` | `ClockTool`, `CalculatorTool` |
 | `catalyst-langchain4j` | `LangChain4jModel`: adapts any LangChain4j `ChatModel` to Catalyst's `Model` |
+| `catalyst-otel` | `CatalystTracer`: folds an execution's log into an OpenTelemetry trace (API-only; app supplies the SDK) |
 | `catalyst-api` | Thin facade: `Catalyst.embedded(path)`, builders, `Serializers` |
 
 Coordinates: `com.cajunsystems:catalyst-*`. Root package `com.cajunsystems.catalyst`. Java 21.
@@ -197,8 +198,9 @@ and **M2** (branch + diff).
 
 ## Roadmap
 
-v0.1 is complete. See [ROADMAP.md](ROADMAP.md) for what's next — v0.2 (snapshots, blob store,
-auto-capture agent, OTel/timeline observability, remaining built-in tools) and v1 (agents, the
+v0.1 is complete. See [ROADMAP.md](ROADMAP.md) for what's next — v0.2 (largely shipped: snapshots,
+blob store, retry semantics, the OTel exporter, built-in tools; remaining: the auto-capture agent,
+streaming, the timeline UI) and v1 (agents, the
 `WAITING`/signal APIs and human-in-the-loop via Boudin, distributed execution over a Gumbo cluster,
 and the replay-driven eval harness).
 

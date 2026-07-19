@@ -136,8 +136,15 @@ shipped; the remaining v0.2 work (the auto-capture agent, streaming, observabili
   policy story.)
 
 ### Observability (spec §12)
-- **OTel exporter** — one span per event, execution = trace; the log already *is* the trace, so this
-  is a fold into OpenTelemetry.
+- ✅ **OTel exporter** — `catalyst-otel`'s `CatalystTracer.export(id, events)` folds an execution's
+  event log into one OpenTelemetry trace: a root span for the run (name = task type, bounds =
+  `startedAt`/`endedAt`, status OK/ERROR, attempt/retries/token/cost attributes), a child span per
+  side-effecting boundary (model / tool / effect / memory — model/tool carry real latency, model spans
+  carry that call's own tokens/cost/finish reason), and lifecycle moments (started/resumed/paused/
+  retry/branched/terminal) as span events on the root. Read-only and post-hoc — it consumes
+  `runtime.log().read(id)`, needing no runtime hook — so the log genuinely *is* the trace. The module
+  depends on the OpenTelemetry **API** only; the app supplies the SDK + a real OTLP exporter (the same
+  shape as the LangChain4j adapter). Gated by the v0.2 OTel exit demo in CI.
 - **Timeline UI** — a read-only view over `inspect(id).timelineView()` / `Trajectory`.
 
 ---
