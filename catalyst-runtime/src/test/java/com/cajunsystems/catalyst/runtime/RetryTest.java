@@ -8,6 +8,7 @@ import com.cajunsystems.catalyst.Tool;
 import com.cajunsystems.catalyst.engine.ExecutionState;
 import com.cajunsystems.catalyst.engine.InDoubtPolicy;
 import com.cajunsystems.catalyst.engine.RetryPolicy;
+import com.fasterxml.jackson.databind.node.NullNode;
 import com.cajunsystems.catalyst.events.CatalystEvent;
 import com.cajunsystems.catalyst.model.CompletionRequest;
 import com.cajunsystems.catalyst.model.Prompt;
@@ -186,6 +187,63 @@ class RetryTest {
             assertThat(replayed.status()).isEqualTo(Status.COMPLETED);
             assertThat(model.callCount()).as("no live model call during replay").isEqualTo(modelCallsAfterRun);
             assertThat(tool.invocations).as("no live tool call during replay").hasValue(toolInvocationsAfterRun);
+        }
+    }
+
+    @Test
+    void crashBetweenToolFailureAndRetryDoesNotBurnTheBudgetOnResume() {
+        // Simulate a crash in the window between recording ToolCompleted(error) and appending
+        // RetryRequested: the log ends with a trailing errored tool and no RetryRequested. On resume the
+        // failure is in-doubt (default FAIL) — it must fail immediately, not burn the whole retry budget
+        // on futile substitution-replay cycles.
+        InMemoryEventLog log = new InMemoryEventLog();
+        MockModel model = MockModel.alwaysReturn("m");
+        FlakyTool tool = new FlakyTool(0); // would succeed if actually re-run
+        Task<String> task = ctx -> ctx.call(tool, new In("x"));
+
+        ExecutionId id = ExecutionId.random();
+        Instant t = Instant.now();
+        log.putKey("k", id);
+        log.append(id, new CatalystEvent.ExecutionCreated(t, task.getClass().getName(), "h", "cfg", "k"));
+        log.append(id, new CatalystEvent.ExecutionStarted(t, 1, "node-0"));
+        log.append(id, new CatalystEvent.ToolRequested(t, "flaky", NullNode.getInstance()));
+        log.append(id, new CatalystEvent.ToolCompleted(t, null, "transient", 1)); // crash right here
+
+        try (CatalystRuntime runtime = CatalystRuntime.builder().log(log).model(model)
+                .retryPolicy(RetryPolicy.maxRetries(5, Duration.ofMillis(5))).build()) {
+            ExecutionHandle<String> h = runtime.execute(task, ExecutionOptions.withKey("k"));
+            catchThrowable(h::result);
+
+            assertThat(runtime.inspect(id).status()).isEqualTo(Status.FAILED);
+            assertThat(countOf(log::read, id, CatalystEvent.RetryRequested.class))
+                    .as("budget untouched: the in-doubt tail is not a retryable substitution").isZero();
+        }
+    }
+
+    @Test
+    void crashWindowToolIsReRunLiveUnderInDoubtRetry() {
+        // The same crash tail, but with InDoubtPolicy.RETRY: the in-doubt tool is genuinely re-run live
+        // and (being transient) now succeeds — the recovery the retry budget could never provide.
+        InMemoryEventLog log = new InMemoryEventLog();
+        MockModel model = MockModel.alwaysReturn("m");
+        FlakyTool tool = new FlakyTool(0);
+        Task<String> task = ctx -> ctx.call(tool, new In("x"));
+
+        ExecutionId id = ExecutionId.random();
+        Instant t = Instant.now();
+        log.putKey("k", id);
+        log.append(id, new CatalystEvent.ExecutionCreated(t, task.getClass().getName(), "h", "cfg", "k"));
+        log.append(id, new CatalystEvent.ExecutionStarted(t, 1, "node-0"));
+        log.append(id, new CatalystEvent.ToolRequested(t, "flaky", NullNode.getInstance()));
+        log.append(id, new CatalystEvent.ToolCompleted(t, null, "transient", 1)); // crash right here
+
+        try (CatalystRuntime runtime = CatalystRuntime.builder().log(log).model(model)
+                .inDoubtPolicy(InDoubtPolicy.RETRY).build()) {
+            ExecutionHandle<String> h = runtime.execute(task, ExecutionOptions.withKey("k"));
+
+            assertThat(h.result()).isEqualTo("ok:x");
+            assertThat(runtime.inspect(id).status()).isEqualTo(Status.COMPLETED);
+            assertThat(tool.invocations).as("the in-doubt tool ran live once").hasValue(1);
         }
     }
 

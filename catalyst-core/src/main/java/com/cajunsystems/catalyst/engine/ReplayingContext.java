@@ -144,6 +144,7 @@ public final class ReplayingContext implements Context {
                 retriedFailures.add(rr.failedSeq());
             }
         }
+        long lastRecordedSeq = recorded.isEmpty() ? -1 : recorded.get(recorded.size() - 1).seq();
 
         String pendingRequestHash = null;
         ToolRequested pendingToolRequest = null; // an unmatched ToolRequested (in-doubt) if non-null at end
@@ -162,20 +163,33 @@ public final class ReplayingContext implements Context {
                     pendingToolRequestSeq = se.seq();
                     pendingToolInputHash = Hashing.canonicalJsonHash(tr.input());
                 }
-                case ToolCompleted tc when tc.error() != null && retriedFailures.contains(se.seq()) -> {
-                    // The boundary a retry targets: drop it so call() re-runs the tool live. Clearing the
-                    // pending request is load-bearing — leave it and the request dangles into handleInDoubt,
-                    // turning a retry into an InDoubtException under the default FAIL policy.
-                    pendingToolRequest = null;
-                    pendingToolRequestSeq = -1;
-                    pendingToolInputHash = null;
-                }
                 case ToolCompleted tc -> {
-                    String name = pendingToolRequest != null ? pendingToolRequest.toolName() : null;
-                    boundaries.add(new Boundary(se.seq(), e, name, pendingToolInputHash));
-                    pendingToolRequest = null;
-                    pendingToolRequestSeq = -1;
-                    pendingToolInputHash = null;
+                    if (tc.error() != null && retriedFailures.contains(se.seq())) {
+                        // The boundary a retry targets: drop it so call() re-runs the tool live. Clearing
+                        // the pending request is load-bearing — leave it and the request dangles into
+                        // handleInDoubt, turning a retry into an InDoubtException under the default policy.
+                        pendingToolRequest = null;
+                        pendingToolRequestSeq = -1;
+                        pendingToolInputHash = null;
+                    } else if (tc.error() != null && se.seq() == lastRecordedSeq && pendingToolRequest != null) {
+                        // An errored tool at the very tail with no RetryRequested naming it: the process
+                        // crashed between recording the failure and deciding whether to retry. Its side
+                        // effect is in-doubt on resume — route recovery through InDoubtPolicy (which may
+                        // re-run it) exactly as for a tool with no recorded completion, rather than
+                        // replaying the recorded failure (which would burn the retry budget on a boundary
+                        // that can never succeed by substitution).
+                        this.danglingTool = pendingToolRequest;
+                        this.danglingToolSeq = pendingToolRequestSeq;
+                        pendingToolRequest = null;
+                        pendingToolRequestSeq = -1;
+                        pendingToolInputHash = null;
+                    } else {
+                        String name = pendingToolRequest != null ? pendingToolRequest.toolName() : null;
+                        boundaries.add(new Boundary(se.seq(), e, name, pendingToolInputHash));
+                        pendingToolRequest = null;
+                        pendingToolRequestSeq = -1;
+                        pendingToolInputHash = null;
+                    }
                 }
                 case EffectRecorded er -> boundaries.add(new Boundary(se.seq(), e, er.label(), null));
                 case MemoryRead mr -> boundaries.add(new Boundary(se.seq(), e, mr.key(), null));
@@ -500,7 +514,9 @@ public final class ReplayingContext implements Context {
      */
     public long failedBoundarySeq(Throwable propagating) {
         if (lastToolFailureException == null) return -1;
-        for (Throwable t = propagating; t != null; t = t.getCause()) {
+        // Bounded walk: a self- or mutually-referential cause chain would otherwise loop forever.
+        Throwable t = propagating;
+        for (int depth = 0; t != null && depth < 64; t = t.getCause(), depth++) {
             if (t == lastToolFailureException) return lastToolFailureSeq;
         }
         return -1;

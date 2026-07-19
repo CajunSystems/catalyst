@@ -71,18 +71,36 @@ class ReplayingContextRetrySeedTest {
     }
 
     @Test
-    void anUnretriedRecordedToolFailureStillSubstitutesAndThrows() {
-        // Without a matching RetryRequested.failedSeq, the recorded failure remains a substitutable
-        // boundary — unchanged behaviour for ordinary (non-retry) replays.
+    void aFinalisedRecordedToolFailureStillSubstitutesAndThrows() {
+        // A genuine terminal recorded failure — the error is followed by ExecutionFailed, so it is NOT
+        // the last event — remains a substitutable boundary: replay reproduces the recorded failure
+        // without re-running the tool (determinism preserved for ordinary, non-retry replays).
         List<SequencedEvent> recorded = seq(
                 new ToolRequested(T, "flaky", new TextNode("in")),
-                new ToolCompleted(T, null, "boom", 1));
+                new ToolCompleted(T, null, "boom", 1),
+                new ExecutionFailed(T, "boom", 1));
 
         CountingTool tool = new CountingTool();
         assertThatThrownBy(() -> newContext(recorded).call(tool, "in"))
                 .isInstanceOf(RuntimeException.class)
                 .hasMessageContaining("Recorded tool 'flaky' failed");
         assertThat(tool.invocations).as("substituted — tool not invoked").hasValue(0);
+    }
+
+    @Test
+    void aTrailingErroredToolWithNoRetryIsInDoubtNotSubstituted() {
+        // A crash between recording the tool failure and deciding whether to retry leaves the errored
+        // ToolCompleted as the last event, with no RetryRequested naming it. Its side effect is in-doubt:
+        // it must route through InDoubtPolicy (FAIL here) rather than replay the recorded failure — which
+        // would otherwise burn the retry budget on a boundary that can never succeed by substitution.
+        List<SequencedEvent> recorded = seq(
+                new ToolRequested(T, "flaky", new TextNode("in")),
+                new ToolCompleted(T, null, "boom", 1));
+
+        CountingTool tool = new CountingTool();
+        assertThatThrownBy(() -> newContext(recorded).call(tool, "in"))
+                .isInstanceOf(InDoubtException.class);
+        assertThat(tool.invocations).as("in-doubt under FAIL — tool not re-run").hasValue(0);
     }
 
     private ReplayingContext newContext(List<SequencedEvent> recorded) {
