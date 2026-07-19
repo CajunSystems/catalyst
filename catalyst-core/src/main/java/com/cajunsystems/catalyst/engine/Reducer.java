@@ -36,6 +36,7 @@ public final class Reducer {
         String taskType = base.taskType();
         String idempotencyKey = base.idempotencyKey();
         int attempt = base.attempt();
+        int retries = base.retries();
         Instant startedAt = base.startedAt();
         Instant endedAt = base.endedAt();
         Cost cost = base.cost();
@@ -103,8 +104,12 @@ public final class Reducer {
                         timeline.add(new TimelineStep(se.seq(), TimelineStep.Kind.MEMORY_READ, mr.key(), mr.at(), 0, mr.value()));
                 case MemoryWritten mw ->
                         timeline.add(new TimelineStep(se.seq(), TimelineStep.Kind.MEMORY_WRITE, mw.key(), mw.at(), 0, mw.value()));
-                case RetryRequested rr ->
-                        timeline.add(new TimelineStep(se.seq(), TimelineStep.Kind.RETRY, rr.cause(), rr.at(), 0, null));
+                case RetryRequested rr -> {
+                    // A failure retry: bump the crash-safe retry budget (distinct from `attempt`, which the
+                    // following ExecutionResumed advances). Status stays RUNNING — a retry is not terminal.
+                    retries++;
+                    timeline.add(new TimelineStep(se.seq(), TimelineStep.Kind.RETRY, rr.cause(), rr.at(), 0, null));
+                }
                 case ExecutionBranched b ->
                         timeline.add(new TimelineStep(se.seq(), TimelineStep.Kind.BRANCHED, b.parentId(), b.at(), 0, null));
                 case ExecutionCompleted c -> {
@@ -128,7 +133,7 @@ public final class Reducer {
             }
         }
 
-        return new ReducerState(status, taskType, idempotencyKey, attempt, startedAt, endedAt,
+        return new ReducerState(status, taskType, idempotencyKey, attempt, retries, startedAt, endedAt,
                 cost, totalLatencyMillis, result, error, lastSeq, lastToolStepIndex, timeline);
     }
 }

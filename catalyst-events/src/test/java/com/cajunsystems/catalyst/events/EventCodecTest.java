@@ -30,7 +30,7 @@ class EventCodecTest {
                 new EffectRecorded(t, "as-of", new TextNode("2026")),
                 new MemoryRead(t, "k", new TextNode("v")),
                 new MemoryWritten(t, "k", new TextNode("v")),
-                new RetryRequested(t, "timeout", 1000),
+                new RetryRequested(t, "timeout", 1000, 5),
                 new ExecutionBranched(t, "exec-parent", 12, "model"),
                 new ExecutionCompleted(t, new TextNode("result")),
                 new ExecutionFailed(t, "boom", 9),

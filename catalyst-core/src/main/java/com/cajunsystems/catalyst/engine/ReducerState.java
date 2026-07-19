@@ -23,6 +23,7 @@ public record ReducerState(
         String taskType,
         String idempotencyKey,
         int attempt,
+        int retries,
         Instant startedAt,
         Instant endedAt,
         Cost cost,
@@ -44,13 +45,13 @@ public record ReducerState(
 
     /** The empty accumulator: an execution with no events folded yet. */
     public static ReducerState initial() {
-        return new ReducerState(Status.NEW, null, null, 0, null, null, Cost.ZERO, 0,
+        return new ReducerState(Status.NEW, null, null, 0, 0, null, null, Cost.ZERO, 0,
                 null, null, -1, -1, List.of());
     }
 
     /** Projects the accumulator to the public folded view for {@code id} (drops private fold state). */
     public ExecutionState toExecutionState(ExecutionId id) {
-        return new ExecutionState(id, status, taskType, idempotencyKey, attempt, startedAt, endedAt,
+        return new ExecutionState(id, status, taskType, idempotencyKey, attempt, retries, startedAt, endedAt,
                 cost, totalLatencyMillis, result, error, lastSeq, timeline);
     }
 }

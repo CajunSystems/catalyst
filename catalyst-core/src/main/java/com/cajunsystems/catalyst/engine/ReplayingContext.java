@@ -23,9 +23,11 @@ import java.time.Instant;
 import java.util.ArrayDeque;
 import java.util.Deque;
 import java.util.HashMap;
+import java.util.HashSet;
 import java.util.List;
 import java.util.Map;
 import java.util.Optional;
+import java.util.Set;
 import java.util.function.Supplier;
 
 /**
@@ -80,6 +82,13 @@ public final class ReplayingContext implements Context {
     /** A trailing {@code ToolRequested} with no completion: a tool that was in flight at crash. */
     private ToolRequested danglingTool;
     private long danglingToolSeq = -1;
+    /**
+     * The seq of the {@code ToolCompleted} recording the most recent live tool failure, and the exact
+     * exception instance it rethrew — so the runtime can attribute a propagating throwable to the
+     * boundary that raised it ({@link #failedBoundarySeq}). {@code -1} until a live tool fails.
+     */
+    private long lastToolFailureSeq = -1;
+    private RuntimeException lastToolFailureException;
     /** True once this run has forked off the recorded history (BRANCH mode). */
     private boolean branched;
     /** Working-memory state rebuilt from recorded {@code MemoryWritten} events. */
@@ -126,6 +135,17 @@ public final class ReplayingContext implements Context {
      * substitutable event.
      */
     private void seed(List<SequencedEvent> recorded) {
+        // Boundaries a retry was requested for: their recorded (failed) result is NOT substitutable —
+        // the retry exists precisely to re-run that boundary live. Pre-scan so the drop below is a pure
+        // function of the log, applied identically on resume and on replay(id, task).
+        Set<Long> retriedFailures = new HashSet<>();
+        for (SequencedEvent se : recorded) {
+            if (se.event() instanceof RetryRequested rr && rr.failedSeq() >= 0) {
+                retriedFailures.add(rr.failedSeq());
+            }
+        }
+        long lastRecordedSeq = recorded.isEmpty() ? -1 : recorded.get(recorded.size() - 1).seq();
+
         String pendingRequestHash = null;
         ToolRequested pendingToolRequest = null; // an unmatched ToolRequested (in-doubt) if non-null at end
         long pendingToolRequestSeq = -1;
@@ -144,11 +164,32 @@ public final class ReplayingContext implements Context {
                     pendingToolInputHash = Hashing.canonicalJsonHash(tr.input());
                 }
                 case ToolCompleted tc -> {
-                    String name = pendingToolRequest != null ? pendingToolRequest.toolName() : null;
-                    boundaries.add(new Boundary(se.seq(), e, name, pendingToolInputHash));
-                    pendingToolRequest = null;
-                    pendingToolRequestSeq = -1;
-                    pendingToolInputHash = null;
+                    if (tc.error() != null && retriedFailures.contains(se.seq())) {
+                        // The boundary a retry targets: drop it so call() re-runs the tool live. Clearing
+                        // the pending request is load-bearing — leave it and the request dangles into
+                        // handleInDoubt, turning a retry into an InDoubtException under the default policy.
+                        pendingToolRequest = null;
+                        pendingToolRequestSeq = -1;
+                        pendingToolInputHash = null;
+                    } else if (tc.error() != null && se.seq() == lastRecordedSeq && pendingToolRequest != null) {
+                        // An errored tool at the very tail with no RetryRequested naming it: the process
+                        // crashed between recording the failure and deciding whether to retry. Its side
+                        // effect is in-doubt on resume — route recovery through InDoubtPolicy (which may
+                        // re-run it) exactly as for a tool with no recorded completion, rather than
+                        // replaying the recorded failure (which would burn the retry budget on a boundary
+                        // that can never succeed by substitution).
+                        this.danglingTool = pendingToolRequest;
+                        this.danglingToolSeq = pendingToolRequestSeq;
+                        pendingToolRequest = null;
+                        pendingToolRequestSeq = -1;
+                        pendingToolInputHash = null;
+                    } else {
+                        String name = pendingToolRequest != null ? pendingToolRequest.toolName() : null;
+                        boundaries.add(new Boundary(se.seq(), e, name, pendingToolInputHash));
+                        pendingToolRequest = null;
+                        pendingToolRequestSeq = -1;
+                        pendingToolInputHash = null;
+                    }
                 }
                 case EffectRecorded er -> boundaries.add(new Boundary(se.seq(), e, er.label(), null));
                 case MemoryRead mr -> boundaries.add(new Boundary(se.seq(), e, mr.key(), null));
@@ -262,7 +303,11 @@ public final class ReplayingContext implements Context {
             return output;
         } catch (RuntimeException ex) {
             long latencyMillis = (System.nanoTime() - t0) / 1_000_000;
-            append(new ToolCompleted(now(), null, String.valueOf(ex), latencyMillis));
+            // Record the failure as a boundary result (so inspect/replay see it), and remember which seq
+            // it landed at plus the instance we rethrow, so a retry can attribute the propagating failure
+            // back to this boundary and re-run it live rather than substituting the recorded failure.
+            lastToolFailureSeq = append(new ToolCompleted(now(), null, String.valueOf(ex), latencyMillis));
+            lastToolFailureException = ex;
             throw ex;
         }
     }
@@ -453,6 +498,28 @@ public final class ReplayingContext implements Context {
 
     private long append(CatalystEvent event) {
         return log.append(id, event);
+    }
+
+    /**
+     * The seq of the recorded boundary whose live failure produced {@code propagating}, or {@code -1}
+     * if this failure is not attributable to an unhandled tool boundary. Used by the runtime to stamp
+     * {@code RetryRequested.failedSeq} so a retry re-runs that boundary live instead of substituting its
+     * recorded failure.
+     *
+     * <p>Attribution is by exception <em>identity</em>: the seq is returned only when the last live tool
+     * failure's exception is {@code propagating} itself or somewhere in its cause chain (covering "catch,
+     * wrap, rethrow"). A failure the task caught and recovered from, or one raised in pure task code,
+     * yields {@code -1} — and {@code -1} degrades safely to "retry is a no-op for this failure", never to
+     * dropping a boundary a substitution still depends on.
+     */
+    public long failedBoundarySeq(Throwable propagating) {
+        if (lastToolFailureException == null) return -1;
+        // Bounded walk: a self- or mutually-referential cause chain would otherwise loop forever.
+        Throwable t = propagating;
+        for (int depth = 0; t != null && depth < 64; t = t.getCause(), depth++) {
+            if (t == lastToolFailureException) return lastToolFailureSeq;
+        }
+        return -1;
     }
 
     private Instant now() {

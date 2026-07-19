@@ -87,5 +87,16 @@ intended source, but if `jitpack.io` is blocked, install Gumbo locally first:
   boundary (checked in `ReplayingContext.requireAppendable`) and records the event itself — so no other
   thread ever appends to a running execution's stream. Attaching to a cancelled execution surfaces a
   `CancellationException`.
+- **v0.2 Retry semantics** — `RetryAcceptanceTest` + `Demo retry`: a transient tool failure is retried
+  as a new attempt on the same stream (retry-as-attempt). A retryable failure appends `RetryRequested`
+  (carrying the failed boundary's `failedSeq`) instead of `ExecutionFailed`, then re-enters the task as
+  a resume — the successful prefix is substituted and only the failing boundary re-runs live (`seed()`
+  drops the retried `ToolCompleted(error)` so it is not substituted; model/effect failures record
+  nothing and already re-run). A pluggable `RetryPolicy` (`none()` default, `maxRetries`, `exponential`)
+  bounds it, set via `Catalyst.builder().retryPolicy` or per-execution `ExecutionOptions.retryPolicy`.
+  Retries fold to a crash-safe `retries` counter distinct from `attempt`. Retryability is gated in the
+  runtime (`isRetryable`: excludes `NonDeterministicReplayException`, `InDoubtException`,
+  `InterruptedException`, `Error`) before the policy is consulted. Whole-task, not per-tool. A retried
+  log still replays exactly.
 
-CI (`.github/workflows/ci.yml`) runs all five exit demos as gates — it is the source of truth per phase.
+CI (`.github/workflows/ci.yml`) runs all exit demos as gates — it is the source of truth per phase.
