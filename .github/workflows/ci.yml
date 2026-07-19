@@ -140,6 +140,33 @@ jobs:
             || { echo "FAIL: the post-cancel boundary executed (or the pre-cancel one did not)"; exit 1; }
           echo "v0.2 Cancellation exit criterion holds: cooperative cancel folded to CANCELLED, no wasted call."
 
+      # The v0.2 retry exit criterion (roadmap §13.3): a transient tool failure is retried as a new
+      # attempt on the same stream — the failing boundary re-runs live while the successful prefix is
+      # substituted — bounded by the policy, and the retried log still replays exactly. The pair
+      # "tool invocations: 3" + "model calls across retries: 1" is the whole semantics: substitute-
+      # everything would show 1 invocation + FAILED, re-run-everything would show 3 model calls.
+      - name: v0.2 Retry exit demo (bounded retry-as-attempt, prefix substituted, replay exact)
+        run: |
+          set -uo pipefail
+          CP="catalyst-api/target/classes:$(cat catalyst-api/target/cp.txt)"
+
+          echo "--- retry a transient tool failure ---"
+          OUT="$(java -cp "$CP" com.cajunsystems.catalyst.api.Demo retry)"
+          echo "$OUT"
+          echo "$OUT" | grep -q "\[retry\] transient tool failure retried -> COMPLETED" \
+            || { echo "FAIL: a retryable failure did not recover"; exit 1; }
+          echo "$OUT" | grep -q "\[retry\] tool invocations: 3" \
+            || { echo "FAIL: the failing tool was not re-run live (recorded failure substituted?)"; exit 1; }
+          echo "$OUT" | grep -q "\[retry\] model calls across retries: 1" \
+            || { echo "FAIL: retry re-ran the successful prefix"; exit 1; }
+          echo "$OUT" | grep -q "\[retry\] external calls during replay of the retried execution: 0" \
+            || { echo "FAIL: a retried execution no longer replays exactly"; exit 1; }
+          echo "$OUT" | grep -q "\[retry\] default policy (none) -> FAILED" \
+            || { echo "FAIL: retry is not opt-in (default policy retried)"; exit 1; }
+          echo "$OUT" | grep -q "\[retry\] retry criterion holds" \
+            || { echo "FAIL: retry demo did not pass its assertions"; exit 1; }
+          echo "v0.2 Retry exit criterion holds: bounded retry-as-attempt, prefix substituted, replay exact."
+
       # The v0.2 resume-by-id exit criterion (roadmap increment ②): recover a crashed execution from
       # its id alone via the task registry — no idempotency key, no re-submitted task — finishing with
       # zero duplicate model calls.
