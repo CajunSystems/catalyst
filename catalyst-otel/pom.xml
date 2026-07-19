@@ -1,0 +1,44 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<project xmlns="http://maven.apache.org/POM/4.0.0"
+         xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance"
+         xsi:schemaLocation="http://maven.apache.org/POM/4.0.0 http://maven.apache.org/xsd/maven-4.0.0.xsd">
+    <modelVersion>4.0.0</modelVersion>
+
+    <parent>
+        <groupId>com.cajunsystems</groupId>
+        <artifactId>catalyst-parent</artifactId>
+        <version>0.1.0-SNAPSHOT</version>
+    </parent>
+
+    <artifactId>catalyst-otel</artifactId>
+    <name>Catalyst OpenTelemetry</name>
+    <description>Exporter: fold an execution's event log into an OpenTelemetry trace (spec §12).</description>
+
+    <dependencies>
+        <dependency>
+            <groupId>com.cajunsystems</groupId>
+            <artifactId>catalyst-core</artifactId>
+        </dependency>
+        <!--
+          Only the OpenTelemetry API is needed at compile time. The application supplies the SDK and a
+          concrete exporter (OTLP → collector, Jaeger, …); Catalyst never owns the telemetry pipeline —
+          the same "adapter depends on the API, app supplies the provider" shape as catalyst-langchain4j.
+        -->
+        <dependency>
+            <groupId>io.opentelemetry</groupId>
+            <artifactId>opentelemetry-api</artifactId>
+        </dependency>
+
+        <!-- Tests drive a real SDK with an in-memory span exporter; never leaves the JVM. -->
+        <dependency>
+            <groupId>io.opentelemetry</groupId>
+            <artifactId>opentelemetry-sdk</artifactId>
+            <scope>test</scope>
+        </dependency>
+        <dependency>
+            <groupId>io.opentelemetry</groupId>
+            <artifactId>opentelemetry-sdk-testing</artifactId>
+            <scope>test</scope>
+        </dependency>
+    </dependencies>
+</project>
