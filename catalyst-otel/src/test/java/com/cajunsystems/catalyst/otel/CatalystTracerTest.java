@@ -50,12 +50,13 @@ class CatalystTracerTest {
                 new ExecutionResumed(at(5), 2),
                 new ToolRequested(at(5), "search", new TextNode("q")),
                 new ToolCompleted(at(6), new TextNode("hit"), null, 500),
+                new EffectRecorded(at(6), "clock", new TextNode("t")),
                 new ExecutionCompleted(at(7), new TextNode("done")));
 
         new CatalystTracer(tracer).export(id, events);
 
         List<SpanData> all = spans.getFinishedSpanItems();
-        assertThat(all).hasSize(4); // root + model + 2 tool
+        assertThat(all).hasSize(5); // root + model + 2 tool + effect
 
         SpanData root = all.stream().filter(s -> !s.getParentSpanContext().isValid()).findFirst().orElseThrow();
         assertThat(root.getName()).isEqualTo("SearchTask");
@@ -81,12 +82,19 @@ class CatalystTracerTest {
         assertThat(model.getAttributes().get(AttributeKey.stringKey("catalyst.finish_reason"))).isEqualTo("stop");
         assertThat(model.getStartEpochNanos()).isEqualTo(toNanos(at(1)));
         assertThat(model.getEndEpochNanos()).isEqualTo(toNanos(at(2)));
+        // An outbound boundary (model call) is a CLIENT span.
+        assertThat(model.getKind()).isEqualTo(SpanKind.CLIENT);
 
-        // Two tool spans; the first errored, the second succeeded.
+        // Two tool spans; the first errored, the second succeeded. Tool calls are also outbound (CLIENT).
         List<SpanData> tools = children.stream().filter(s -> s.getName().equals("search")).toList();
         assertThat(tools).hasSize(2);
         assertThat(tools).anySatisfy(s -> assertThat(s.getStatus().getStatusCode()).isEqualTo(StatusCode.ERROR));
         assertThat(tools).anySatisfy(s -> assertThat(s.getStatus().getStatusCode()).isEqualTo(StatusCode.UNSET));
+        assertThat(tools).allSatisfy(s -> assertThat(s.getKind()).isEqualTo(SpanKind.CLIENT));
+
+        // An in-process boundary (effect) is an INTERNAL span, not CLIENT.
+        SpanData effect = children.stream().filter(s -> s.getName().equals("effect")).findFirst().orElseThrow();
+        assertThat(effect.getKind()).isEqualTo(SpanKind.INTERNAL);
 
         // Lifecycle moments are annotations on the root, not spans.
         assertThat(root.getEvents()).extracting(EventData::getName)

@@ -88,7 +88,7 @@ public final class CatalystTracer {
                 case CompletionReceived cr -> {
                     Instant spanEnd = cr.at();
                     Instant spanStart = modelRequestAt != null ? modelRequestAt : minusMillis(spanEnd, cr.latencyMillis());
-                    Span s = child("model", parent, spanStart, seq, "MODEL")
+                    Span s = child("model", parent, spanStart, seq, "MODEL", SpanKind.CLIENT)
                             .setAttribute("gen_ai.usage.input_tokens", cr.promptTokens())
                             .setAttribute("gen_ai.usage.output_tokens", cr.completionTokens())
                             .setAttribute("catalyst.cost.usd", cr.costUsd())
@@ -106,7 +106,7 @@ public final class CatalystTracer {
                     Instant spanEnd = tc.at();
                     Instant spanStart = toolRequestAt != null ? toolRequestAt : minusMillis(spanEnd, tc.latencyMillis());
                     String name = pendingTool != null ? pendingTool.toolName() : "tool";
-                    Span s = child(name, parent, spanStart, seq, "TOOL")
+                    Span s = child(name, parent, spanStart, seq, "TOOL", SpanKind.CLIENT)
                             .setAttribute("catalyst.tool.name", name)
                             .setAttribute("catalyst.latency.ms", tc.latencyMillis())
                             .startSpan();
@@ -147,10 +147,10 @@ public final class CatalystTracer {
         root.end(end);
     }
 
-    private SpanBuilder child(String name, Context parent, Instant start, long seq, String kind) {
+    private SpanBuilder child(String name, Context parent, Instant start, long seq, String kind, SpanKind spanKind) {
         return tracer.spanBuilder(name)
                 .setParent(parent)
-                .setSpanKind(SpanKind.CLIENT)
+                .setSpanKind(spanKind)
                 .setStartTimestamp(start)
                 .setAttribute("catalyst.seq", seq)
                 .setAttribute("catalyst.kind", kind);
@@ -158,8 +158,9 @@ public final class CatalystTracer {
 
     private void pointSpan(String name, Context parent, Instant at, long seq, String kind,
                            String attrKey, String attrValue) {
-        // A boundary with no recorded duration: a zero-length span at its instant.
-        Span s = child(name, parent, at, seq, kind).setAttribute(attrKey, attrValue).startSpan();
+        // A boundary with no recorded duration: a zero-length span at its instant. Effect/memory are
+        // in-process work, so INTERNAL (not CLIENT, which signals an outbound call to a backend).
+        Span s = child(name, parent, at, seq, kind, SpanKind.INTERNAL).setAttribute(attrKey, attrValue).startSpan();
         s.end(at);
     }
 

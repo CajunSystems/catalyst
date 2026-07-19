@@ -61,12 +61,18 @@ class OtelAcceptanceTest {
     }
 
     private InMemorySpanExporter spans;
+    private SdkTracerProvider activeProvider;
+
+    @org.junit.jupiter.api.AfterEach
+    void closeProvider() {
+        if (activeProvider != null) activeProvider.close();
+    }
 
     private CatalystTracer tracerInto(InMemorySpanExporter exporter) {
-        SdkTracerProvider provider = SdkTracerProvider.builder()
+        activeProvider = SdkTracerProvider.builder()
                 .addSpanProcessor(SimpleSpanProcessor.create(exporter))
                 .build();
-        return new CatalystTracer(provider.get("test"));
+        return new CatalystTracer(activeProvider.get("test"));
     }
 
     @Test
