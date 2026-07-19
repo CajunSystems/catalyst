@@ -16,12 +16,14 @@ import com.cajunsystems.catalyst.engine.ExecutionFailedException;
 import com.cajunsystems.catalyst.engine.ExecutionPausedSignal;
 import com.cajunsystems.catalyst.engine.ExecutionState;
 import com.cajunsystems.catalyst.engine.Hashing;
+import com.cajunsystems.catalyst.engine.InDoubtException;
 import com.cajunsystems.catalyst.engine.InDoubtPolicy;
 import com.cajunsystems.catalyst.engine.NonDeterministicReplayException;
 import com.cajunsystems.catalyst.engine.PayloadCodec;
 import com.cajunsystems.catalyst.engine.Reducer;
 import com.cajunsystems.catalyst.engine.ReducerState;
 import com.cajunsystems.catalyst.engine.ReplayingContext;
+import com.cajunsystems.catalyst.engine.RetryPolicy;
 import com.cajunsystems.catalyst.engine.TimelineStep;
 import com.cajunsystems.catalyst.engine.Trajectory;
 import com.cajunsystems.catalyst.events.CatalystEvent;
@@ -37,6 +39,7 @@ import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 
 import java.time.Clock;
+import java.time.Duration;
 import java.time.Instant;
 import java.util.ArrayList;
 import java.util.HashMap;
@@ -63,6 +66,7 @@ public final class CatalystRuntime implements AutoCloseable {
     private final ReplayMode replayMode;
     private final InDoubtPolicy inDoubtPolicy;
     private final CostModel costModel;
+    private final RetryPolicy retryPolicy;
     private final ObjectMapper eventMapper;
     private final PayloadCodec payloads;
     private final String nodeId;
@@ -126,6 +130,7 @@ public final class CatalystRuntime implements AutoCloseable {
         this.replayMode = b.replayMode;
         this.inDoubtPolicy = b.inDoubtPolicy;
         this.costModel = b.costModel;
+        this.retryPolicy = b.retryPolicy;
         this.eventMapper = b.eventMapper;
         this.payloads = new PayloadCodec();
         this.nodeId = b.nodeId;
@@ -554,9 +559,11 @@ public final class CatalystRuntime implements AutoCloseable {
                                 ExecutionOptions opts, Mode mode, CompletableFuture<R> future,
                                 RunningAttempt runningAttempt) {
         runningAttempt.thread = Thread.currentThread();
-        // Everything is inside a try that always completes the future — including the setup below
-        // (log I/O, fold, lifecycle appends, context construction). If any of that throws, the caller
-        // must see the failure rather than block forever on handle.result().
+        RetryPolicy policy = opts.retryPolicy().orElse(this.retryPolicy);
+        // Outer try: the future is ALWAYS completed on every exit — including setup failures (log I/O,
+        // fold, context construction), which append nothing (the log may be unreadable). A retryable
+        // task failure loops WITHOUT completing the future, so inFlight stays registered and a concurrent
+        // same-key execute attaches to this attempt rather than scheduling a duplicate writer.
         try {
             List<SequencedEvent> recorded = log.read(id);
             ExecutionState state = Reducer.fold(id, recorded);
@@ -569,56 +576,134 @@ public final class CatalystRuntime implements AutoCloseable {
                 return;
             }
 
-            int attempt = state.attempt() + 1;
-            switch (mode) {
-                case FRESH -> log.append(id, new CatalystEvent.ExecutionStarted(now(), attempt, nodeId));
-                case RESUME -> log.append(id, new CatalystEvent.ExecutionResumed(now(), attempt));
-                case REPLAY_TERMINAL -> { /* handled above */ }
-            }
-
-            String effectiveTaskType = state.taskType() != null ? state.taskType() : taskType;
-            ExecutionInfo info = new ExecutionInfo(id, attempt, effectiveTaskType, opts.metadata());
-            Logger logger = LoggerFactory.getLogger("catalyst.exec." + id.value());
-
-            ReplayingContext ctx = new ReplayingContext(id, log, defaultModel, info, opts.vars(),
-                    eventMapper, payloads, inDoubtPolicy, costModel, replayMode, null, clock, logger,
-                    recorded, /* appendEnabled */ true, runningAttempt.token);
-
-            try {
-                R result = task.execute(ctx);
-                log.append(id, new CatalystEvent.ExecutionCompleted(now(), payloads.toTree(result)));
-                future.complete(result);
-            } catch (ExecutionPausedSignal pause) {
-                // ExecutionPaused already recorded by the context; leave the execution paused.
-                future.completeExceptionally(pause);
-            } catch (Throwable t) {
-                // A cancelled attempt folds to CANCELLED only via the cooperative unwind itself: the
-                // CancellationSignal the context raises at the next live boundary once the token trips
-                // (that is, the task acknowledging cancellation). Every other throwable after a cancel
-                // request is preserved as ExecutionFailed — including a bare InterruptedException, which
-                // is indistinguishable from a fresh interrupt failure a blocking call raised during
-                // cleanup. The interrupt() we raise is only a best-effort nudge to reach that boundary
-                // promptly; it never, by itself, reclassifies a failure as a clean cancellation.
-                if (t instanceof CancellationSignal) {
-                    String reason = runningAttempt.token.reason();
-                    try {
-                        log.append(id, new CatalystEvent.ExecutionCancelled(now(), reason, log.latestSeq(id)));
-                    } catch (RuntimeException ignored) {
-                        // best-effort cancellation record; the future still completes exceptionally below
-                    }
-                    future.completeExceptionally(new CancellationException(reason));
+            boolean firstIteration = true;
+            while (true) {
+                // Re-read + re-fold each iteration: a retry appends RetryRequested + ExecutionResumed,
+                // and the context must seed from the full recorded prefix (including its own last
+                // failure). Full read, not foldState — so snapshots are never consulted here.
+                if (!firstIteration) {
+                    recorded = log.read(id);
+                    state = Reducer.fold(id, recorded);
+                }
+                int attempt = state.attempt() + 1;
+                if (firstIteration && mode == Mode.FRESH) {
+                    log.append(id, new CatalystEvent.ExecutionStarted(now(), attempt, nodeId));
                 } else {
-                    try {
-                        log.append(id, new CatalystEvent.ExecutionFailed(now(), String.valueOf(t), log.latestSeq(id)));
-                    } catch (RuntimeException ignored) {
-                        // best-effort failure record; the future still completes exceptionally below
+                    // A retry IS a resume: it re-enters the task with the recorded prefix substituted.
+                    log.append(id, new CatalystEvent.ExecutionResumed(now(), attempt));
+                }
+                firstIteration = false;
+
+                String effectiveTaskType = state.taskType() != null ? state.taskType() : taskType;
+                ExecutionInfo info = new ExecutionInfo(id, attempt, effectiveTaskType, opts.metadata());
+                Logger logger = LoggerFactory.getLogger("catalyst.exec." + id.value());
+
+                ReplayingContext ctx = new ReplayingContext(id, log, defaultModel, info, opts.vars(),
+                        eventMapper, payloads, inDoubtPolicy, costModel, replayMode, null, clock, logger,
+                        recorded, /* appendEnabled */ true, runningAttempt.token);
+
+                try {
+                    R result = task.execute(ctx);
+                    log.append(id, new CatalystEvent.ExecutionCompleted(now(), payloads.toTree(result)));
+                    future.complete(result);
+                    return;
+                } catch (ExecutionPausedSignal pause) {
+                    // ExecutionPaused already recorded by the context; leave the execution paused.
+                    future.completeExceptionally(pause);
+                    return;
+                } catch (Throwable t) {
+                    // A cancelled attempt folds to CANCELLED only via the cooperative unwind itself: the
+                    // CancellationSignal the context raises at the next live boundary once the token trips
+                    // (the task acknowledging cancellation). The interrupt() cancel() raises is only a
+                    // best-effort nudge to reach that boundary; it never reclassifies a failure.
+                    if (t instanceof CancellationSignal) {
+                        recordCancelled(id, runningAttempt.token.reason(), future);
+                        return;
                     }
-                    future.completeExceptionally(t);
+                    // Decide retry vs. terminal failure. isRetryable gates out failures a retry can never
+                    // fix (determinism bugs, in-doubt, interrupts, Errors) before the policy is consulted;
+                    // a cancel that raced the failure wins (no phantom retry-then-cancel).
+                    Optional<Duration> backoff = isRetryable(t)
+                            ? policy.nextBackoff(state.retries(), t) : Optional.empty();
+                    if (backoff.isEmpty() || runningAttempt.token.isCancelled()) {
+                        recordFailed(id, t, future);
+                        return;
+                    }
+                    long backoffMillis = Math.max(0, backoff.get().toMillis());
+                    try {
+                        // failedSeq lets the next seed() re-run the failing boundary live instead of
+                        // substituting its recorded failure; -1 when the failure is not one (see
+                        // ReplayingContext.failedBoundarySeq). Appended BEFORE the sleep so a crash mid-
+                        // backoff preserves the budget; ExecutionResumed follows atop the next iteration.
+                        log.append(id, new CatalystEvent.RetryRequested(
+                                now(), String.valueOf(t), backoffMillis, ctx.failedBoundarySeq(t)));
+                    } catch (RuntimeException appendFailed) {
+                        // Cannot durably record the retry → do not retry; fail with the original cause.
+                        recordFailed(id, t, future);
+                        return;
+                    }
+                    if (!sleepUnlessCancelled(backoffMillis, runningAttempt.token)) {
+                        recordCancelled(id, runningAttempt.token.reason(), future);
+                        return;
+                    }
+                    // Clear any stray interrupt so it cannot leak a spurious InterruptedException into the
+                    // next attempt's task code.
+                    Thread.interrupted();
                 }
             }
         } catch (Throwable setupFailure) {
             future.completeExceptionally(setupFailure);
         }
+    }
+
+    /**
+     * True if {@code t} is a failure a retry could plausibly fix. Enforced before any {@link RetryPolicy}
+     * is consulted, so a policy never sees — and cannot elect to spin on — a failure retry can't help:
+     * a determinism divergence (a bug in the task), an in-doubt boundary (governed by
+     * {@link InDoubtPolicy}, and re-thrown identically), an interrupt (a cancellation nudge, not a
+     * transient fault), or an {@link Error} (OOM/StackOverflow, which retrying only worsens).
+     */
+    private static boolean isRetryable(Throwable t) {
+        return !(t instanceof NonDeterministicReplayException
+                || t instanceof InDoubtException
+                || t instanceof InterruptedException
+                || t instanceof Error);
+    }
+
+    /** Best-effort {@code ExecutionFailed} append (terminal), then completes the future with the cause. */
+    private <R> void recordFailed(ExecutionId id, Throwable t, CompletableFuture<R> future) {
+        try {
+            log.append(id, new CatalystEvent.ExecutionFailed(now(), String.valueOf(t), log.latestSeq(id)));
+        } catch (RuntimeException ignored) {
+            // best-effort failure record; the future still completes exceptionally below
+        }
+        future.completeExceptionally(t);
+    }
+
+    /** Best-effort {@code ExecutionCancelled} append (terminal), then completes with CancellationException. */
+    private <R> void recordCancelled(ExecutionId id, String reason, CompletableFuture<R> future) {
+        try {
+            log.append(id, new CatalystEvent.ExecutionCancelled(now(), reason, log.latestSeq(id)));
+        } catch (RuntimeException ignored) {
+            // best-effort cancellation record; the future still completes exceptionally below
+        }
+        future.completeExceptionally(new CancellationException(reason));
+    }
+
+    /**
+     * Sleeps the backoff on the worker thread. Returns true to proceed with the next attempt, or false if
+     * the attempt was cancelled — detected via the token (which {@code cancel(id)} trips before it
+     * interrupts the worker), not via the interrupt flag. A spurious interrupt with no cancel is treated
+     * as "keep going"; the caller then clears the flag so it cannot leak into the next attempt.
+     */
+    private boolean sleepUnlessCancelled(long millis, CancellationToken token) {
+        if (token.isCancelled()) return false;
+        try {
+            if (millis > 0) Thread.sleep(millis);
+        } catch (InterruptedException e) {
+            // fall through: the token is the source of truth for whether this was a cancel
+        }
+        return !token.isCancelled();
     }
 
     /** Completes a handle from an already-terminal execution's recorded outcome, without re-running. */
@@ -652,6 +737,7 @@ public final class CatalystRuntime implements AutoCloseable {
         private ReplayMode replayMode = ReplayMode.STRICT;
         private InDoubtPolicy inDoubtPolicy = InDoubtPolicy.FAIL;
         private CostModel costModel = CostModel.free();
+        private RetryPolicy retryPolicy = RetryPolicy.none();
         private ObjectMapper eventMapper = EventJson.shared();
         private String nodeId = "node-0";
         private long snapshotInterval = 100;
@@ -685,6 +771,15 @@ public final class CatalystRuntime implements AutoCloseable {
         /** Prices completions so cost folds into the execution (default {@link CostModel#free()}). */
         public Builder costModel(CostModel costModel) {
             this.costModel = costModel;
+            return this;
+        }
+
+        /**
+         * The runtime-wide default retry policy (default {@link RetryPolicy#none()} — failures are
+         * terminal on first throw). Overridable per execution via {@code ExecutionOptions.retryPolicy}.
+         */
+        public Builder retryPolicy(RetryPolicy retryPolicy) {
+            this.retryPolicy = retryPolicy;
             return this;
         }
 
