@@ -36,8 +36,8 @@ first: **① cancellation event → ② task registry / `resume(id)` → ③ bui
 auto-capture agent, per-execution locking, streaming, and observability sequenced after. Order is a
 guide, not a contract — it flexes as we learn. Snapshots, the cancellation event (①), the task
 registry / standalone `resume(id)` (②), the built-in HTTP + Filesystem tools (③), generic-collection
-payloads (④), the blob store (⑤), schema evolution, and per-execution locking have shipped; the
-remaining v0.2 work (retry semantics, the auto-capture agent, streaming, observability) is unsequenced.
+payloads (④), the blob store (⑤), schema evolution, per-execution locking, and retry semantics have
+shipped; the remaining v0.2 work (the auto-capture agent, streaming, observability) is unsequenced.
 
 ### Durability & storage (spec §8)
 - ✅ **Snapshots** — periodic fold checkpoints so long executions don't re-fold the whole log on
@@ -78,8 +78,17 @@ remaining v0.2 work (retry semantics, the auto-capture agent, streaming, observa
   exit demo in CI.
 - **Streaming completions** (open question §13.1) — decide whether the `Model` SPI needs a streaming
   variant now; record the assembled completion, add token-level replay later.
-- **Retry semantics** (open question §13.3) — finalize retry-as-attempt (`RetryRequested` + attempt
-  counter, already in the schema) vs. child execution, and wire a retry policy.
+- ✅ **Retry semantics** (open question §13.3) — resolved in favour of **retry-as-attempt** (same
+  `ExecutionId`, same stream) over child execution: a retryable task failure appends `RetryRequested`
+  instead of `ExecutionFailed`, then re-enters the task as a resume with the recorded prefix
+  substituted and only the failed boundary re-run live (a tool failure is recorded, so `RetryRequested`
+  carries the `failedSeq` the seeder drops; model/effect failures record nothing and already re-run).
+  A pluggable `RetryPolicy` (`none()` default — opt-in; `maxRetries`, `exponential`) bounds it,
+  configured runtime-wide (`Catalyst.builder().retryPolicy`) or per execution
+  (`ExecutionOptions.retryPolicy`). Retries fold to a **crash-safe** `retries` counter distinct from
+  `attempt` (a crash resume never burns budget). Retryability is an engine gate (excludes determinism
+  divergence, in-doubt, interrupts, `Error`) consulted before the policy. This is **whole-task** retry,
+  not per-tool. Gated by the v0.2 Retry exit demo in CI.
 
 ### Runtime ergonomics & scale
 - ✅ **Dedicated cancellation event** (①) — `ExecutionCancelled` folds `cancel()` to `CANCELLED`

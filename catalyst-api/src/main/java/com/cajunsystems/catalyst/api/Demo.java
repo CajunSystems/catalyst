@@ -4,12 +4,15 @@ import com.cajunsystems.catalyst.Context;
 import com.cajunsystems.catalyst.ExecutionId;
 import com.cajunsystems.catalyst.ExecutionInfo;
 import com.cajunsystems.catalyst.ExecutionOptions;
+import com.cajunsystems.catalyst.Status;
 import com.cajunsystems.catalyst.Task;
+import com.cajunsystems.catalyst.Tool;
 import com.cajunsystems.catalyst.engine.CostModel;
 import com.cajunsystems.catalyst.engine.ExecutionState;
 import com.cajunsystems.catalyst.engine.InDoubtPolicy;
 import com.cajunsystems.catalyst.engine.PayloadCodec;
 import com.cajunsystems.catalyst.engine.ReplayingContext;
+import com.cajunsystems.catalyst.engine.RetryPolicy;
 import com.cajunsystems.catalyst.engine.Timeline;
 import com.cajunsystems.catalyst.events.CatalystEvent;
 import com.cajunsystems.catalyst.events.EventJson;
@@ -26,8 +29,10 @@ import org.slf4j.LoggerFactory;
 import java.nio.file.Files;
 import java.nio.file.Path;
 import java.time.Clock;
+import java.time.Duration;
 import java.time.Instant;
 import java.util.Map;
+import java.util.concurrent.atomic.AtomicInteger;
 
 /**
  * The M0 exit demo (spec §11), runnable by hand. Two modes tell the {@code kill -9} story across
@@ -92,6 +97,8 @@ public final class Demo {
             toolsDemo(Files.createTempDirectory("catalyst-tools-"));
         } else if (args.length >= 1 && args[0].equals("collections")) {
             collectionsDemo(Files.createTempDirectory("catalyst-collections-"));
+        } else if (args.length >= 1 && args[0].equals("retry")) {
+            retryDemo(Files.createTempDirectory("catalyst-retry-"));
         } else if (args.length >= 1 && args[0].equals("blob")) {
             blobDemo(Files.createTempDirectory("catalyst-blob-"));
         } else if (args.length >= 1 && args[0].equals("schema")) {
@@ -335,6 +342,122 @@ public final class Demo {
                 throw new AssertionError("expected exactly 1 model call, got " + model.callCount());
             }
         }
+    }
+
+    /** Input for the flaky demo tool. */
+    record FlakyIn(String v) {}
+
+    /** A tool that fails its first {@code failures} live invocations, then succeeds; counts invocations. */
+    static final class FlakyTool implements Tool<FlakyIn, String> {
+        final AtomicInteger invocations = new AtomicInteger();
+        private final int failures;
+        FlakyTool(int failures) { this.failures = failures; }
+        public String name() { return "flaky"; }
+        public Class<FlakyIn> inputType() { return FlakyIn.class; }
+        public String apply(FlakyIn in) {
+            int n = invocations.incrementAndGet();
+            if (n <= failures) throw new RuntimeException("transient failure #" + n);
+            return "ok:" + in.v();
+        }
+    }
+
+    /**
+     * The v0.2 retry exit demo (roadmap §13.3): a transient tool failure is retried as a new attempt on
+     * the same stream. The failing boundary re-runs live while the successful prefix (the model call) is
+     * substituted, bounded by the policy — and the retried log still replays exactly. A default
+     * ({@link RetryPolicy#none()}) run shows the opt-in nature: the same failure is terminal.
+     */
+    private static void retryDemo(Path dir) throws Exception {
+        // Case 1 — a flaky tool fails twice then succeeds, under a bounded retry policy.
+        MockModel model = answerModel("FINAL");
+        FlakyTool flaky = new FlakyTool(2);
+        Task<String> task = ctx -> {
+            String m = ctx.model().complete(STEP1).message();
+            String r = ctx.call(flaky, new FlakyIn("x"));
+            return m + "|" + r;
+        };
+
+        try (CatalystRuntime runtime = Catalyst.builder()
+                .log(GumboEventLog.at(dir.resolve("ok")))
+                .model(model)
+                .retryPolicy(RetryPolicy.maxRetries(3, Duration.ofMillis(10)))
+                .build()) {
+
+            ExecutionHandle<String> handle = runtime.execute(task, ExecutionOptions.withKey(KEY));
+            String result = handle.result();
+            ExecutionState state = runtime.inspect(handle.id());
+            int modelCallsAfterRun = model.callCount();
+
+            System.out.println("[retry] transient tool failure retried -> " + state.status());
+            System.out.println("[retry] result: " + result);
+            System.out.println("[retry] tool invocations: " + flaky.invocations.get());
+            System.out.println("[retry] model calls across retries: " + modelCallsAfterRun);
+            System.out.println("[retry] retries recorded: " + state.retries());
+
+            // The retried log still replays exactly: no boundary is re-executed live.
+            int toolBeforeReplay = flaky.invocations.get();
+            ExecutionState replayed = runtime.replay(handle.id(), task);
+            int externalDuringReplay = (model.callCount() - modelCallsAfterRun)
+                    + (flaky.invocations.get() - toolBeforeReplay);
+            System.out.println("[retry] external calls during replay of the retried execution: "
+                    + externalDuringReplay);
+            System.out.println("[retry] replay -> " + replayed.status());
+
+            if (state.status() != Status.COMPLETED) {
+                throw new AssertionError("expected COMPLETED, got " + state.status());
+            }
+            if (flaky.invocations.get() != 3) {
+                throw new AssertionError("expected 3 tool invocations (2 fail + 1 ok), got "
+                        + flaky.invocations.get());
+            }
+            if (modelCallsAfterRun != 1) {
+                throw new AssertionError("expected the model prefix substituted (1 call), got "
+                        + modelCallsAfterRun);
+            }
+            if (state.retries() != 2) {
+                throw new AssertionError("expected 2 retries recorded, got " + state.retries());
+            }
+            if (externalDuringReplay != 0) {
+                throw new AssertionError("expected 0 external calls during replay, got "
+                        + externalDuringReplay);
+            }
+        }
+
+        // Case 2 — the default policy (none) is opt-in: the same transient failure is terminal.
+        MockModel model2 = answerModel("FINAL");
+        FlakyTool flaky2 = new FlakyTool(2);
+        Task<String> task2 = ctx -> {
+            String m = ctx.model().complete(STEP1).message();
+            String r = ctx.call(flaky2, new FlakyIn("x"));
+            return m + "|" + r;
+        };
+        try (CatalystRuntime runtime = Catalyst.builder()
+                .log(GumboEventLog.at(dir.resolve("none")))
+                .model(model2)
+                .build()) { // no retry policy → RetryPolicy.none()
+
+            ExecutionHandle<String> handle = runtime.execute(task2, ExecutionOptions.withKey(KEY));
+            try {
+                handle.result();
+                throw new AssertionError("expected failure under the default policy");
+            } catch (RuntimeException expected) {
+                // the transient failure is terminal
+            }
+            ExecutionState state = runtime.inspect(handle.id());
+            System.out.println("[retry] default policy (none) -> " + state.status()
+                    + " on first failure, tool invocations: " + flaky2.invocations.get());
+
+            if (state.status() != Status.FAILED) {
+                throw new AssertionError("expected FAILED under default policy, got " + state.status());
+            }
+            if (flaky2.invocations.get() != 1) {
+                throw new AssertionError("expected 1 tool invocation under default policy, got "
+                        + flaky2.invocations.get());
+            }
+        }
+
+        System.out.println("[retry] retry criterion holds: bounded retry-as-attempt, "
+                + "prefix substituted, replay exact, opt-in.");
     }
 
     /**
