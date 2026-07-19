@@ -167,6 +167,31 @@ jobs:
             || { echo "FAIL: retry demo did not pass its assertions"; exit 1; }
           echo "v0.2 Retry exit criterion holds: bounded retry-as-attempt, prefix substituted, replay exact."
 
+      # The v0.2 observability exit criterion (spec §12): an execution's event log folds into one
+      # OpenTelemetry trace — a root span for the run, a child span per boundary (model/tool), and
+      # lifecycle moments (a retry here) as annotations on the root. Exported through a real OTel SDK
+      # into an in-process exporter, fully offline. "model spans: 1" + "tool spans: 2" proves semantic
+      # spans; "root spans (traces): 1" proves one trace per execution.
+      - name: v0.2 OTel exit demo (execution log folds into an OpenTelemetry trace)
+        run: |
+          set -uo pipefail
+          CP="catalyst-api/target/classes:$(cat catalyst-api/target/cp.txt)"
+
+          echo "--- fold an execution into an OpenTelemetry trace ---"
+          OUT="$(java -cp "$CP" com.cajunsystems.catalyst.api.Demo otel)"
+          echo "$OUT"
+          echo "$OUT" | grep -q "\[otel\] root spans (traces): 1" \
+            || { echo "FAIL: an execution did not fold into exactly one trace"; exit 1; }
+          echo "$OUT" | grep -q "\[otel\] model spans: 1" \
+            || { echo "FAIL: the model boundary did not become a span"; exit 1; }
+          echo "$OUT" | grep -q "\[otel\] tool spans: 2" \
+            || { echo "FAIL: the tool boundaries did not become spans"; exit 1; }
+          echo "$OUT" | grep -q "\[otel\] retry annotation on root: true" \
+            || { echo "FAIL: the retry was not annotated on the root span"; exit 1; }
+          echo "$OUT" | grep -q "\[otel\] otel criterion holds" \
+            || { echo "FAIL: otel demo did not pass its assertions"; exit 1; }
+          echo "v0.2 OTel exit criterion holds: execution folded into one trace with semantic spans."
+
       # The v0.2 resume-by-id exit criterion (roadmap increment ②): recover a crashed execution from
       # its id alone via the task registry — no idempotency key, no re-submitted task — finishing with
       # zero duplicate model calls.
