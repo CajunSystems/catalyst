@@ -31,5 +31,26 @@
             <groupId>com.cajunsystems</groupId>
             <artifactId>catalyst-tools</artifactId>
         </dependency>
+        <dependency>
+            <groupId>com.cajunsystems</groupId>
+            <artifactId>catalyst-otel</artifactId>
+        </dependency>
+        <!--
+          The OTel exit demo (Demo.java, main scope) builds a real SDK to collect the exported spans
+          in-process. Marked optional so it stays off the transitive classpath of catalyst-api's
+          consumers — the facade must not force the SDK on apps (they supply their own; catalyst-otel
+          itself depends on the API only). It remains on this module's own compile/runtime/test
+          classpath, so the demo builds and the CI gate can run it.
+        -->
+        <dependency>
+            <groupId>io.opentelemetry</groupId>
+            <artifactId>opentelemetry-sdk</artifactId>
+            <optional>true</optional>
+        </dependency>
+        <dependency>
+            <groupId>io.opentelemetry</groupId>
+            <artifactId>opentelemetry-sdk-testing</artifactId>
+            <scope>test</scope>
+        </dependency>
     </dependencies>
 </project>

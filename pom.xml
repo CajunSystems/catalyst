@@ -19,6 +19,7 @@
         <module>catalyst-gumbo</module>
         <module>catalyst-tools</module>
         <module>catalyst-langchain4j</module>
+        <module>catalyst-otel</module>
         <module>catalyst-api</module>
     </modules>
 
@@ -31,6 +32,7 @@
         <slf4j.version>2.0.12</slf4j.version>
         <gumbo.version>0.2.0</gumbo.version>
         <langchain4j.version>1.8.0</langchain4j.version>
+        <opentelemetry.version>1.45.0</opentelemetry.version>
 
         <junit.version>5.10.2</junit.version>
         <assertj.version>3.25.3</assertj.version>
@@ -73,6 +75,11 @@
                 <artifactId>catalyst-tools</artifactId>
                 <version>${catalyst.version}</version>
             </dependency>
+            <dependency>
+                <groupId>com.cajunsystems</groupId>
+                <artifactId>catalyst-otel</artifactId>
+                <version>${catalyst.version}</version>
+            </dependency>
 
             <!-- Third-party -->
             <dependency>
@@ -96,6 +103,13 @@
                 <groupId>dev.langchain4j</groupId>
                 <artifactId>langchain4j-core</artifactId>
                 <version>${langchain4j.version}</version>
+            </dependency>
+            <dependency>
+                <groupId>io.opentelemetry</groupId>
+                <artifactId>opentelemetry-bom</artifactId>
+                <version>${opentelemetry.version}</version>
+                <type>pom</type>
+                <scope>import</scope>
             </dependency>
             <dependency>
                 <groupId>com.cajunsystems</groupId>
