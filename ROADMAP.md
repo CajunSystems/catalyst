@@ -241,6 +241,18 @@ The substrate becomes a platform. This is where the other CajunSystems component
   append must be a **Gumbo** primitive rather than a Catalyst-side wrapper, or the check races the
   assignment beneath it.
 
+### In-doubt model completions (found while designing distribution)
+- A crash between `CompletionRequested` and `CompletionReceived` leaves the provider call **in
+  doubt**: it may have been accepted and billed, but no result reached the log, so a resume re-issues
+  it. Measured on the current single-node code — a log ending at `CompletionRequested` resumed and
+  invoked the model a second time. Catalyst already handles this for **tools** (`seed()` detects a
+  `ToolRequested` with no `ToolCompleted` and routes recovery through `InDoubtPolicy`), but there is
+  no equivalent for model completions: a trailing `CompletionRequested` sets `pendingRequestHash` and
+  is otherwise ignored. Closing the asymmetry — an in-doubt policy for model calls, keyed on the
+  recorded `requestHash` — is what "zero duplicate model calls" needs in order to hold under node
+  failure rather than only under graceful resume. Worth doing independently of distribution, which
+  merely makes the window far more frequent.
+
 ### Eval harness (spec §12)
 - Recorded production executions replayed against **candidate models/prompts** as a regression suite
   — the log *is* the dataset. Branch + diff (M2) is the primitive; the harness batches and scores it.

@@ -69,9 +69,31 @@ Correctness is settled by the paragraph above; the rest is efficiency and operat
    a zombie that still believes it holds the lease cannot do damage; its writes are simply rejected.
 
 The reclaim path is where Catalyst beats a conventional job queue. A reclaimed execution does not
-restart from scratch — it substitutes its recorded prefix and resumes at the boundary it reached,
-with zero duplicate model calls. That is the M0 exit criterion, already proven, operating across
-nodes instead of across a crash.
+restart from scratch — it substitutes its recorded prefix and resumes at the boundary it reached.
+That is the M0 exit criterion, already proven, operating across nodes instead of across a crash.
+
+**The guarantee is "no duplicate *recorded* boundaries", not "no duplicate provider calls."** A
+boundary that was in flight when the node died is *in doubt*: the provider may have accepted the
+request and produced a billable completion that never reached the log. On resume there is no
+recorded result to substitute, so the call is re-issued. Measured, on the current single-node code —
+a log hand-built to end at `CompletionRequested` with no `CompletionReceived` resumed and invoked
+the model again:
+
+```
+PROBE model calls before resume: 0
+PROBE model calls AFTER resume:  1   ← the accepted-but-unrecorded call was re-issued
+```
+
+This is not new to distribution — it is the same crash window that exists single-node — but node
+death makes it far more frequent, so the design must not overstate the guarantee.
+
+Catalyst already has the machinery for this on the *tool* side: `seed()` detects a `ToolRequested`
+with no matching `ToolCompleted` and routes recovery through `InDoubtPolicy` (`RETRY` / `FAIL` /
+`ASK`). There is **no equivalent for model completions** — a trailing `CompletionRequested` sets
+`pendingRequestHash` and is otherwise ignored, with no `danglingModel` counterpart to `danglingTool`.
+Closing that asymmetry (an in-doubt policy for model calls, keyed on the recorded `requestHash`) is a
+prerequisite for honestly claiming exactly-once provider spend under node failure, and is worth doing
+independently of distribution.
 
 ## What "just start an instance" looks like
 
@@ -187,8 +209,28 @@ file adapter and a `kvSubspace` in FoundationDB. Catalyst is already a client of
 `putKey` (the idempotency index) and `readSnapshot` / `writeSnapshot` both go through it. So leases
 do not need a new store, only a **conditional** write on the store that is already there.
 
-Conditional append is additive on the Catalyst side: a default method that degrades to unconditional
-keeps every existing `EventLog` implementation compiling and single-node behaviour unchanged.
+Conditional append must **not** silently degrade. A default method that ignores `expectedSeq` and
+writes unconditionally would keep old implementations compiling at the cost of quietly removing the
+only fence the design has — a log that cannot reject a stale writer would look like it was
+participating in the protocol while providing none of it. That is the worst possible failure shape
+for a correctness primitive.
+
+The default therefore **throws**, following the convention Gumbo already uses for optional adapter
+capabilities:
+
+```java
+default long append(ExecutionId id, CatalystEvent event, long expectedSeq) {
+    throw new UnsupportedOperationException(
+            "conditional append not implemented by " + getClass().getSimpleName());
+}
+
+/** True if this log can reject a stale writer. Distributed execution requires it. */
+default boolean supportsConditionalAppend() { return false; }
+```
+
+Source compatibility is preserved — existing implementations still compile — but the capability is
+now *declarable and checkable*, so the runtime can refuse to enable distributed execution against a
+log that cannot fence, rather than discovering it by corruption.
 
 ### Claimable work: solved by dual-tagging, not by a new index
 
@@ -268,6 +310,9 @@ Being clear about the limits, since the comparison to BEAM invites them:
 - **In-flight non-boundary computation is lost when a node dies.** Work since the last recorded
   boundary is redone on resume. This is the trade Catalyst already made for determinism, and replay
   makes it cheap.
+- **An in-flight boundary may be executed twice.** See the in-doubt window above: a provider call
+  accepted but not yet recorded is re-issued on resume. Bounded by `InDoubtPolicy` for tools; not yet
+  bounded at all for model completions.
 - **No cross-node visibility of *running* work.** A node cannot ask "who is executing what right
   now" except through lease rows. That is a monitoring gap, not a correctness one.
 
