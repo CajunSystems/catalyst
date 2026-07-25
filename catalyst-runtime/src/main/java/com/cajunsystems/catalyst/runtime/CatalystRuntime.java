@@ -665,12 +665,27 @@ public final class CatalystRuntime implements AutoCloseable {
      * a determinism divergence (a bug in the task), an in-doubt boundary (governed by
      * {@link InDoubtPolicy}, and re-thrown identically), an interrupt (a cancellation nudge, not a
      * transient fault), or an {@link Error} (OOM/StackOverflow, which retrying only worsens).
+     *
+     * <p>The <em>cause chain</em> is inspected, not just the throwable itself. None of these become
+     * retryable by being wrapped, and wrapping is the norm rather than the exception: {@code
+     * ReplayingContext.applyUnchecked} wraps a tool's checked exceptions in a {@code RuntimeException},
+     * and a {@link com.cajunsystems.catalyst.model.Model} adapter must do the same because its SPI
+     * declares none. Matching only the top-level type let an interrupt arrive dressed as a plain
+     * {@code RuntimeException} and burn retry budget on a cancellation nudge.
      */
     private static boolean isRetryable(Throwable t) {
-        return !(t instanceof NonDeterministicReplayException
-                || t instanceof InDoubtException
-                || t instanceof InterruptedException
-                || t instanceof Error);
+        // Bounded walk: a self- or mutually-referential cause chain would otherwise loop forever
+        // (the same guard ReplayingContext.failedBoundarySeq uses).
+        Throwable cause = t;
+        for (int depth = 0; cause != null && depth < 64; cause = cause.getCause(), depth++) {
+            if (cause instanceof NonDeterministicReplayException
+                    || cause instanceof InDoubtException
+                    || cause instanceof InterruptedException
+                    || cause instanceof Error) {
+                return false;
+            }
+        }
+        return true;
     }
 
     /** Best-effort {@code ExecutionFailed} append (terminal), then completes the future with the cause. */

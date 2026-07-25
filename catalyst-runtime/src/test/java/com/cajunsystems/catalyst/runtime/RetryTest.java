@@ -6,7 +6,9 @@ import com.cajunsystems.catalyst.Status;
 import com.cajunsystems.catalyst.Task;
 import com.cajunsystems.catalyst.Tool;
 import com.cajunsystems.catalyst.engine.ExecutionState;
+import com.cajunsystems.catalyst.engine.InDoubtException;
 import com.cajunsystems.catalyst.engine.InDoubtPolicy;
+import com.cajunsystems.catalyst.engine.NonDeterministicReplayException;
 import com.cajunsystems.catalyst.engine.RetryPolicy;
 import com.fasterxml.jackson.databind.node.NullNode;
 import com.cajunsystems.catalyst.events.CatalystEvent;
@@ -18,9 +20,11 @@ import org.junit.jupiter.api.Test;
 
 import java.time.Duration;
 import java.time.Instant;
+import java.util.List;
 import java.util.concurrent.atomic.AtomicInteger;
 
 import static org.assertj.core.api.Assertions.assertThat;
+import static org.assertj.core.api.Assertions.assertThatThrownBy;
 import static org.assertj.core.api.Assertions.catchThrowable;
 
 class RetryTest {
@@ -287,6 +291,87 @@ class RetryTest {
             // A single writer: exactly one creation and one completion despite two submissions + retries.
             assertThat(countOf(log::read, h1.id(), CatalystEvent.ExecutionCreated.class)).isEqualTo(1);
             assertThat(countOf(log::read, h1.id(), CatalystEvent.ExecutionCompleted.class)).isEqualTo(1);
+        }
+    }
+
+    /**
+     * A failure a retry can never fix stays non-retryable when it arrives <em>wrapped</em>. Wrapping is
+     * the norm, not the exception: {@code ReplayingContext.applyUnchecked} wraps a tool's checked
+     * exceptions, and a {@code Model} adapter must too since the SPI declares none. Matching only the
+     * top-level type let an interrupt dressed as a plain {@code RuntimeException} burn retry budget.
+     */
+    @Test
+    void doesNotRetryANonRetryableFailureHiddenInsideACauseChain() {
+        for (Throwable nonRetryable : List.of(
+                new InterruptedException("cancellation nudge"),
+                new InDoubtException("in-doubt boundary"),
+                new NonDeterministicReplayException(3, "expected", "actual"),
+                new StackOverflowError("blown stack"))) {
+
+            AtomicInteger attempts = new AtomicInteger();
+            Task<String> task = ctx -> {
+                attempts.incrementAndGet();
+                // Two layers deep, the way a tool body wrapped by applyUnchecked and then rethrown looks.
+                throw new RuntimeException("outer", new IllegalStateException("inner", nonRetryable));
+            };
+
+            try (CatalystRuntime runtime = CatalystRuntime.builder()
+                    .log(EventLogs.inMemory())
+                    .retryPolicy(RetryPolicy.maxRetries(3, Duration.ZERO))
+                    .build()) {
+
+                ExecutionHandle<String> handle = runtime.execute(task, ExecutionOptions.withKey("k"));
+                assertThatThrownBy(handle::result).isInstanceOf(Throwable.class);
+
+                assertThat(attempts.get())
+                        .as("wrapped %s must not be retried", nonRetryable.getClass().getSimpleName())
+                        .isEqualTo(1);
+                assertThat(runtime.inspect(handle.id()).status()).isEqualTo(Status.FAILED);
+            }
+        }
+    }
+
+    /** The gate must not over-reach: an ordinary wrapped failure is still retried. */
+    @Test
+    void stillRetriesAnOrdinaryFailureInsideACauseChain() {
+        AtomicInteger attempts = new AtomicInteger();
+        Task<String> task = ctx -> {
+            if (attempts.incrementAndGet() <= 2) {
+                throw new RuntimeException("outer", new IllegalStateException("transient inner"));
+            }
+            return "recovered";
+        };
+
+        try (CatalystRuntime runtime = CatalystRuntime.builder()
+                .log(EventLogs.inMemory())
+                .retryPolicy(RetryPolicy.maxRetries(3, Duration.ZERO))
+                .build()) {
+
+            assertThat(runtime.execute(task, ExecutionOptions.withKey("k")).result()).isEqualTo("recovered");
+            assertThat(attempts.get()).isEqualTo(3);
+        }
+    }
+
+    /** A cyclic cause chain must not hang the gate. */
+    @Test
+    void toleratesASelfReferentialCauseChain() {
+        AtomicInteger attempts = new AtomicInteger();
+        Task<String> task = ctx -> {
+            attempts.incrementAndGet();
+            RuntimeException a = new RuntimeException("a");
+            RuntimeException b = new RuntimeException("b", a);
+            a.initCause(b); // a -> b -> a -> ...
+            throw a;
+        };
+
+        try (CatalystRuntime runtime = CatalystRuntime.builder()
+                .log(EventLogs.inMemory())
+                .retryPolicy(RetryPolicy.maxRetries(1, Duration.ZERO))
+                .build()) {
+
+            ExecutionHandle<String> handle = runtime.execute(task, ExecutionOptions.withKey("k"));
+            assertThatThrownBy(handle::result).isInstanceOf(Throwable.class);
+            assertThat(attempts.get()).isEqualTo(2); // retried once, then terminal — no hang
         }
     }
 }
