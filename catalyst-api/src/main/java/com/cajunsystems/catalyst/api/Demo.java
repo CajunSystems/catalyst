@@ -733,6 +733,10 @@ public final class Demo {
             }
             System.out.println("[streaming] streaming criterion holds: incremental delivery on the live"
                     + " run, one recorded completion, exact replay with zero model calls.");
+        }
+    }
+
+    /**
      * The v0.2 timeline exit demo (spec §12): an execution's folded state is rendered as a
      * self-contained HTML report — the read-only view over {@code inspect(id)}.
      *

@@ -163,13 +163,28 @@ public final class TimelineReport {
         if (node == null || node.isNull()) return "";
         String text = node.toString();
         boolean elided = text.length() > MAX_DETAIL_CHARS;
-        String shown = elided ? text.substring(0, MAX_DETAIL_CHARS) : text;
+        int cut = elided ? truncationPoint(text) : text.length();
         StringBuilder sb = new StringBuilder();
         sb.append("<details><summary>").append(text.length()).append(" chars</summary><pre>")
-                .append(escape(shown));
-        if (elided) sb.append("\n… elided (").append(text.length() - MAX_DETAIL_CHARS).append(" more)");
+                .append(escape(text.substring(0, cut)));
+        if (elided) sb.append("\n… elided (").append(text.length() - cut).append(" more)");
         sb.append("</pre></details>");
         return sb.toString();
+    }
+
+    /**
+     * Where to cut an oversized payload, never between the halves of a surrogate pair. A cut landing
+     * inside one leaves a lone surrogate, which is unmappable in UTF-8 and reaches the page as a
+     * replacement character — a visibly corrupted last character in what is supposed to be a faithful
+     * record of a payload. Emoji and other supplementary characters turn up in completions routinely,
+     * so the boundary is worth respecting.
+     */
+    private static int truncationPoint(String text) {
+        int cut = Math.min(MAX_DETAIL_CHARS, text.length());
+        if (cut > 0 && cut < text.length() && Character.isHighSurrogate(text.charAt(cut - 1))) {
+            cut--; // the pair straddles the cut: drop its leading half too
+        }
+        return cut;
     }
 
     private static String offset(Instant start, Instant at) {

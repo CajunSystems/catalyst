@@ -163,4 +163,43 @@ class TimelineReportTest {
         assertThatThrownBy(() -> TimelineReport.html(null))
                 .isInstanceOf(IllegalArgumentException.class);
     }
+
+    @Test
+    void elidesOnACodePointBoundarySoNoCharacterIsCorrupted() {
+        // The payload is serialized into a JSON envelope before truncation, so the exact padding that
+        // puts a surrogate pair across the 2000-char cut is not something to guess at. Sweep a range
+        // of lengths around the boundary: at least one lands mid-pair, and none may corrupt.
+        // "\uD83D\uDE80" is a rocket — two UTF-16 chars, one code point.
+        String rocket = "\uD83D\uDE80";
+
+        for (int pad = 1_950; pad <= 2_010; pad++) {
+            String payload = "a".repeat(pad) + rocket.repeat(100);
+            try (CatalystRuntime runtime = CatalystRuntime.builder()
+                    .log(EventLogs.inMemory()).build()) {
+
+                ExecutionState state = runAndInspect(runtime, ctx -> ctx.effect("emoji", () -> payload));
+                String html = TimelineReport.html(state);
+
+                assertThat(html).as("pad=%d should elide", pad).contains("elided");
+                assertNoLoneSurrogates(html, pad);
+                // A lone surrogate is unmappable in UTF-8, so it would not survive this round-trip.
+                byte[] utf8 = html.getBytes(java.nio.charset.StandardCharsets.UTF_8);
+                assertThat(new String(utf8, java.nio.charset.StandardCharsets.UTF_8))
+                        .as("pad=%d must survive a UTF-8 round-trip", pad).isEqualTo(html);
+            }
+        }
+    }
+
+    private static void assertNoLoneSurrogates(String html, int pad) {
+        for (int i = 0; i < html.length(); i++) {
+            char c = html.charAt(i);
+            if (Character.isHighSurrogate(c)) {
+                assertThat(i + 1 < html.length() && Character.isLowSurrogate(html.charAt(i + 1)))
+                        .as("pad=%d left a lone high surrogate at %d", pad, i).isTrue();
+            } else if (Character.isLowSurrogate(c)) {
+                assertThat(i > 0 && Character.isHighSurrogate(html.charAt(i - 1)))
+                        .as("pad=%d left a lone low surrogate at %d", pad, i).isTrue();
+            }
+        }
+    }
 }
