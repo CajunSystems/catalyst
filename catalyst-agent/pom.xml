@@ -1,0 +1,85 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<project xmlns="http://maven.apache.org/POM/4.0.0"
+         xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance"
+         xsi:schemaLocation="http://maven.apache.org/POM/4.0.0 http://maven.apache.org/xsd/maven-4.0.0.xsd">
+    <modelVersion>4.0.0</modelVersion>
+
+    <parent>
+        <groupId>com.cajunsystems</groupId>
+        <artifactId>catalyst-parent</artifactId>
+        <version>0.1.0-SNAPSHOT</version>
+    </parent>
+
+    <artifactId>catalyst-agent</artifactId>
+    <name>Catalyst Auto-capture Agent</name>
+    <description>
+        Java agent that rewrites the JDK's nondeterministic sources inside task code into recorded
+        Catalyst boundaries, so task authors need not wrap each one in ctx.effect (spec §6).
+    </description>
+
+    <dependencies>
+        <!--
+          catalyst-core carries the AutoCapture bridge that instrumented call sites target. The bridge
+          deliberately lives in core, not here: task classes already resolve core through their own
+          loader, so a rewritten call site links whether or not this module is on the classpath.
+        -->
+        <dependency>
+            <groupId>com.cajunsystems</groupId>
+            <artifactId>catalyst-core</artifactId>
+        </dependency>
+        <dependency>
+            <groupId>net.bytebuddy</groupId>
+            <artifactId>byte-buddy</artifactId>
+        </dependency>
+        <!-- Enables AutoCaptureAgent.install() to attach to the running JVM without -javaagent. -->
+        <dependency>
+            <groupId>net.bytebuddy</groupId>
+            <artifactId>byte-buddy-agent</artifactId>
+        </dependency>
+
+        <dependency>
+            <groupId>com.cajunsystems</groupId>
+            <artifactId>catalyst-runtime</artifactId>
+            <scope>test</scope>
+        </dependency>
+    </dependencies>
+
+    <build>
+        <plugins>
+            <!--
+              One JVM per test class. Installing an agent mutates JVM-wide state, and resetting one
+              installation retransforms classes back to their original bytecode — which silently
+              un-instruments classes another test class is still relying on. Forking per class keeps
+              each installation's blast radius inside its own JVM.
+            -->
+            <plugin>
+                <groupId>org.apache.maven.plugins</groupId>
+                <artifactId>maven-surefire-plugin</artifactId>
+                <configuration>
+                    <reuseForks>false</reuseForks>
+                    <forkCount>1</forkCount>
+                </configuration>
+            </plugin>
+            <!--
+              The manifest that makes the built jar usable as -javaagent:catalyst-agent.jar. Both entry
+              points are declared: Premain-Class for launch-time attach (the preferred mode, since no
+              task class is loaded yet) and Agent-Class for attaching to a running JVM. Retransformation
+              is required for the latter, which is also how install() reaches already-loaded classes.
+            -->
+            <plugin>
+                <groupId>org.apache.maven.plugins</groupId>
+                <artifactId>maven-jar-plugin</artifactId>
+                <configuration>
+                    <archive>
+                        <manifestEntries>
+                            <Premain-Class>com.cajunsystems.catalyst.agent.AutoCaptureAgent</Premain-Class>
+                            <Agent-Class>com.cajunsystems.catalyst.agent.AutoCaptureAgent</Agent-Class>
+                            <Can-Retransform-Classes>true</Can-Retransform-Classes>
+                            <Can-Redefine-Classes>true</Can-Redefine-Classes>
+                        </manifestEntries>
+                    </archive>
+                </configuration>
+            </plugin>
+        </plugins>
+    </build>
+</project>
