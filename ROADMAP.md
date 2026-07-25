@@ -37,8 +37,8 @@ auto-capture agent, per-execution locking, streaming, and observability sequence
 guide, not a contract — it flexes as we learn. Snapshots, the cancellation event (①), the task
 registry / standalone `resume(id)` (②), the built-in HTTP + Filesystem tools (③), generic-collection
 payloads (④), the blob store (⑤), schema evolution, per-execution locking, retry semantics, the OTel
-exporter, the auto-capture agent, and streaming completions have shipped; the timeline UI is the last
-remaining v0.2 item.
+exporter, the auto-capture agent, streaming completions, and the timeline UI have all shipped —
+**v0.2 is complete**.
 
 ### Durability & storage (spec §8)
 - ✅ **Snapshots** — periodic fold checkpoints so long executions don't re-fold the whole log on
@@ -186,7 +186,21 @@ remaining v0.2 item.
   `runtime.log().read(id)`, needing no runtime hook — so the log genuinely *is* the trace. The module
   depends on the OpenTelemetry **API** only; the app supplies the SDK + a real OTLP exporter (the same
   shape as the LangChain4j adapter). Gated by the v0.2 OTel exit demo in CI.
-- **Timeline UI** — a read-only view over `inspect(id).timelineView()` / `Trajectory`.
+- ✅ **Timeline UI** — `catalyst-timeline`'s `TimelineReport.html(state)` renders a folded
+  `ExecutionState` as a **self-contained HTML page**: a status header, the roll-ups
+  (`timelineView()` — model/tool counts, tokens, cost, latency, wall clock) and the step-by-step
+  trajectory with each boundary's label, offset, latency and recorded payload. Read-only and post-hoc,
+  the same shape as the OTel exporter — it consumes a fold of the log and installs no runtime hook, so
+  any execution renders without having cooperated in advance, and the log stays the single source of
+  truth. Because the input is a fold, the output is a **pure function** of the log: two renders of one
+  execution are byte-identical, which is what makes a report safe to diff or commit as a build
+  artifact. The page references nothing external (inline CSS, no scripts/fonts/images) so it opens from
+  `file://` years later; everything interpolated is HTML-escaped, since tool names, effect labels and
+  recorded payloads are log content and a report gets opened in a browser by someone who did not
+  produce the execution. The module depends on `catalyst-core` alone — no templating engine, no web
+  server. Gated by the v0.2 Timeline exit demo in CI. *Deferred (noted): latency bars and a
+  `TrajectoryDiff` view (the M2 branch comparison) — the table is the read-only view the roadmap asked
+  for; visual timing and diff rendering are polish on top.*
 
 ---
 

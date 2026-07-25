@@ -60,6 +60,9 @@ log) provides durability.
   incrementally while recording the assembled result, so a streamed execution writes the same log a
   non-streaming one does and replays with zero provider calls. See
   [Streaming](#streaming-completions).
+- **Timeline report (v0.2)** — `TimelineReport.html(runtime.inspect(id))` renders an execution as a
+  self-contained HTML page: status, token/cost roll-ups, and the step-by-step trajectory. Read-only and
+  post-hoc, so any recorded execution renders. See [Timeline reports](#timeline-reports).
 - **Auto-capture (v0.2)** — attach `catalyst-agent` and task code no longer has to wrap its
   nondeterminism: `Instant.now()`, `UUID.randomUUID()`, `Math.random()` and `Random` draws are
   rewritten at their call sites into recorded boundaries, so a task written with plain JDK calls
@@ -79,6 +82,7 @@ Deferred to later milestones (schema slots already reserved so no breaking chang
 | `catalyst-tools` | `ClockTool`, `CalculatorTool` |
 | `catalyst-langchain4j` | `LangChain4jModel`: adapts any LangChain4j `ChatModel` to Catalyst's `Model` |
 | `catalyst-otel` | `CatalystTracer`: folds an execution's log into an OpenTelemetry trace (API-only; app supplies the SDK) |
+| `catalyst-timeline` | `TimelineReport`: renders a folded execution as a self-contained HTML timeline (no deps beyond core) |
 | `catalyst-agent` | `AutoCaptureAgent`: rewrites the JDK's nondeterministic call sites in task code into recorded boundaries |
 | `catalyst-api` | Thin facade: `Catalyst.embedded(path)`, builders, `Serializers` |
 
@@ -236,6 +240,34 @@ Two things to know:
   request and its result, which no replay can match.
 
 Asserted automatically in `StreamingAcceptanceTest` and gated in CI by `Demo streaming`.
+## Timeline reports
+
+The log already contains everything an execution did, so a timeline is a fold, not an instrumentation
+layer. `catalyst-timeline` renders that fold as a page:
+
+```java
+ExecutionState state = runtime.inspect(id);
+TimelineReport.writeTo(state, Path.of("build/reports/" + id.value() + ".html"));
+```
+
+You get a status header, the roll-ups from `timelineView()` (model/tool calls, prompt and completion
+tokens, cost, boundary latency, wall clock), and the step-by-step trajectory — each boundary with its
+kind, label, offset from start, latency, and recorded payload in a collapsed block.
+
+The design constraints are the interesting part:
+
+- **Read-only and post-hoc**, exactly like the OTel exporter. It consumes an `ExecutionState` and
+  installs no runtime hook, so an execution recorded months ago renders just as well as a fresh one.
+- **A pure function of the log.** Two renders of the same execution are byte-identical, which is what
+  makes a report safe to diff or commit as a build artifact.
+- **Self-contained.** Inline CSS, no scripts, no fonts, no images — it opens from a `file://` URL with
+  nothing else present, so you can attach one to a ticket.
+- **Everything is escaped.** Tool names, effect labels and recorded payloads are log content, and a
+  report is likely to be opened by someone other than whoever produced the execution.
+
+The module depends on `catalyst-core` and nothing else: no templating engine, no web server.
+
+Asserted automatically in `TimelineAcceptanceTest` and gated in CI by `Demo timeline`.
 
 ## Auto-capture: nondeterminism without the ceremony
 
@@ -302,9 +334,9 @@ and **M2** (branch + diff).
 
 ## Roadmap
 
-v0.1 is complete. See [ROADMAP.md](ROADMAP.md) for what's next — v0.2 (largely shipped: snapshots,
-blob store, retry semantics, the OTel exporter, built-in tools, the auto-capture agent, streaming
-completions; remaining: the timeline UI) and v1 (agents, the
+v0.1 is complete, and v0.2 with it. See [ROADMAP.md](ROADMAP.md) for what's next — v0.2 (shipped:
+snapshots, blob store, retry semantics, the OTel exporter, built-in tools, the auto-capture agent,
+streaming completions, the timeline report) and v1 (agents, the
 `WAITING`/signal APIs and human-in-the-loop via Boudin, distributed execution over a Gumbo cluster,
 and the replay-driven eval harness).
 
