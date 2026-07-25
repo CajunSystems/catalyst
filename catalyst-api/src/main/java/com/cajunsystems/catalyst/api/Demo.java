@@ -7,6 +7,9 @@ import com.cajunsystems.catalyst.ExecutionOptions;
 import com.cajunsystems.catalyst.Status;
 import com.cajunsystems.catalyst.Task;
 import com.cajunsystems.catalyst.Tool;
+import com.cajunsystems.catalyst.agent.AutoCaptureAgent;
+import com.cajunsystems.catalyst.agent.AutoCaptureConfig;
+import com.cajunsystems.catalyst.api.autocapture.StampedReport;
 import com.cajunsystems.catalyst.engine.CostModel;
 import com.cajunsystems.catalyst.engine.ExecutionState;
 import com.cajunsystems.catalyst.engine.InDoubtPolicy;
@@ -112,6 +115,8 @@ public final class Demo {
             otelDemo(Files.createTempDirectory("catalyst-otel-"));
         } else if (args.length >= 1 && args[0].equals("blob")) {
             blobDemo(Files.createTempDirectory("catalyst-blob-"));
+        } else if (args.length >= 1 && args[0].equals("autocapture")) {
+            autoCaptureDemo(Files.createTempDirectory("catalyst-autocapture-"));
         } else if (args.length >= 1 && args[0].equals("schema")) {
             schemaDemo();
         } else {
@@ -648,6 +653,72 @@ public final class Demo {
             if (writeReapplied) throw new AssertionError("replay re-applied the file write");
             System.out.println("[tools] built-in-tools criterion holds: HTTP + Filesystem calls recorded"
                     + " once and substituted on replay (zero re-execution).");
+        }
+    }
+
+    /**
+     * The v0.2 auto-capture exit demo (spec §6): the <em>same task class</em>, containing plain
+     * {@code Instant.now()} / {@code UUID.randomUUID()} / {@code Random} calls and not one
+     * {@code ctx.effect}, is run twice — once uninstrumented, once with the agent attached.
+     *
+     * <p>The first half is the failure this feature exists to remove, and it is quiet: replaying an
+     * uninstrumented task raises nothing, because a task with no recorded boundaries has nothing to
+     * diverge at. It simply recomputes different values, and only comparing what the task actually
+     * computed reveals it. The second half runs the very same class with auto-capture installed: each
+     * nondeterministic call becomes a recorded boundary, and the replay reproduces the run exactly.
+     */
+    private static void autoCaptureDemo(Path dir) throws Exception {
+        Path uninstrumentedLog = Files.createDirectory(dir.resolve("uninstrumented"));
+        Path capturedLog = Files.createDirectory(dir.resolve("captured"));
+
+        // ── Without the agent: nondeterminism goes unrecorded and replay silently recomputes ──
+        StampedReport.reset();
+        try (CatalystRuntime runtime = Catalyst.builder().log(GumboEventLog.at(uninstrumentedLog)).build()) {
+            ExecutionHandle<String> handle = runtime.execute(new StampedReport());
+            handle.result();
+            runtime.replay(handle.id(), new StampedReport());
+        }
+        java.util.List<String> withoutAgent = StampedReport.computed();
+        boolean recomputedDifferently = !withoutAgent.get(0).equals(withoutAgent.get(1));
+        System.out.println("[autocapture] without the agent - effects recorded: 0");
+        System.out.println("[autocapture] without the agent - replay recomputed a different value: "
+                + recomputedDifferently);
+
+        // ── With the agent: the same class, rewritten at its call sites ──
+        StampedReport.reset();
+        AutoCaptureConfig config = AutoCaptureConfig.forPackages(StampedReport.instrumentedPackage());
+        try (AutoCaptureAgent.Installation installed = AutoCaptureAgent.install(config);
+             CatalystRuntime runtime = Catalyst.builder().log(GumboEventLog.at(capturedLog)).build()) {
+
+            ExecutionHandle<String> handle = runtime.execute(new StampedReport());
+            String recorded = handle.result();
+            ExecutionId id = handle.id();
+
+            java.util.List<String> labels = new java.util.ArrayList<>();
+            for (var se : runtime.log().read(id)) {
+                if (se.event() instanceof CatalystEvent.EffectRecorded er) labels.add(er.label());
+            }
+            System.out.println("[autocapture] recorded execution " + id.value());
+            System.out.println("[autocapture] auto-captured boundaries: " + labels);
+
+            // Strict replay: appends nothing and may not run a single live boundary.
+            ExecutionState replayed = runtime.replay(id, new StampedReport());
+            java.util.List<String> withAgent = StampedReport.computed();
+            boolean identical = withAgent.get(0).equals(withAgent.get(1));
+            System.out.println("[autocapture] replayed -> " + replayed.status()
+                    + "; replay recomputed the recorded value exactly: " + identical);
+
+            if (!recomputedDifferently) {
+                throw new AssertionError("the uninstrumented control run was unexpectedly deterministic");
+            }
+            if (labels.size() != 3) {
+                throw new AssertionError("expected 3 auto-captured boundaries, got " + labels);
+            }
+            if (!identical || !withAgent.get(1).equals(recorded)) {
+                throw new AssertionError("replay did not reproduce the recorded values");
+            }
+            System.out.println("[autocapture] autocapture criterion holds: unwrapped nondeterminism was"
+                    + " recorded and substituted, with no ctx.effect in the task.");
         }
     }
 

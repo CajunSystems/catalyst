@@ -56,6 +56,10 @@ log) provides durability.
   counterfactual tool results), then runs forward with the new model. Under `ReplayMode.BRANCH` a
   divergence forks (appends `ExecutionBranched`, continues live) instead of throwing.
   `Trajectory.diff(base, fork)` gives the step-by-step difference.
+- **Auto-capture (v0.2)** — attach `catalyst-agent` and task code no longer has to wrap its
+  nondeterminism: `Instant.now()`, `UUID.randomUUID()`, `Math.random()` and `Random` draws are
+  rewritten at their call sites into recorded boundaries, so a task written with plain JDK calls
+  replays exactly. See [Auto-capture](#auto-capture-nondeterminism-without-the-ceremony).
 
 Deferred to later milestones (schema slots already reserved so no breaking change is needed):
 `WAITING`/signal APIs and human-in-the-loop, snapshots and blob store, distributed execution (v0.2+/v1).
@@ -71,6 +75,7 @@ Deferred to later milestones (schema slots already reserved so no breaking chang
 | `catalyst-tools` | `ClockTool`, `CalculatorTool` |
 | `catalyst-langchain4j` | `LangChain4jModel`: adapts any LangChain4j `ChatModel` to Catalyst's `Model` |
 | `catalyst-otel` | `CatalystTracer`: folds an execution's log into an OpenTelemetry trace (API-only; app supplies the SDK) |
+| `catalyst-agent` | `AutoCaptureAgent`: rewrites the JDK's nondeterministic call sites in task code into recorded boundaries |
 | `catalyst-api` | Thin facade: `Catalyst.embedded(path)`, builders, `Serializers` |
 
 Coordinates: `com.cajunsystems:catalyst-*`. Root package `com.cajunsystems.catalyst`. Java 21.
@@ -190,6 +195,63 @@ CatalystRuntime runtime = Catalyst.builder()
         .build();
 ```
 
+## Auto-capture: nondeterminism without the ceremony
+
+Catalyst's determinism contract asks that task code produce the same values on every run. The manual
+way to honour it is to route each nondeterministic call through `ctx.effect(...)`:
+
+```java
+Task<String> task = ctx -> {
+    String stamp = ctx.effect("stamp", () -> Instant.now().toString());
+    String id = ctx.effect("id", () -> UUID.randomUUID().toString());
+    return stamp + "|" + id;
+};
+```
+
+Add the `catalyst-agent` module and you can write the same task the way you would write any Java:
+
+```java
+public final class StampedReport implements Task<String> {
+    @Override public String execute(Context ctx) {
+        return Instant.now() + "|" + UUID.randomUUID();   // no ctx.effect, still replayable
+    }
+}
+```
+
+Point the agent at the packages holding your task code, either at launch — using the self-contained
+`javaagent`-classified artifact, since a `-javaagent` jar does not get its Maven dependencies:
+
+```bash
+java -javaagent:catalyst-agent-<version>-javaagent.jar=packages=com.acme.tasks -cp ... com.acme.Main
+```
+
+or from inside the process, which also retransforms classes that are already loaded — this path uses
+the ordinary `catalyst-agent` dependency:
+
+```java
+AutoCaptureAgent.install(AutoCaptureConfig.forPackages("com.acme.tasks"));
+```
+
+Each rewritten call site records its value as an ordinary effect boundary (`auto:Instant.now#0`,
+`auto:UUID.randomUUID#1`, …), so resume, replay and branch substitute it like any other. Captured
+sources are `Instant.now()` and the other no-argument `java.time` factories,
+`System.currentTimeMillis()` / `nanoTime()`, `UUID.randomUUID()`, `Math.random()`, and draws from
+`Random` and its relatives (including `ThreadLocalRandom` and `SplittableRandom`). Narrow that with
+`sources=time,identity` when a source is not something your task treats as data.
+
+Worth knowing:
+
+- **Packages are opt-in, with no default.** Instrumenting a whole classpath would rewrite library
+  internals whose `nanoTime` calls are none of Catalyst's business.
+- **Without the agent, nothing changes.** An instrumented class calls the plain JDK method when no
+  execution is bound to the thread, so it behaves normally in unit tests and ordinary code.
+- **Nondeterminism already inside a boundary is left alone.** A `ctx.effect` supplier or a tool body
+  is covered by that boundary's own recorded result.
+- **The contract still holds.** Auto-capture removes the bookkeeping, not the discipline: a task
+  whose *sequence* of calls varies between runs still diverges, and strict replay still says so.
+
+Asserted automatically in `AutoCaptureAcceptanceTest` and gated in CI by `Demo autocapture`.
+
 ## Specification
 
 The full v0.1 design lives in the project spec (Catalyst v0.1 Specification). This repository
@@ -199,7 +261,7 @@ and **M2** (branch + diff).
 ## Roadmap
 
 v0.1 is complete. See [ROADMAP.md](ROADMAP.md) for what's next — v0.2 (largely shipped: snapshots,
-blob store, retry semantics, the OTel exporter, built-in tools; remaining: the auto-capture agent,
+blob store, retry semantics, the OTel exporter, built-in tools, the auto-capture agent; remaining:
 streaming, the timeline UI) and v1 (agents, the
 `WAITING`/signal APIs and human-in-the-loop via Boudin, distributed execution over a Gumbo cluster,
 and the replay-driven eval harness).

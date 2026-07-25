@@ -22,6 +22,7 @@ import com.cajunsystems.catalyst.engine.NonDeterministicReplayException;
 import com.cajunsystems.catalyst.engine.PayloadCodec;
 import com.cajunsystems.catalyst.engine.Reducer;
 import com.cajunsystems.catalyst.engine.ReducerState;
+import com.cajunsystems.catalyst.capture.AutoCapture;
 import com.cajunsystems.catalyst.engine.ReplayingContext;
 import com.cajunsystems.catalyst.engine.RetryPolicy;
 import com.cajunsystems.catalyst.engine.TimelineStep;
@@ -329,7 +330,7 @@ public final class CatalystRuntime implements AutoCloseable {
         Logger logger = LoggerFactory.getLogger("catalyst.replay." + id.value());
         ReplayingContext ctx = new ReplayingContext(id, log, defaultModel, info, opts.vars(),
                 eventMapper, payloads, inDoubtPolicy, costModel, replayMode, null, clock, logger, recorded, /* appendEnabled */ false);
-        try {
+        try (AutoCapture.Scope captured = AutoCapture.bind(ctx)) {
             task.execute(ctx);
         } catch (RuntimeException e) {
             throw e; // includes NonDeterministicReplayException
@@ -450,7 +451,7 @@ public final class CatalystRuntime implements AutoCloseable {
         ReplayingContext ctx = new ReplayingContext(childId, log, model, info, vars,
                 eventMapper, payloads, inDoubtPolicy, costModel, ReplayMode.BRANCH, spec, clock, logger,
                 parentEvents, /* appendEnabled */ true);
-        try {
+        try (AutoCapture.Scope captured = AutoCapture.bind(ctx)) {
             R result = task.execute(ctx);
             log.append(childId, new CatalystEvent.ExecutionCompleted(now(), payloads.toTree(result)));
         } catch (ExecutionPausedSignal pause) {
@@ -602,7 +603,9 @@ public final class CatalystRuntime implements AutoCloseable {
                         eventMapper, payloads, inDoubtPolicy, costModel, replayMode, null, clock, logger,
                         recorded, /* appendEnabled */ true, runningAttempt.token);
 
-                try {
+                // The capture scope is per-attempt: a retry re-enters the task from the top, so its
+                // auto-capture counter restarts in step with the recorded prefix it replays.
+                try (AutoCapture.Scope captured = AutoCapture.bind(ctx)) {
                     R result = task.execute(ctx);
                     log.append(id, new CatalystEvent.ExecutionCompleted(now(), payloads.toTree(result)));
                     future.complete(result);

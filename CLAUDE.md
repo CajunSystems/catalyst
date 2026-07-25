@@ -1,7 +1,7 @@
 # Catalyst — notes for Claude
 
 Catalyst is a **durable AI execution runtime for the JVM** (Java 21, Maven multi-module). This repo
-implements all three v0.1 milestones: **M0** (*execute + record + resume*), **M1** (*replay +
+implements all three v0.1 milestones plus most of v0.2: **M0** (*execute + record + resume*), **M1** (*replay +
 inspect* — strict canonical-hash replay with `NonDeterministicReplayException`, `replay(id, task)`,
 typed token/cost timeline via `ExecutionState.timelineView()` + pluggable `CostModel`), and **M2**
 (*branch + diff* — `ReplayMode.BRANCH` forks on divergence, `runtime.branch(id, atSeq)` with model /
@@ -35,6 +35,11 @@ intended source, but if `jitpack.io` is blocked, install Gumbo locally first:
 - `catalyst-langchain4j` — `LangChain4jModel`: wraps any LangChain4j `ChatModel` (real providers).
   Depends only on `langchain4j-core`; the app supplies the provider. Tested offline with a fake
   `ChatModel` (override `doChat`).
+- `catalyst-agent` — `AutoCaptureAgent`: a Byte Buddy agent that rewrites the JDK's nondeterministic
+  call sites (`Instant.now()`, `UUID.randomUUID()`, `Math.random()`, `Random` draws) inside configured
+  task packages into calls on `catalyst-core`'s `AutoCapture` bridge. The bridge lives in **core**, not
+  here, so instrumented classes link without the agent. Depends on Byte Buddy; tests fork a JVM per
+  class (agent installs are JVM-wide).
 - `catalyst-otel` — `CatalystTracer`: folds an execution's event log into an OpenTelemetry trace
   (root span + per-boundary child spans + lifecycle annotations). Read-only, post-hoc, no runtime hook.
   Depends on the OpenTelemetry **API** only; the app supplies the SDK + exporter. Tested offline with
@@ -102,6 +107,20 @@ intended source, but if `jitpack.io` is blocked, install Gumbo locally first:
   runtime (`isRetryable`: excludes `NonDeterministicReplayException`, `InDoubtException`,
   `InterruptedException`, `Error`) before the policy is consulted. Whole-task, not per-tool. A retried
   log still replays exactly.
+- **v0.2 Auto-capture** — `AutoCaptureAcceptanceTest` + `Demo autocapture`: a task containing plain
+  `Instant.now()` / `UUID.randomUUID()` / `Random` calls and **no** `ctx.effect` is recorded and
+  replayed exactly, because `catalyst-agent` rewrote those call sites into `AutoCapture` calls that
+  record through the bound `Context` as effect boundaries (`auto:<source>#<n>`, counted per attempt —
+  a resume/replay re-enters the task from the top, which realigns the counter). The uninstrumented
+  control run is half the criterion: without capture, replay raises **nothing** and silently
+  recomputes different values. `CatalystRuntime` binds the scope (`AutoCapture.bind`) around all three
+  `task.execute` sites, per-attempt so retries realign. Capture is suppressed inside boundaries that
+  already record a result (`ctx.effect` suppliers, tool bodies) — otherwise a nested capture appends
+  its event *before* the enclosing one and desynchronises the boundary queue. `PayloadCodec` allowlists
+  `UUID` + the `java.time` value types for the same reason. Gotchas that bit: Byte Buddy skips
+  synthetic methods by default (exempting every lambda body — the agent overrides `ByteBuddy.ignore`),
+  and `Random` does not declare `nextInt(int,int)` (draws match by declaring type against
+  `RandomGenerator`).
 - **v0.2 Observability / OTel exporter** — `OtelAcceptanceTest` + `Demo otel`: an execution's event log
   folds into one OpenTelemetry trace via `catalyst-otel`'s `CatalystTracer.export(id, events)` — a root
   span for the run, a child span per boundary (model/tool/effect/memory; model/tool carry real latency,

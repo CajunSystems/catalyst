@@ -1,0 +1,153 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<project xmlns="http://maven.apache.org/POM/4.0.0"
+         xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance"
+         xsi:schemaLocation="http://maven.apache.org/POM/4.0.0 http://maven.apache.org/xsd/maven-4.0.0.xsd">
+    <modelVersion>4.0.0</modelVersion>
+
+    <parent>
+        <groupId>com.cajunsystems</groupId>
+        <artifactId>catalyst-parent</artifactId>
+        <version>0.1.0-SNAPSHOT</version>
+    </parent>
+
+    <artifactId>catalyst-agent</artifactId>
+    <name>Catalyst Auto-capture Agent</name>
+    <description>
+        Java agent that rewrites the JDK's nondeterministic sources inside task code into recorded
+        Catalyst boundaries, so task authors need not wrap each one in ctx.effect (spec §6).
+    </description>
+
+    <dependencies>
+        <!--
+          catalyst-core carries the AutoCapture bridge that instrumented call sites target. The bridge
+          deliberately lives in core, not here: task classes already resolve core through their own
+          loader, so a rewritten call site links whether or not this module is on the classpath.
+        -->
+        <dependency>
+            <groupId>com.cajunsystems</groupId>
+            <artifactId>catalyst-core</artifactId>
+        </dependency>
+        <dependency>
+            <groupId>net.bytebuddy</groupId>
+            <artifactId>byte-buddy</artifactId>
+        </dependency>
+        <!-- Enables AutoCaptureAgent.install() to attach to the running JVM without -javaagent. -->
+        <dependency>
+            <groupId>net.bytebuddy</groupId>
+            <artifactId>byte-buddy-agent</artifactId>
+        </dependency>
+
+        <dependency>
+            <groupId>com.cajunsystems</groupId>
+            <artifactId>catalyst-runtime</artifactId>
+            <scope>test</scope>
+        </dependency>
+    </dependencies>
+
+    <build>
+        <plugins>
+            <!--
+              One JVM per test class. Installing an agent mutates JVM-wide state, and resetting one
+              installation retransforms classes back to their original bytecode — which silently
+              un-instruments classes another test class is still relying on. Forking per class keeps
+              each installation's blast radius inside its own JVM.
+            -->
+            <plugin>
+                <groupId>org.apache.maven.plugins</groupId>
+                <artifactId>maven-surefire-plugin</artifactId>
+                <configuration>
+                    <reuseForks>false</reuseForks>
+                    <forkCount>1</forkCount>
+                </configuration>
+            </plugin>
+            <!--
+              Agent entry points. Premain-Class is launch-time attach (the preferred mode, since no task
+              class is loaded yet); Agent-Class is attach-to-running-JVM, which is also how install()
+              reaches already-loaded classes. Both need retransformation.
+            -->
+            <plugin>
+                <groupId>org.apache.maven.plugins</groupId>
+                <artifactId>maven-jar-plugin</artifactId>
+                <configuration>
+                    <archive>
+                        <manifestEntries>
+                            <Premain-Class>com.cajunsystems.catalyst.agent.AutoCaptureAgent</Premain-Class>
+                            <Agent-Class>com.cajunsystems.catalyst.agent.AutoCaptureAgent</Agent-Class>
+                            <Can-Retransform-Classes>true</Can-Retransform-Classes>
+                            <Can-Redefine-Classes>true</Can-Redefine-Classes>
+                        </manifestEntries>
+                    </archive>
+                </configuration>
+            </plugin>
+
+            <!--
+              A second, self-contained artifact for the -javaagent launch:
+              catalyst-agent-<version>-javaagent.jar.
+
+              A -javaagent jar is appended to the system classpath on its own; its Maven dependencies
+              are not. The plain library jar therefore cannot serve as one — premain dies with
+              NoClassDefFoundError on net.bytebuddy unless the application happens to carry Byte Buddy
+              itself, which is not something the agent should require of it. So Byte Buddy is bundled
+              here and relocated, keeping the agent's copy off the application's namespace.
+
+              What is deliberately NOT bundled is catalyst-core. Instrumented call sites must resolve
+              AutoCapture to the very class the runtime binds a Context on; a second copy inside this
+              jar would be a different class with its own thread-local, and every capture would silently
+              fall through to the plain JDK call. Core comes from the application, which by definition
+              already has it. The library jar stays the main artifact, so consumers using the
+              programmatic install() keep an ordinary dependency with an ordinary Byte Buddy on it.
+            -->
+            <plugin>
+                <groupId>org.apache.maven.plugins</groupId>
+                <artifactId>maven-shade-plugin</artifactId>
+                <version>3.5.3</version>
+                <executions>
+                    <execution>
+                        <phase>package</phase>
+                        <goals>
+                            <goal>shade</goal>
+                        </goals>
+                        <configuration>
+                            <shadedArtifactAttached>true</shadedArtifactAttached>
+                            <shadedClassifierName>javaagent</shadedClassifierName>
+                            <createDependencyReducedPom>false</createDependencyReducedPom>
+                            <artifactSet>
+                                <includes>
+                                    <include>net.bytebuddy:byte-buddy</include>
+                                    <include>net.bytebuddy:byte-buddy-agent</include>
+                                </includes>
+                            </artifactSet>
+                            <relocations>
+                                <relocation>
+                                    <pattern>net.bytebuddy</pattern>
+                                    <shadedPattern>com.cajunsystems.catalyst.agent.shaded.bytebuddy</shadedPattern>
+                                </relocation>
+                            </relocations>
+                            <filters>
+                                <filter>
+                                    <artifact>*:*</artifact>
+                                    <excludes>
+                                        <exclude>META-INF/*.SF</exclude>
+                                        <exclude>META-INF/*.DSA</exclude>
+                                        <exclude>META-INF/*.RSA</exclude>
+                                        <exclude>module-info.class</exclude>
+                                    </excludes>
+                                </filter>
+                            </filters>
+                            <transformers>
+                                <transformer implementation="org.apache.maven.plugins.shade.resource.ManifestResourceTransformer">
+                                    <manifestEntries>
+                                        <Premain-Class>com.cajunsystems.catalyst.agent.AutoCaptureAgent</Premain-Class>
+                                        <Agent-Class>com.cajunsystems.catalyst.agent.AutoCaptureAgent</Agent-Class>
+                                        <Can-Retransform-Classes>true</Can-Retransform-Classes>
+                                        <Can-Redefine-Classes>true</Can-Redefine-Classes>
+                                    </manifestEntries>
+                                </transformer>
+                            </transformers>
+                        </configuration>
+                    </execution>
+                </executions>
+            </plugin>
+        </plugins>
+    </build>
+</project>

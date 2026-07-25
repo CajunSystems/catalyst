@@ -7,6 +7,7 @@ import com.cajunsystems.catalyst.ExecutionInfo;
 import com.cajunsystems.catalyst.Memory;
 import com.cajunsystems.catalyst.ReplayMode;
 import com.cajunsystems.catalyst.Tool;
+import com.cajunsystems.catalyst.capture.AutoCapture;
 import com.cajunsystems.catalyst.events.CatalystEvent;
 import com.cajunsystems.catalyst.events.CatalystEvent.*;
 import com.cajunsystems.catalyst.events.SequencedEvent;
@@ -348,7 +349,16 @@ public final class ReplayingContext implements Context {
             return (T) payloads.fromTree(((EffectRecorded) recorded.get().event()).value());
         }
         requireAppendable("effect " + label);
-        T value = supplier.get();
+        // Auto-capture is suppressed inside the supplier: this boundary already records whatever the
+        // supplier computes, so a nested capture would append its own event *before* this one and
+        // desynchronise the boundary queue on replay.
+        T value;
+        boolean previousSuppression = AutoCapture.suppress();
+        try {
+            value = supplier.get();
+        } finally {
+            AutoCapture.restore(previousSuppression);
+        }
         append(new EffectRecorded(now(), label, payloads.toTree(value)));
         return value;
     }
@@ -530,14 +540,23 @@ public final class ReplayingContext implements Context {
         return tool.getClass().isAnnotationPresent(Deterministic.class);
     }
 
+    /**
+     * Runs a tool body with auto-capture suppressed: the tool's own output is the recorded boundary, so
+     * nondeterminism inside it needs no separate capture. (A {@link Deterministic} tool is re-executed
+     * on replay, but its purity is the annotation's promise — capturing inside it would record events a
+     * pure replay must not append.)
+     */
     @SuppressWarnings("unchecked")
     private static <I, O> O applyUnchecked(Tool<I, O> tool, I input) {
+        boolean previousSuppression = AutoCapture.suppress();
         try {
             return tool.apply(input);
         } catch (RuntimeException e) {
             throw e;
         } catch (Exception e) {
             throw new RuntimeException("Tool '" + tool.name() + "' threw", e);
+        } finally {
+            AutoCapture.restore(previousSuppression);
         }
     }
 }
