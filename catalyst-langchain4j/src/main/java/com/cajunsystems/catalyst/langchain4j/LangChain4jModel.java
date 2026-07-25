@@ -5,6 +5,7 @@ import com.cajunsystems.catalyst.model.CompletionRequest;
 import com.cajunsystems.catalyst.model.Message;
 import com.cajunsystems.catalyst.model.Model;
 import com.cajunsystems.catalyst.model.ToolCall;
+import com.cajunsystems.catalyst.model.TokenSink;
 import com.cajunsystems.catalyst.model.ToolSpec;
 import com.cajunsystems.catalyst.model.Usage;
 import com.fasterxml.jackson.databind.JsonNode;
@@ -16,15 +17,19 @@ import dev.langchain4j.data.message.ChatMessage;
 import dev.langchain4j.data.message.SystemMessage;
 import dev.langchain4j.data.message.UserMessage;
 import dev.langchain4j.model.chat.ChatModel;
+import dev.langchain4j.model.chat.StreamingChatModel;
 import dev.langchain4j.model.chat.request.ChatRequest;
 import dev.langchain4j.model.chat.request.json.JsonObjectSchema;
 import dev.langchain4j.model.chat.response.ChatResponse;
+import dev.langchain4j.model.chat.response.StreamingChatResponseHandler;
 import dev.langchain4j.model.output.FinishReason;
 import dev.langchain4j.model.output.TokenUsage;
 
 import java.util.ArrayList;
 import java.util.List;
 import java.util.Map;
+import java.util.concurrent.BlockingQueue;
+import java.util.concurrent.LinkedBlockingQueue;
 
 /**
  * Adapts any LangChain4j {@link ChatModel} to Catalyst's {@link Model} SPI (spec §2). This is the
@@ -40,10 +45,22 @@ public final class LangChain4jModel implements Model {
 
     private static final ObjectMapper SCHEMA_MAPPER = new ObjectMapper();
 
+    /** Ends a chunk queue; carries the assembled response or the failure that ended the stream. */
+    private record Terminal(ChatResponse response, Throwable error) {}
+
     private final ChatModel chatModel;
+    private final StreamingChatModel streamingChatModel;
 
     public LangChain4jModel(ChatModel chatModel) {
+        this(chatModel, null);
+    }
+
+    public LangChain4jModel(ChatModel chatModel, StreamingChatModel streamingChatModel) {
+        if (chatModel == null && streamingChatModel == null) {
+            throw new IllegalArgumentException("Supply a ChatModel, a StreamingChatModel, or both");
+        }
         this.chatModel = chatModel;
+        this.streamingChatModel = streamingChatModel;
     }
 
     /** Convenience factory. */
@@ -51,15 +68,86 @@ public final class LangChain4jModel implements Model {
         return new LangChain4jModel(chatModel);
     }
 
+    /**
+     * Adapts a streaming provider. {@code complete} works too — it consumes the stream and returns the
+     * assembled response — so one of these can serve a task whether or not it asks for chunks.
+     */
+    public static LangChain4jModel streaming(StreamingChatModel streamingChatModel) {
+        return new LangChain4jModel(null, streamingChatModel);
+    }
+
+    /** Uses the blocking model for {@code complete} and the streaming one for {@code stream}. */
+    public static LangChain4jModel of(ChatModel chatModel, StreamingChatModel streamingChatModel) {
+        return new LangChain4jModel(chatModel, streamingChatModel);
+    }
+
     @Override
     public Completion complete(CompletionRequest request) {
+        if (chatModel == null) {
+            return stream(request, TokenSink.discarding()); // streaming-only provider
+        }
+        ChatResponse response = chatModel.chat(toChatRequest(request));
+        return toCompletion(response);
+    }
+
+    /**
+     * Bridges LangChain4j's callback API onto Catalyst's synchronous {@link Model#stream} contract: the
+     * boundary is not recorded until the assembled completion is in hand, so this must block until the
+     * provider says it is done.
+     *
+     * <p>Chunks are handed across a queue rather than passed straight through from the provider's
+     * callback. The callbacks arrive on the provider's own thread, and the sink is <em>task</em> code —
+     * it belongs on the task's thread, which is where the {@code Context} is bound and where the
+     * determinism contract applies. Draining the queue here keeps delivery incremental while keeping
+     * the sink on the calling thread.
+     */
+    @Override
+    public Completion stream(CompletionRequest request, TokenSink sink) {
+        if (streamingChatModel == null) {
+            return Model.super.stream(request, sink); // no streaming provider: one chunk at the end
+        }
+        BlockingQueue<Object> queue = new LinkedBlockingQueue<>();
+        streamingChatModel.chat(toChatRequest(request), new StreamingChatResponseHandler() {
+            @Override
+            public void onPartialResponse(String partial) {
+                if (partial != null && !partial.isEmpty()) queue.add(partial);
+            }
+
+            @Override
+            public void onCompleteResponse(ChatResponse response) {
+                queue.add(new Terminal(response, null));
+            }
+
+            @Override
+            public void onError(Throwable error) {
+                queue.add(new Terminal(null, error));
+            }
+        });
+
+        try {
+            while (true) {
+                Object next = queue.take();
+                if (next instanceof Terminal terminal) {
+                    if (terminal.error() != null) {
+                        throw new RuntimeException("Streaming completion failed", terminal.error());
+                    }
+                    return toCompletion(terminal.response());
+                }
+                sink.accept((String) next);
+            }
+        } catch (InterruptedException e) {
+            Thread.currentThread().interrupt();
+            throw new RuntimeException("Interrupted while streaming a completion", e);
+        }
+    }
+
+    private static ChatRequest toChatRequest(CompletionRequest request) {
         ChatRequest.Builder builder = ChatRequest.builder().messages(toLangChainMessages(request));
         List<ToolSpecification> tools = toToolSpecifications(request.tools());
         if (!tools.isEmpty()) {
             builder.toolSpecifications(tools);
         }
-        ChatResponse response = chatModel.chat(builder.build());
-        return toCompletion(response);
+        return builder.build();
     }
 
     private static List<ChatMessage> toLangChainMessages(CompletionRequest request) {

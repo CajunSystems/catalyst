@@ -121,6 +121,19 @@ intended source, but if `jitpack.io` is blocked, install Gumbo locally first:
   synthetic methods by default (exempting every lambda body — the agent overrides `ByteBuddy.ignore`),
   and `Random` does not declare `nextInt(int,int)` (draws match by declaring type against
   `RandomGenerator`).
+- **v0.2 Streaming** — `StreamingAcceptanceTest` + `Demo streaming`: a task consumes a completion
+  incrementally via `ctx.model().stream(request, TokenSink)` and still replays exactly. **Streaming is
+  a delivery concern, not a durability one** — the recorded boundary is the assembled `Completion`,
+  i.e. the same single `CompletionReceived` a non-streaming call writes, so the schema is unchanged and
+  a streamed log is interchangeable with a plain one on replay. `Model.stream` is a **default method**
+  (delegates to `complete()`, one chunk) so every existing `Model` still compiles and `Model` stays
+  functional. `ReplayingContext.model()` now returns a `RecordingModel` (was a method ref) folding both
+  entry points onto one `modelBoundary`. Chunk boundaries are NOT recorded — replay re-emits the
+  recorded text as one chunk (token-level replay deferred), so tasks may accumulate chunks but must not
+  branch on chunk counts. The sink is wrapped so auto-capture is **suppressed** while it runs: it
+  executes between `CompletionRequested` and `CompletionReceived`, and a capture there would append
+  into that gap and break replay. `LangChain4jModel.streaming(...)` bridges LangChain4j's async
+  callbacks over a `BlockingQueue` so the sink runs on the **task's** thread, not the provider's.
 - **v0.2 Observability / OTel exporter** — `OtelAcceptanceTest` + `Demo otel`: an execution's event log
   folds into one OpenTelemetry trace via `catalyst-otel`'s `CatalystTracer.export(id, events)` — a root
   span for the run, a child span per boundary (model/tool/effect/memory; model/tool carry real latency,

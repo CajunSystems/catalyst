@@ -56,6 +56,10 @@ log) provides durability.
   counterfactual tool results), then runs forward with the new model. Under `ReplayMode.BRANCH` a
   divergence forks (appends `ExecutionBranched`, continues live) instead of throwing.
   `Trajectory.diff(base, fork)` gives the step-by-step difference.
+- **Streaming completions (v0.2)** — `ctx.model().stream(request, sink)` delivers a completion's text
+  incrementally while recording the assembled result, so a streamed execution writes the same log a
+  non-streaming one does and replays with zero provider calls. See
+  [Streaming](#streaming-completions).
 - **Auto-capture (v0.2)** — attach `catalyst-agent` and task code no longer has to wrap its
   nondeterminism: `Instant.now()`, `UUID.randomUUID()`, `Math.random()` and `Random` draws are
   rewritten at their call sites into recorded boundaries, so a task written with plain JDK calls
@@ -195,6 +199,44 @@ CatalystRuntime runtime = Catalyst.builder()
         .build();
 ```
 
+## Streaming completions
+
+A task that wants tokens as they arrive asks for a sink instead of a return value:
+
+```java
+Task<String> task = ctx -> {
+    StringBuilder assembled = new StringBuilder();
+    ctx.model().stream(
+            CompletionRequest.of(Prompt.builder().user("describe streaming").build()),
+            chunk -> {
+                ui.append(chunk);          // incremental delivery
+                assembled.append(chunk);
+            });
+    return assembled.toString();
+};
+```
+
+Streaming is a **delivery** concern, not a durability one. Whatever the provider does on the wire, the
+boundary Catalyst records is the assembled `Completion` — the same single `CompletionReceived` event a
+non-streaming call writes. So nothing about resume, replay or branch had to change: a streamed
+execution and a non-streamed one are indistinguishable in the log, and the two are interchangeable on
+replay. On replay the recorded text is re-emitted to the sink and no provider is contacted.
+
+`Model.stream` is a **default method** — every existing `Model` keeps working, and one that cannot
+stream hands the sink the whole message as one chunk. `LangChain4jModel.streaming(streamingChatModel)`
+adapts a real streaming provider.
+
+Two things to know:
+
+- **Chunk boundaries are not recorded.** A replay delivers the recorded text in a single chunk.
+  Accumulating chunks is safe; branching on *how many* arrived is not, and is the one way streaming can
+  make a task nondeterministic. (Token-level replay is deliberately left to a later phase.)
+- **The sink runs on the task's thread**, before the boundary is recorded. It must not call
+  `ctx.effect`, `ctx.call`, or another completion — that would append an event between this boundary's
+  request and its result, which no replay can match.
+
+Asserted automatically in `StreamingAcceptanceTest` and gated in CI by `Demo streaming`.
+
 ## Auto-capture: nondeterminism without the ceremony
 
 Catalyst's determinism contract asks that task code produce the same values on every run. The manual
@@ -261,8 +303,8 @@ and **M2** (branch + diff).
 ## Roadmap
 
 v0.1 is complete. See [ROADMAP.md](ROADMAP.md) for what's next — v0.2 (largely shipped: snapshots,
-blob store, retry semantics, the OTel exporter, built-in tools, the auto-capture agent; remaining:
-streaming, the timeline UI) and v1 (agents, the
+blob store, retry semantics, the OTel exporter, built-in tools, the auto-capture agent, streaming
+completions; remaining: the timeline UI) and v1 (agents, the
 `WAITING`/signal APIs and human-in-the-loop via Boudin, distributed execution over a Gumbo cluster,
 and the replay-driven eval harness).
 

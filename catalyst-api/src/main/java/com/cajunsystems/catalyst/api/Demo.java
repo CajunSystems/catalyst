@@ -117,6 +117,8 @@ public final class Demo {
             blobDemo(Files.createTempDirectory("catalyst-blob-"));
         } else if (args.length >= 1 && args[0].equals("autocapture")) {
             autoCaptureDemo(Files.createTempDirectory("catalyst-autocapture-"));
+        } else if (args.length >= 1 && args[0].equals("streaming")) {
+            streamingDemo(Files.createTempDirectory("catalyst-streaming-"));
         } else if (args.length >= 1 && args[0].equals("schema")) {
             schemaDemo();
         } else {
@@ -653,6 +655,81 @@ public final class Demo {
             if (writeReapplied) throw new AssertionError("replay re-applied the file write");
             System.out.println("[tools] built-in-tools criterion holds: HTTP + Filesystem calls recorded"
                     + " once and substituted on replay (zero re-execution).");
+        }
+    }
+
+    /**
+     * The v0.2 streaming exit demo (spec §13.1): a task consumes a completion incrementally through
+     * {@code ctx.model().stream(request, sink)}, building its result from the chunks as they arrive.
+     *
+     * <p>What the demo is really showing is that streaming changed <em>nothing</em> about durability.
+     * The recorded event stream is the same one a non-streaming call produces — one
+     * {@code CompletionReceived} carrying the assembled completion — so the execution replays with the
+     * provider never contacted, and the sink is still fed (from the log) so the task can rebuild the
+     * same answer. Chunk boundaries are deliberately not recorded: replay delivers the recorded text
+     * in one piece, which is why a task may accumulate chunks but must not branch on how many arrived.
+     */
+    private static void streamingDemo(Path dir) {
+        MockModel model = MockModel.alwaysReturn("streaming completions arrive one piece at a time");
+
+        // The task exists only as a consumer of the stream: its result is whatever the sink was fed.
+        java.util.List<String> chunks = new java.util.ArrayList<>();
+        Task<String> summarise = ctx -> {
+            StringBuilder assembled = new StringBuilder();
+            ctx.model().stream(
+                    CompletionRequest.of(Prompt.builder().user("describe streaming").build()),
+                    text -> {
+                        chunks.add(text);
+                        assembled.append(text);
+                    });
+            return assembled.toString();
+        };
+
+        try (CatalystRuntime runtime = Catalyst.builder()
+                .log(GumboEventLog.at(dir))
+                .model(model)
+                .build()) {
+
+            ExecutionHandle<String> handle = runtime.execute(summarise, ExecutionOptions.withKey(KEY));
+            String recorded = handle.result();
+            ExecutionId id = handle.id();
+            int chunksDuringRecord = chunks.size();
+            int callsAfterRecord = model.callCount();
+
+            java.util.List<String> eventTypes = new java.util.ArrayList<>();
+            for (var se : runtime.log().read(id)) eventTypes.add(se.event().getClass().getSimpleName());
+
+            System.out.println("[streaming] recorded execution " + id.value());
+            System.out.println("[streaming] chunks during record: " + chunksDuringRecord);
+            System.out.println("[streaming] result: " + recorded);
+            System.out.println("[streaming] events recorded: " + eventTypes);
+
+            // Replay: the provider must not be contacted, and the sink must still be fed — otherwise
+            // the task could not rebuild its result at all.
+            chunks.clear();
+            ExecutionState replayed = runtime.replay(id, summarise);
+            int externalCalls = model.callCount() - callsAfterRecord;
+            String replayedText = String.join("", chunks);
+
+            System.out.println("[streaming] replayed -> " + replayed.status()
+                    + "; model calls during replay: " + externalCalls);
+            System.out.println("[streaming] chunks during replay: " + chunks.size()
+                    + " (assembled text identical: " + replayedText.equals(recorded) + ")");
+
+            if (chunksDuringRecord <= 1) {
+                throw new AssertionError("the model did not stream incrementally during record");
+            }
+            if (externalCalls != 0) {
+                throw new AssertionError("replay contacted the model " + externalCalls + " time(s)");
+            }
+            if (!replayedText.equals(recorded)) {
+                throw new AssertionError("replay did not reproduce the streamed text");
+            }
+            if (eventTypes.stream().filter(t -> t.equals("CompletionReceived")).count() != 1) {
+                throw new AssertionError("expected exactly one recorded completion, got " + eventTypes);
+            }
+            System.out.println("[streaming] streaming criterion holds: incremental delivery on the live"
+                    + " run, one recorded completion, exact replay with zero model calls.");
         }
     }
 

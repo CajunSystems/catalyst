@@ -3,6 +3,7 @@ package com.cajunsystems.catalyst.mock;
 import com.cajunsystems.catalyst.model.Completion;
 import com.cajunsystems.catalyst.model.CompletionRequest;
 import com.cajunsystems.catalyst.model.Model;
+import com.cajunsystems.catalyst.model.TokenSink;
 import com.cajunsystems.catalyst.model.Usage;
 
 import java.util.ArrayList;
@@ -49,6 +50,39 @@ public final class MockModel implements Model {
         int idx = cursor.getAndIncrement();
         if (idx >= script.size()) idx = script.size() - 1; // repeat the last scripted step
         return script.get(idx).apply(request);
+    }
+
+    /**
+     * Streams the scripted response in word-sized chunks, so tests and demos exercise genuinely
+     * incremental delivery rather than the single-chunk default. Counts as one invocation, exactly like
+     * {@link #complete}: what matters to the resume and replay criteria is how often the model was
+     * reached, not how many pieces it answered in.
+     */
+    @Override
+    public Completion stream(CompletionRequest request, TokenSink sink) {
+        Completion completion = complete(request);
+        for (String chunk : chunk(completion.message())) {
+            sink.accept(chunk);
+        }
+        return completion;
+    }
+
+    /**
+     * Splits text after each run of whitespace, so the chunks concatenate back to the original exactly.
+     * Deterministic, which keeps a chunk-counting assertion in a test meaningful.
+     */
+    private static List<String> chunk(String text) {
+        List<String> chunks = new ArrayList<>();
+        int start = 0;
+        for (int i = 0; i < text.length(); i++) {
+            if (Character.isWhitespace(text.charAt(i))
+                    && (i + 1 == text.length() || !Character.isWhitespace(text.charAt(i + 1)))) {
+                chunks.add(text.substring(start, i + 1));
+                start = i + 1;
+            }
+        }
+        if (start < text.length()) chunks.add(text.substring(start));
+        return chunks;
     }
 
     /** How many times the model was actually invoked (i.e. not substituted from the log). */

@@ -37,8 +37,8 @@ auto-capture agent, per-execution locking, streaming, and observability sequence
 guide, not a contract — it flexes as we learn. Snapshots, the cancellation event (①), the task
 registry / standalone `resume(id)` (②), the built-in HTTP + Filesystem tools (③), generic-collection
 payloads (④), the blob store (⑤), schema evolution, per-execution locking, retry semantics, the OTel
-exporter, and the auto-capture agent have shipped; the remaining v0.2 work (streaming completions and
-the timeline UI) is unsequenced.
+exporter, the auto-capture agent, and streaming completions have shipped; the timeline UI is the last
+remaining v0.2 item.
 
 ### Durability & storage (spec §8)
 - ✅ **Snapshots** — periodic fold checkpoints so long executions don't re-fold the whole log on
@@ -101,8 +101,24 @@ the timeline UI) is unsequenced.
   enforced at every nested leaf and array component (gadget-safe). Collections rebuild as
   `ArrayList`/`LinkedHashSet`/`LinkedHashMap` (equal by content). Gated by the v0.2 Collection-payloads
   exit demo in CI.
-- **Streaming completions** (open question §13.1) — decide whether the `Model` SPI needs a streaming
-  variant now; record the assembled completion, add token-level replay later.
+- ✅ **Streaming completions** (open question §13.1) — resolved: the `Model` SPI gets a streaming
+  variant now, as a **default method** (`stream(request, TokenSink)`) rather than a second interface,
+  so every existing `Model` keeps working and `Model` stays functional. The default delegates to
+  `complete()` and hands the sink one chunk; an adapter overrides it to deliver incrementally and must
+  block until the completion is assembled. Streaming is treated as a **delivery** concern, not a
+  durability one: the boundary recorded is the assembled `Completion` — byte-for-byte the same
+  `CompletionReceived` a non-streaming call writes — so the schema did not change, a streamed and a
+  non-streamed execution are indistinguishable in the log, and the two are interchangeable on replay.
+  A replay re-emits the recorded text to the sink (the task rebuilds its result from what it receives)
+  and contacts no provider. Token-level replay is deliberately deferred: chunk boundaries are not
+  recorded, so replay delivers the text in one piece — a task may accumulate chunks but must not branch
+  on how many arrived, which is the one determinism caveat streaming adds. `MockModel` streams in
+  word-sized chunks; `LangChain4jModel` adapts a `StreamingChatModel`, bridging its async callbacks to
+  the synchronous contract over a queue so the sink runs on the **task's** thread (where the `Context`
+  is bound) rather than the provider's. Auto-capture is suppressed while the sink runs, for the same
+  reason it is inside an `effect` supplier: the sink executes between `CompletionRequested` and
+  `CompletionReceived`, and a capture there would append into that gap. Gated by the v0.2 Streaming
+  exit demo in CI.
 - ✅ **Retry semantics** (open question §13.3) — resolved in favour of **retry-as-attempt** (same
   `ExecutionId`, same stream) over child execution: a retryable task failure appends `RetryRequested`
   instead of `ExecutionFailed`, then re-enters the task as a resume with the recorded prefix
