@@ -36,6 +36,16 @@
             <artifactId>catalyst-otel</artifactId>
         </dependency>
         <!--
+          The auto-capture exit demo attaches the agent in-process. Optional for the same reason as the
+          OTel SDK below: an app that never wants bytecode instrumentation should not inherit Byte Buddy
+          from the facade. It stays on this module's own classpath so the demo builds and CI can gate it.
+        -->
+        <dependency>
+            <groupId>com.cajunsystems</groupId>
+            <artifactId>catalyst-agent</artifactId>
+            <optional>true</optional>
+        </dependency>
+        <!--
           The OTel exit demo (Demo.java, main scope) builds a real SDK to collect the exported spans
           in-process. Marked optional so it stays off the transitive classpath of catalyst-api's
           consumers — the facade must not force the SDK on apps (they supply their own; catalyst-otel

@@ -36,8 +36,9 @@ first: **① cancellation event → ② task registry / `resume(id)` → ③ bui
 auto-capture agent, per-execution locking, streaming, and observability sequenced after. Order is a
 guide, not a contract — it flexes as we learn. Snapshots, the cancellation event (①), the task
 registry / standalone `resume(id)` (②), the built-in HTTP + Filesystem tools (③), generic-collection
-payloads (④), the blob store (⑤), schema evolution, per-execution locking, and retry semantics have
-shipped; the remaining v0.2 work (the auto-capture agent, streaming, observability) is unsequenced.
+payloads (④), the blob store (⑤), schema evolution, per-execution locking, retry semantics, the OTel
+exporter, and the auto-capture agent have shipped; the remaining v0.2 work (streaming completions and
+the timeline UI) is unsequenced.
 
 ### Durability & storage (spec §8)
 - ✅ **Snapshots** — periodic fold checkpoints so long executions don't re-fold the whole log on
@@ -66,9 +67,26 @@ shipped; the remaining v0.2 work (the auto-capture agent, streaming, observabili
   today's logs stay byte-identical. Gated by the v0.2 Schema-evolution exit demo in CI.
 
 ### Determinism & correctness
-- **Auto-capture agent** (spec §6, v0.2 stretch) — a ByteBuddy agent that records `Instant.now()`,
-  `Random`, and `UUID.randomUUID()` inside task code automatically, so users don't have to route
-  every nondeterministic call through `ctx.effect(...)`.
+- ✅ **Auto-capture agent** (spec §6, v0.2 stretch) — a Byte Buddy agent rewrites the JDK's
+  nondeterministic call sites inside configured task packages into calls on a static `AutoCapture`
+  bridge, which records each value through the executing `Context` as an ordinary effect boundary
+  (`auto:<source>#<n>`, positional per attempt) — so a task written with plain `Instant.now()` /
+  `UUID.randomUUID()` / `Math.random()` / `Random` draws resumes, replays and branches exactly, with
+  no `ctx.effect` in it. Captured sources are selectable (`time`, `identity`, `random`); packages are
+  opt-in with no default, backed by a deny list (above all the bridge's own package — rewriting it
+  would make every capture recurse). Only invocations are rewritten, never a method's shape, so
+  already-loaded classes can be retransformed and `install()` works from a running process, not just
+  `-javaagent` at launch. The bridge lives in `catalyst-core` so instrumented classes link and run
+  unchanged when no agent is attached (bridge methods fall through to the plain JDK call), and
+  capture is suppressed inside boundaries that already record their own result (manual `effect`
+  suppliers, tool bodies) so a nested capture cannot desynchronise the boundary queue. Two things
+  real bytecode forced: Byte Buddy's default configuration skips synthetic methods, which would have
+  exempted every lambda body; and draws are matched by declaring type against `RandomGenerator`, which
+  covers `ThreadLocalRandom`/`SecureRandom`/`SplittableRandom` plus `nextInt(int,int)` (a method
+  `Random` does not declare). Gated by the v0.2 Auto-capture exit demo in CI. *Not captured (noted):
+  `Random`'s stream methods (`ints()`/`doubles()`), the `now(Clock)`/`now(ZoneId)` overloads (an
+  explicit time source is the caller's own determinism choice), and nondeterminism on threads the task
+  spawns — the binding is per-thread by design.*
 - ✅ **Generic-collection payloads** (④) — `PayloadCodec` now encodes `List`/`Set`/`Map`/arrays
   structurally, carrying each element in its own typed envelope (recursively), so element types survive
   the round-trip (`List<Point>` comes back as records, not maps; `Map` keys may be non-`String`). Leaf
