@@ -21,6 +21,8 @@ import org.junit.jupiter.api.Test;
 
 import java.util.ArrayList;
 import java.util.List;
+import java.util.concurrent.CountDownLatch;
+import java.util.concurrent.TimeUnit;
 
 import static org.assertj.core.api.Assertions.assertThat;
 import static org.assertj.core.api.Assertions.assertThatThrownBy;
@@ -227,5 +229,50 @@ class LangChain4jModelTest {
     void refusesAnAdapterWithNoProviderAtAll() {
         assertThatThrownBy(() -> new LangChain4jModel(null, null))
                 .isInstanceOf(IllegalArgumentException.class);
+    }
+
+    /**
+     * A provider that keeps emitting after the consumer has given up, reporting how many callbacks the
+     * adapter's handler actually accepted. That is the consumer-liveness property: once nobody is
+     * draining, the handler must stop buffering.
+     */
+    private static final class ChattyStreamingChatModel implements StreamingChatModel {
+        private final int chunkCount;
+        final CountDownLatch finished = new CountDownLatch(1);
+
+        ChattyStreamingChatModel(int chunkCount) {
+            this.chunkCount = chunkCount;
+        }
+
+        @Override
+        public void doChat(ChatRequest chatRequest, StreamingChatResponseHandler handler) {
+            new Thread(() -> {
+                for (int i = 0; i < chunkCount; i++) {
+                    handler.onPartialResponse("chunk" + i);
+                }
+                handler.onCompleteResponse(responseOf("done"));
+                finished.countDown();
+            }, "chatty-provider").start();
+        }
+    }
+
+    @Test
+    void aThrowingSinkStopsTheStreamAndDoesNotKeepBuffering() throws Exception {
+        ChattyStreamingChatModel fake = new ChattyStreamingChatModel(500);
+
+        List<String> delivered = new ArrayList<>();
+        assertThatThrownBy(() -> LangChain4jModel.streaming(fake).stream(
+                CompletionRequest.of(Prompt.builder().user("go").build()),
+                text -> {
+                    delivered.add(text);
+                    if (delivered.size() == 2) throw new IllegalStateException("sink gave up");
+                }))
+                .isInstanceOf(IllegalStateException.class)
+                .hasMessage("sink gave up");
+
+        // The sink is not called again after it throws, and the provider still runs to completion
+        // rather than parking forever — which is why the queue is unbounded rather than blocking.
+        assertThat(delivered).hasSize(2);
+        assertThat(fake.finished.await(5, TimeUnit.SECONDS)).isTrue();
     }
 }

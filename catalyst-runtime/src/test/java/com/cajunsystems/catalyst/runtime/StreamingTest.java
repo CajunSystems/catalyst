@@ -18,6 +18,8 @@ import org.junit.jupiter.api.Test;
 
 import java.util.ArrayList;
 import java.util.List;
+import java.util.concurrent.CountDownLatch;
+import java.util.concurrent.TimeUnit;
 
 import static org.assertj.core.api.Assertions.assertThat;
 import static org.assertj.core.api.Assertions.assertThatThrownBy;
@@ -187,6 +189,78 @@ class StreamingTest {
 
             assertThat(chunks).isEmpty();
             assertThat(result).isEmpty();
+        }
+    }
+
+    /**
+     * Cancelling a task blocked <em>inside</em> a live model boundary folds to {@code FAILED}, not
+     * {@code CANCELLED} — and does so identically whether the task was streaming or not.
+     *
+     * <p>This is the documented cancellation contract, not a streaming quirk: only the cooperative
+     * unwind itself (the {@code CancellationSignal} the context raises at the task's next live
+     * boundary) folds to {@code CANCELLED}; the interrupt is a best-effort nudge to reach that
+     * boundary, and any other throwable after a cancel still records {@code ExecutionFailed} so that
+     * cancellation never masks a real failure. A task blocked in a provider call has no next boundary
+     * to unwind to, so the provider's exception is what propagates.
+     *
+     * <p>Asserted as a pair deliberately: it pins that streaming introduced no new behaviour here, so
+     * a future change to this semantics is a change to cancellation, not to streaming.
+     */
+    @Test
+    void cancellingInsideAProviderCallFoldsTheSameWayStreamingOrNot() throws Exception {
+        assertThat(statusAfterCancellingInsideProvider(/* streaming */ false))
+                .isEqualTo(statusAfterCancellingInsideProvider(/* streaming */ true))
+                .isEqualTo(Status.FAILED);
+    }
+
+    private static Status statusAfterCancellingInsideProvider(boolean streaming) throws Exception {
+        CountDownLatch enteredProvider = new CountDownLatch(1);
+        com.cajunsystems.catalyst.model.Model blocking = new com.cajunsystems.catalyst.model.Model() {
+            @Override
+            public Completion complete(CompletionRequest request) {
+                return block();
+            }
+
+            @Override
+            public Completion stream(CompletionRequest request, TokenSink sink) {
+                return block();
+            }
+
+            /** Stands in for a provider call in flight when the cancel lands. */
+            private Completion block() {
+                enteredProvider.countDown();
+                try {
+                    Thread.sleep(30_000);
+                } catch (InterruptedException e) {
+                    Thread.currentThread().interrupt();
+                    // Exactly what the LangChain4j adapter does when its queue wait is interrupted.
+                    throw new RuntimeException("Interrupted while streaming a completion", e);
+                }
+                return Completion.ofText("never reached");
+            }
+        };
+
+        Task<String> task = streaming
+                ? ctx -> {
+                    StringBuilder sb = new StringBuilder();
+                    ctx.model().stream(ASK, sb::append);
+                    return sb.toString();
+                }
+                : ctx -> ctx.model().complete(ASK).message();
+
+        try (CatalystRuntime runtime = CatalystRuntime.builder()
+                .log(EventLogs.inMemory()).model(blocking).build()) {
+
+            var handle = runtime.execute(task, ExecutionOptions.withKey("k"));
+            assertThat(enteredProvider.await(5, TimeUnit.SECONDS)).isTrue();
+            runtime.cancel(handle.id());
+
+            try {
+                handle.result();
+            } catch (Throwable expected) {
+                // the provider's exception propagates; the folded status is what we are asserting
+            }
+            return runtime.inspect(handle.id()).status();
         }
     }
 

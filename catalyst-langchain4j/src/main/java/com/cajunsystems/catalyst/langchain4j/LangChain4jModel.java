@@ -30,6 +30,7 @@ import java.util.List;
 import java.util.Map;
 import java.util.concurrent.BlockingQueue;
 import java.util.concurrent.LinkedBlockingQueue;
+import java.util.concurrent.atomic.AtomicBoolean;
 
 /**
  * Adapts any LangChain4j {@link ChatModel} to Catalyst's {@link Model} SPI (spec §2). This is the
@@ -107,9 +108,17 @@ public final class LangChain4jModel implements Model {
             return Model.super.stream(request, sink); // no streaming provider: one chunk at the end
         }
         BlockingQueue<Object> queue = new LinkedBlockingQueue<>();
+        // Set once the consumer below stops draining — a throwing sink, or an interrupt. The provider
+        // keeps calling back until its stream ends regardless, and without this it would go on
+        // enqueueing chunks nobody will ever read. The queue is deliberately unbounded: a bounded one
+        // would park the provider's thread in put() with no consumer left to release it, trading a
+        // short-lived buffer for a permanently stuck thread. What bounds it in practice is that a
+        // completion's text is finite — the engine buffers the whole message anyway to record it.
+        AtomicBoolean abandoned = new AtomicBoolean(false);
         streamingChatModel.chat(toChatRequest(request), new StreamingChatResponseHandler() {
             @Override
             public void onPartialResponse(String partial) {
+                if (abandoned.get()) return;
                 if (partial != null && !partial.isEmpty()) queue.add(partial);
             }
 
@@ -136,8 +145,12 @@ public final class LangChain4jModel implements Model {
                 sink.accept((String) next);
             }
         } catch (InterruptedException e) {
+            abandoned.set(true);
             Thread.currentThread().interrupt();
             throw new RuntimeException("Interrupted while streaming a completion", e);
+        } catch (RuntimeException e) {
+            abandoned.set(true); // the sink threw, or the stream failed: nobody is draining any more
+            throw e;
         }
     }
 
