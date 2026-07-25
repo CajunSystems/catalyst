@@ -61,10 +61,9 @@
                 </configuration>
             </plugin>
             <!--
-              The manifest that makes the built jar usable as -javaagent:catalyst-agent.jar. Both entry
-              points are declared: Premain-Class for launch-time attach (the preferred mode, since no
-              task class is loaded yet) and Agent-Class for attaching to a running JVM. Retransformation
-              is required for the latter, which is also how install() reaches already-loaded classes.
+              Agent entry points. Premain-Class is launch-time attach (the preferred mode, since no task
+              class is loaded yet); Agent-Class is attach-to-running-JVM, which is also how install()
+              reaches already-loaded classes. Both need retransformation.
             -->
             <plugin>
                 <groupId>org.apache.maven.plugins</groupId>
@@ -79,6 +78,75 @@
                         </manifestEntries>
                     </archive>
                 </configuration>
+            </plugin>
+
+            <!--
+              A second, self-contained artifact for the -javaagent launch:
+              catalyst-agent-<version>-javaagent.jar.
+
+              A -javaagent jar is appended to the system classpath on its own; its Maven dependencies
+              are not. The plain library jar therefore cannot serve as one — premain dies with
+              NoClassDefFoundError on net.bytebuddy unless the application happens to carry Byte Buddy
+              itself, which is not something the agent should require of it. So Byte Buddy is bundled
+              here and relocated, keeping the agent's copy off the application's namespace.
+
+              What is deliberately NOT bundled is catalyst-core. Instrumented call sites must resolve
+              AutoCapture to the very class the runtime binds a Context on; a second copy inside this
+              jar would be a different class with its own thread-local, and every capture would silently
+              fall through to the plain JDK call. Core comes from the application, which by definition
+              already has it. The library jar stays the main artifact, so consumers using the
+              programmatic install() keep an ordinary dependency with an ordinary Byte Buddy on it.
+            -->
+            <plugin>
+                <groupId>org.apache.maven.plugins</groupId>
+                <artifactId>maven-shade-plugin</artifactId>
+                <version>3.5.3</version>
+                <executions>
+                    <execution>
+                        <phase>package</phase>
+                        <goals>
+                            <goal>shade</goal>
+                        </goals>
+                        <configuration>
+                            <shadedArtifactAttached>true</shadedArtifactAttached>
+                            <shadedClassifierName>javaagent</shadedClassifierName>
+                            <createDependencyReducedPom>false</createDependencyReducedPom>
+                            <artifactSet>
+                                <includes>
+                                    <include>net.bytebuddy:byte-buddy</include>
+                                    <include>net.bytebuddy:byte-buddy-agent</include>
+                                </includes>
+                            </artifactSet>
+                            <relocations>
+                                <relocation>
+                                    <pattern>net.bytebuddy</pattern>
+                                    <shadedPattern>com.cajunsystems.catalyst.agent.shaded.bytebuddy</shadedPattern>
+                                </relocation>
+                            </relocations>
+                            <filters>
+                                <filter>
+                                    <artifact>*:*</artifact>
+                                    <excludes>
+                                        <exclude>META-INF/*.SF</exclude>
+                                        <exclude>META-INF/*.DSA</exclude>
+                                        <exclude>META-INF/*.RSA</exclude>
+                                        <exclude>module-info.class</exclude>
+                                    </excludes>
+                                </filter>
+                            </filters>
+                            <transformers>
+                                <transformer implementation="org.apache.maven.plugins.shade.resource.ManifestResourceTransformer">
+                                    <manifestEntries>
+                                        <Premain-Class>com.cajunsystems.catalyst.agent.AutoCaptureAgent</Premain-Class>
+                                        <Agent-Class>com.cajunsystems.catalyst.agent.AutoCaptureAgent</Agent-Class>
+                                        <Can-Retransform-Classes>true</Can-Retransform-Classes>
+                                        <Can-Redefine-Classes>true</Can-Redefine-Classes>
+                                    </manifestEntries>
+                                </transformer>
+                            </transformers>
+                        </configuration>
+                    </execution>
+                </executions>
             </plugin>
         </plugins>
     </build>

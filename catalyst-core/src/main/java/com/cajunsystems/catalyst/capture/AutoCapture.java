@@ -143,6 +143,27 @@ public final class AutoCapture {
         return b.capture(source, real);
     }
 
+    /**
+     * Captures a draw from a <em>stateful</em> generator. The draw is always performed, even when the
+     * value is then substituted from the log and the drawn value discarded.
+     *
+     * <p>That looks wasteful and is load-bearing. A generator the task created is task-local state, and
+     * Catalyst's model is that task-local computation re-runs while only boundaries are substituted —
+     * so replay has to leave the generator where the recorded run left it. Skipping the draw would
+     * advance the recorded prefix's boundaries without advancing the generator, and a run that
+     * substitutes a prefix and then draws live (a resume, or a retry) would continue from a stale
+     * position: with a seeded generator the first live draw repeats a value the prefix already used.
+     *
+     * <p>Drawing on replay is safe because it is pure local computation — no external effect, nothing
+     * appended. Only the recorded value is ever returned to the task.
+     */
+    private static <T> T captureDraw(String source, Supplier<T> draw) {
+        Binding b = CURRENT.get();
+        if (b == null || b.suppressed) return draw.get();
+        T drawn = draw.get();
+        return b.capture(source, () -> drawn);
+    }
+
     // ── Time ───────────────────────────────────────────────────────────────────
     // Only the no-argument forms are captured. An overload taking an explicit Clock is the caller
     // already controlling determinism, and Catalyst does not second-guess it.
@@ -202,35 +223,35 @@ public final class AutoCapture {
     }
 
     public static int nextInt(RandomGenerator receiver) {
-        return capture("Random.nextInt", receiver::nextInt);
+        return captureDraw("Random.nextInt", receiver::nextInt);
     }
 
     public static int nextInt(RandomGenerator receiver, int bound) {
-        return capture("Random.nextInt", () -> receiver.nextInt(bound));
+        return captureDraw("Random.nextInt", () -> receiver.nextInt(bound));
     }
 
     public static int nextInt(RandomGenerator receiver, int origin, int bound) {
-        return capture("Random.nextInt", () -> receiver.nextInt(origin, bound));
+        return captureDraw("Random.nextInt", () -> receiver.nextInt(origin, bound));
     }
 
     public static long nextLong(RandomGenerator receiver) {
-        return capture("Random.nextLong", receiver::nextLong);
+        return captureDraw("Random.nextLong", receiver::nextLong);
     }
 
     public static double nextDouble(RandomGenerator receiver) {
-        return capture("Random.nextDouble", receiver::nextDouble);
+        return captureDraw("Random.nextDouble", receiver::nextDouble);
     }
 
     public static float nextFloat(RandomGenerator receiver) {
-        return capture("Random.nextFloat", receiver::nextFloat);
+        return captureDraw("Random.nextFloat", receiver::nextFloat);
     }
 
     public static boolean nextBoolean(RandomGenerator receiver) {
-        return capture("Random.nextBoolean", receiver::nextBoolean);
+        return captureDraw("Random.nextBoolean", receiver::nextBoolean);
     }
 
     public static double nextGaussian(RandomGenerator receiver) {
-        return capture("Random.nextGaussian", receiver::nextGaussian);
+        return captureDraw("Random.nextGaussian", receiver::nextGaussian);
     }
 
     /**
@@ -239,7 +260,7 @@ public final class AutoCapture {
      * than being the thing recorded.
      */
     public static void nextBytes(RandomGenerator receiver, byte[] bytes) {
-        byte[] drawn = capture("Random.nextBytes", () -> {
+        byte[] drawn = captureDraw("Random.nextBytes", () -> {
             byte[] fresh = new byte[bytes.length];
             receiver.nextBytes(fresh);
             return fresh;

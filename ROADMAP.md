@@ -83,7 +83,14 @@ the timeline UI) is unsequenced.
   real bytecode forced: Byte Buddy's default configuration skips synthetic methods, which would have
   exempted every lambda body; and draws are matched by declaring type against `RandomGenerator`, which
   covers `ThreadLocalRandom`/`SecureRandom`/`SplittableRandom` plus `nextInt(int,int)` (a method
-  `Random` does not declare). Gated by the v0.2 Auto-capture exit demo in CI. *Not captured (noted):
+  `Random` does not declare). Draws always advance their generator even when the value is substituted
+  — the generator is task-local state, so replay must leave it where the recorded run did, or a resume
+  that substitutes a prefix then draws live continues from a stale position. Shipped as two artifacts:
+  the library jar (ordinary dependency, for the programmatic `install()`) and a self-contained
+  `-javaagent`-classified jar with Byte Buddy bundled and relocated — a `-javaagent` jar does not get
+  its Maven dependencies, and bundling `catalyst-core` into it would give instrumented code a
+  *different* `AutoCapture` than the runtime binds. Gated by the v0.2 Auto-capture exit demo and a
+  packaging gate in CI. *Not captured (noted):
   `Random`'s stream methods (`ints()`/`doubles()`), the `now(Clock)`/`now(ZoneId)` overloads (an
   explicit time source is the caller's own determinism choice), and nondeterminism on threads the task
   spawns — the binding is per-thread by design.*

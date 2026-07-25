@@ -298,3 +298,70 @@ jobs:
           echo "$OUT" | grep -q "\[autocapture\] autocapture criterion holds" \
             || { echo "FAIL: autocapture demo did not pass its assertions"; exit 1; }
           echo "v0.2 Auto-capture exit criterion holds: unwrapped nondeterminism recorded and substituted."
+
+      # The -javaagent launch the README documents, exercised the way a user would: the agent jar alone,
+      # with NO Byte Buddy on the application classpath (a -javaagent jar does not get its Maven
+      # dependencies). This gates two failure modes that are invisible to the in-process tests — an
+      # agent jar missing its own dependencies, and a shaded copy of catalyst-core inside it, which
+      # would give instrumented code a *different* AutoCapture than the one the runtime binds, silently
+      # capturing nothing.
+      - name: v0.2 Auto-capture -javaagent packaging (launch-time attach, dependency-free)
+        run: |
+          set -euo pipefail
+          AGENT="$(ls catalyst-agent/target/catalyst-agent-*-javaagent.jar)"
+          echo "agent jar: $AGENT"
+
+          if unzip -l "$AGENT" | grep -q "com/cajunsystems/catalyst/capture/"; then
+            echo "FAIL: the agent jar bundles catalyst-core's AutoCapture bridge; instrumented code"
+            echo "      would target a duplicate class and capture nothing."; exit 1
+          fi
+          if unzip -l "$AGENT" | grep -qE " net/bytebuddy/"; then
+            echo "FAIL: Byte Buddy is not relocated in the agent jar"; exit 1
+          fi
+
+          mkdir -p /tmp/agentcheck/src/com/acme/tasks
+          cat > /tmp/agentcheck/src/com/acme/tasks/Main.java <<'JAVA'
+          package com.acme.tasks;
+          import com.cajunsystems.catalyst.Context;
+          import com.cajunsystems.catalyst.ExecutionInfo;
+          import com.cajunsystems.catalyst.Memory;
+          import com.cajunsystems.catalyst.Tool;
+          import com.cajunsystems.catalyst.capture.AutoCapture;
+          import com.cajunsystems.catalyst.model.Model;
+          import org.slf4j.Logger;
+          import java.time.Instant;
+          import java.util.ArrayList;
+          import java.util.List;
+          import java.util.UUID;
+          import java.util.function.Supplier;
+          public class Main {
+              static final class Probe implements Context {
+                  final List<String> labels = new ArrayList<>();
+                  @Override public <T> T effect(String label, Supplier<T> supplier) {
+                      labels.add(label); return supplier.get();
+                  }
+                  @Override public Model model() { throw new UnsupportedOperationException(); }
+                  @Override public <I, O> O call(Tool<I, O> t, I i) { throw new UnsupportedOperationException(); }
+                  @Override public Memory memory() { throw new UnsupportedOperationException(); }
+                  @Override public <T> T var(String n) { return null; }
+                  @Override public ExecutionInfo info() { throw new UnsupportedOperationException(); }
+                  @Override public Logger log() { throw new UnsupportedOperationException(); }
+              }
+              static String taskBody() { return Instant.now() + "|" + UUID.randomUUID(); }
+              public static void main(String[] args) {
+                  Probe probe = new Probe();
+                  try (AutoCapture.Scope scope = AutoCapture.bind(probe)) { taskBody(); }
+                  System.out.println("CAPTURED_LABELS=" + probe.labels);
+              }
+          }
+          JAVA
+
+          SLF4J="$(ls ~/.m2/repository/org/slf4j/slf4j-api/2.*/slf4j-api-2.*.jar | head -1)"
+          APPCP="/tmp/agentcheck/out:catalyst-core/target/classes:catalyst-events/target/classes:$SLF4J"
+          javac -cp "$APPCP" -d /tmp/agentcheck/out /tmp/agentcheck/src/com/acme/tasks/Main.java
+
+          OUT="$(java -javaagent:"$AGENT"=packages=com.acme.tasks -cp "$APPCP" com.acme.tasks.Main)"
+          echo "$OUT"
+          echo "$OUT" | grep -q "CAPTURED_LABELS=\[auto:Instant.now#0, auto:UUID.randomUUID#1\]" \
+            || { echo "FAIL: -javaagent launch did not capture through the application's bridge"; exit 1; }
+          echo "v0.2 Auto-capture packaging holds: -javaagent works standalone and binds the app's bridge."

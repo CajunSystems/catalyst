@@ -188,6 +188,36 @@ class AutoCaptureTest {
     }
 
     @Test
+    void advancesTheGeneratorEvenWhenTheDrawIsSubstituted() {
+        // A resume substitutes the recorded prefix and then runs live. The generator is task-local
+        // state, so it has to end up where the recorded run left it — otherwise the first live draw
+        // continues from a stale position and repeats a value the prefix already used.
+        RecordingContext recording = new RecordingContext();
+        int first;
+        int second;
+        try (AutoCapture.Scope scope = AutoCapture.bind(recording)) {
+            first = AutoCapture.nextInt(new Random(42));
+            second = AutoCapture.nextInt(new Random(42)); // fresh generator: same value as `first`
+        }
+        assertThat(second).isEqualTo(first);
+
+        // Now the resume: one recorded draw substituted, the next drawn live from the same generator.
+        RecordingContext resuming = new RecordingContext();
+        resuming.substituteFrom = Map.of("auto:Random.nextInt#0", first);
+        Random generator = new Random(42);
+        int substituted;
+        int live;
+        try (AutoCapture.Scope scope = AutoCapture.bind(resuming)) {
+            substituted = AutoCapture.nextInt(generator); // served from the log
+            live = AutoCapture.nextInt(generator);        // first genuinely live draw
+        }
+
+        assertThat(substituted).isEqualTo(first);
+        assertThat(live).isNotEqualTo(first);            // the generator moved on
+        assertThat(live).isEqualTo(new Random(42).ints().skip(1).findFirst().orElseThrow());
+    }
+
+    @Test
     void fillsNextBytesFromTheRecordedDraw() {
         RecordingContext ctx = new RecordingContext();
         byte[] recorded = new byte[16];

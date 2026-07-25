@@ -218,13 +218,15 @@ public final class StampedReport implements Task<String> {
 }
 ```
 
-Point the agent at the packages holding your task code, either at launch:
+Point the agent at the packages holding your task code, either at launch — using the self-contained
+`javaagent`-classified artifact, since a `-javaagent` jar does not get its Maven dependencies:
 
 ```bash
-java -javaagent:catalyst-agent.jar=packages=com.acme.tasks -cp ... com.acme.Main
+java -javaagent:catalyst-agent-<version>-javaagent.jar=packages=com.acme.tasks -cp ... com.acme.Main
 ```
 
-or from inside the process, which also retransforms classes that are already loaded:
+or from inside the process, which also retransforms classes that are already loaded — this path uses
+the ordinary `catalyst-agent` dependency:
 
 ```java
 AutoCaptureAgent.install(AutoCaptureConfig.forPackages("com.acme.tasks"));
