@@ -219,8 +219,39 @@ The substrate becomes a platform. This is where the other CajunSystems component
 - `await`/signal APIs on `Context` — no schema change needed (the slot is reserved).
 
 ### Distributed execution (spec §12)
-- Execution across **Cajun** actor nodes over a shared **Gumbo cluster** — same `EventLog` SPI, a
-  one-line bootstrap change from single-node. History and replay preserved across nodes.
+- Execution across many nodes over a shared **Gumbo cluster** — same `EventLog` SPI, history and
+  replay preserved across nodes. Design recorded in [`docs/distribution.md`](docs/distribution.md):
+  **the log is the arbiter, not a coordination service.** Single-writer-per-execution is enforced by
+  a *conditional append* (`append(id, event, expectedSeq)`) rather than by a distributed lock, so a
+  stale writer is rejected by storage even if the coordination layer is wrong. Nodes then compete for
+  work through shared storage — lease CAS to claim, the existing `resume(id)` to run, lease expiry to
+  reclaim — with no membership protocol, no leader election and no seed list: start another instance
+  and it participates. That makes placement an *optimisation*, not a correctness dependency, so
+  **Cajun**'s `ClusterActorSystem` can be swapped in behind `KeyedLock` (push-based assignment
+  instead of polling) whenever it is ready, and backed out cheaply if it is not. **Bayou** does not
+  distribute — it is single-process — but it shares Gumbo with Catalyst, so it is useful *within* a
+  node (supervising the claim loop, lease-renewal timers, death watch) and could later consume the
+  same primitives to become clustered itself. The gaps are all storage-side: conditional append, lease CAS with TTL, and a claimable-work index
+  (there is currently no way to ask the log *what needs running* — every read path starts from an id
+  you already hold). **Measured prerequisite:** Gumbo is not multi-writer safe today — two JVMs on one
+  directory were each handed `seq` 0,1,2 for the same execution and the log then reported 3 of the 6
+  appends. Nothing is physically lost (all six are in `log.dat`); `localId` assignment is process-local
+  and `index.dat` clobbers. `FoundationDBSequencer` does not help — it sequences the global `seqnum`,
+  while `localId` (which *is* Catalyst's `seq`) never passes through the `Sequencer`. So conditional
+  append must be a **Gumbo** primitive rather than a Catalyst-side wrapper, or the check races the
+  assignment beneath it.
+
+### In-doubt model completions (found while designing distribution)
+- A crash between `CompletionRequested` and `CompletionReceived` leaves the provider call **in
+  doubt**: it may have been accepted and billed, but no result reached the log, so a resume re-issues
+  it. Measured on the current single-node code — a log ending at `CompletionRequested` resumed and
+  invoked the model a second time. Catalyst already handles this for **tools** (`seed()` detects a
+  `ToolRequested` with no `ToolCompleted` and routes recovery through `InDoubtPolicy`), but there is
+  no equivalent for model completions: a trailing `CompletionRequested` sets `pendingRequestHash` and
+  is otherwise ignored. Closing the asymmetry — an in-doubt policy for model calls, keyed on the
+  recorded `requestHash` — is what "zero duplicate model calls" needs in order to hold under node
+  failure rather than only under graceful resume. Worth doing independently of distribution, which
+  merely makes the window far more frequent.
 
 ### Eval harness (spec §12)
 - Recorded production executions replayed against **candidate models/prompts** as a regression suite
