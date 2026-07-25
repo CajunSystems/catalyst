@@ -7,9 +7,16 @@ import com.fasterxml.jackson.databind.node.ObjectNode;
 import com.fasterxml.jackson.databind.node.TextNode;
 import org.junit.jupiter.api.Test;
 
+import java.time.Instant;
+import java.time.LocalDate;
+import java.time.LocalDateTime;
+import java.time.LocalTime;
+import java.time.OffsetDateTime;
+import java.time.ZonedDateTime;
 import java.util.List;
 import java.util.Map;
 import java.util.Set;
+import java.util.UUID;
 
 import static org.assertj.core.api.Assertions.assertThat;
 import static org.assertj.core.api.Assertions.assertThatThrownBy;
@@ -141,6 +148,43 @@ class PayloadCodecTest {
         assertThatThrownBy(() -> codec.fromTree(listEnvelope))
                 .isInstanceOf(IllegalStateException.class)
                 .hasMessageContaining("non-allowlisted");
+    }
+
+    /**
+     * Auto-capture records these as effect values, so each must survive the envelope round-trip
+     * exactly — a value that came back merely equivalent (a normalised zone, a truncated fraction)
+     * would replay as a different value than the one the task originally saw.
+     */
+    @Test
+    void roundTripsTheValueTypesAutoCaptureRecords() {
+        assertThat(roundTrip(UUID.fromString("3f2504e0-4f89-11d3-9a0c-0305e82c3301")))
+                .isEqualTo(UUID.fromString("3f2504e0-4f89-11d3-9a0c-0305e82c3301"));
+        assertThat(roundTrip(Instant.parse("2024-05-06T07:08:09.123456789Z")))
+                .isEqualTo(Instant.parse("2024-05-06T07:08:09.123456789Z"));
+        assertThat(roundTrip(LocalDate.of(2024, 5, 6))).isEqualTo(LocalDate.of(2024, 5, 6));
+        assertThat(roundTrip(LocalTime.of(7, 8, 9, 123456789))).isEqualTo(LocalTime.of(7, 8, 9, 123456789));
+        assertThat(roundTrip(LocalDateTime.of(2024, 5, 6, 7, 8, 9, 123456789)))
+                .isEqualTo(LocalDateTime.of(2024, 5, 6, 7, 8, 9, 123456789));
+        assertThat(roundTrip(OffsetDateTime.parse("2024-05-06T07:08:09.123456789+02:00")))
+                .isEqualTo(OffsetDateTime.parse("2024-05-06T07:08:09.123456789+02:00"));
+        assertThat(roundTrip(ZonedDateTime.parse("2024-05-06T07:08:09.123456789+02:00[Europe/Paris]")))
+                .isEqualTo(ZonedDateTime.parse("2024-05-06T07:08:09.123456789+02:00[Europe/Paris]"));
+    }
+
+    /** Live clock values, not just literals — whatever sub-second precision the platform yields survives. */
+    @Test
+    void roundTripsLiveClockValuesWithFullPrecision() {
+        Instant instant = Instant.now();
+        assertThat(roundTrip(instant)).isEqualTo(instant);
+
+        LocalDateTime localDateTime = LocalDateTime.now();
+        assertThat(roundTrip(localDateTime)).isEqualTo(localDateTime);
+
+        ZonedDateTime zoned = ZonedDateTime.now();
+        assertThat(roundTrip(zoned)).isEqualTo(zoned);
+
+        UUID uuid = UUID.randomUUID();
+        assertThat(roundTrip(uuid)).isEqualTo(uuid);
     }
 
     @Test

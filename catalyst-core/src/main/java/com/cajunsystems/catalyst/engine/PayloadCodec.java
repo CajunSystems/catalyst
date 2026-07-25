@@ -11,12 +11,18 @@ import java.math.BigDecimal;
 import java.math.BigInteger;
 import java.time.Duration;
 import java.time.Instant;
+import java.time.LocalDate;
+import java.time.LocalDateTime;
+import java.time.LocalTime;
+import java.time.OffsetDateTime;
+import java.time.ZonedDateTime;
 import java.util.ArrayList;
 import java.util.LinkedHashMap;
 import java.util.LinkedHashSet;
 import java.util.List;
 import java.util.Map;
 import java.util.Set;
+import java.util.UUID;
 
 /**
  * (De)serializes opaque payload values embedded in events — effect results and tool outputs — where
@@ -47,11 +53,18 @@ public final class PayloadCodec {
     private static final String NULL = "[]null";
     private static final String ARRAY_PREFIX = "[]array:"; // ARRAY_PREFIX + componentType
 
-    /** Non-record/enum value types that are safe to reconstruct from an untrusted log. */
+    /**
+     * Non-record/enum value types that are safe to reconstruct from an untrusted log. All are final,
+     * immutable, and deserialized by Jackson from a scalar — none can be driven to load or invoke
+     * anything else, which is the property the allowlist exists to guarantee. The {@code java.time}
+     * types and {@link UUID} are here because auto-capture records them as effect values.
+     */
     private static final Set<Class<?>> SAFE_TYPES = Set.of(
             String.class, Boolean.class, Character.class,
             Byte.class, Short.class, Integer.class, Long.class, Float.class, Double.class,
-            BigInteger.class, BigDecimal.class, Instant.class, Duration.class);
+            BigInteger.class, BigDecimal.class, UUID.class,
+            Instant.class, Duration.class, LocalDate.class, LocalTime.class, LocalDateTime.class,
+            ZonedDateTime.class, OffsetDateTime.class);
 
     private static final Map<String, Class<?>> PRIMITIVES = Map.of(
             "boolean", boolean.class, "byte", byte.class, "char", char.class, "short", short.class,
