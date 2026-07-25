@@ -82,7 +82,7 @@ $ java -jar my-agent.jar    # node A
 $ java -jar my-agent.jar    # node B — no config, no seed list, no join
 ```
 
-Both nodes poll for claimable work against the shared log and take what they can. Start more
+Both nodes subscribe to the shared task tag and take what they can claim. Start more
 instances and throughput rises; kill one and its executions are reclaimed and resumed. There is no
 membership protocol, no seed nodes, no split-brain to reason about, and no cluster state that can
 disagree with itself — because there is no cluster, only a shared log.
@@ -176,16 +176,45 @@ Three gaps, all in storage. None of them require an actor system.
 | Gap | Today | Needed |
 |---|---|---|
 | Conditional append | `append(id, event)` — unconditional | `append(id, event, expectedSeq)`, rejecting on mismatch |
-| Lease storage | `findByKey` / `putKey` — no CAS, no expiry | compare-and-set with TTL |
-| Claimable work | per-execution reads + `findByKey` only | an index of non-terminal, unleased executions |
+| Lease storage | Gumbo's tag KV exists (`setTagValue`/`getTagValue`/`deleteTagValue`) — but get/set only | **compare-and-set + TTL** on the existing KV |
+| Claimable work | ~~no way to ask the log what needs running~~ | **already possible** — see below |
 
-The first is additive: a default method that degrades to unconditional keeps every existing
-`EventLog` implementation compiling and single-node behaviour unchanged.
+Smaller than it first appeared, because two of the three are partly solved already.
 
-The third is the least obvious and the most consequential — there is currently **no way to ask the
-log "what needs running?"**. Every existing read path starts from an `ExecutionId` you already have.
-A distributed Catalyst needs the inverse query, and that shape should be settled before anything is
-built on it.
+**The KV already exists**, in Gumbo rather than Catalyst: `PersistenceAdapter.setTagValue /
+getTagValue / deleteTagValue`, surfaced as `LogView.getValue/setValue`, persisted to `kv.dat` in the
+file adapter and a `kvSubspace` in FoundationDB. Catalyst is already a client of it — `findByKey` /
+`putKey` (the idempotency index) and `readSnapshot` / `writeSnapshot` both go through it. So leases
+do not need a new store, only a **conditional** write on the store that is already there.
+
+Conditional append is additive on the Catalyst side: a default method that degrades to unconditional
+keeps every existing `EventLog` implementation compiling and single-node behaviour unchanged.
+
+### Claimable work: solved by dual-tagging, not by a new index
+
+An earlier draft of this document called out "no way to ask the log what needs running" as the least
+obvious and most consequential gap. It is neither — **Boudin already solves it on the same
+substrate**, and the technique falls out of Gumbo's design rather than extending it.
+
+A Gumbo entry can carry *multiple tags*, so one atomic append can write to both a per-instance stream
+and a shared queue:
+
+| Boudin tag | Contents |
+|---|---|
+| `workflow-history:{workflowId}` | the durable per-instance record |
+| `workflow-tasks:{taskQueue}` | the delivery channel workers read |
+
+> "a single atomic append writes the same entry to **both** … There is no separate two-phase write."
+
+Catalyst can do exactly this: tag `ExecutionCreated` into `catalyst-tasks/<queue>` alongside
+`catalyst-exec/<id>`. No new SPI, no secondary index to keep consistent, and — because the queue
+entry and the history entry are the *same append* — no window in which an execution is recorded but
+not yet claimable.
+
+Better still, Gumbo has **push subscriptions** (`SharedLogService.notifySubscribers`), which Boudin's
+`WorkflowDispatcher` uses to subscribe to its task tag rather than poll. Work delivery is therefore
+push already, which removes polling latency from the design and further reduces what a placement
+layer would add.
 
 On the Gumbo side, conditional append is natural for the FoundationDB adapter (real transactions)
 and enforceable with a local lock in the file adapter, which is sufficient because that adapter is
@@ -197,11 +226,11 @@ Both sibling projects were surveyed for this design. Neither provides a ready-ma
 it joins" story for Catalyst today, which is part of why the shared-storage design above is not
 merely the safer option but the only one that does not block on another project's roadmap.
 
-| | Cajun `ClusterActorSystem` | Bayou |
-|---|---|---|
-| Clustering | Yes — metadata store, leader election, actor→node assignment, `EXACTLY_ONCE` delivery | **None** — single process, no node identity or remote concept |
-| Durable substrate | Its own `MetadataStore` + `MessagingSystem` | **Gumbo** — the same log Catalyst uses |
-| Erlang-style primitives | Actors, supervision, messaging | Supervision trees, death watch, linking, timers, back-pressure, PubSub |
+| | Cajun `ClusterActorSystem` | Bayou | Boudin |
+|---|---|---|---|
+| Clustering | Yes — metadata store, leader election, actor→node assignment, `EXACTLY_ONCE` delivery | **None** — single process | **None** — no lease/claim/ownership in source |
+| Durable substrate | Its own `MetadataStore` + `MessagingSystem` | **Gumbo** | **Gumbo** |
+| Relevance | Placement, eventually | Erlang primitives *within* a node | **Closest sibling — same problem, same substrate** |
 
 **Cajun** is the closest fit for placement: `register(actorClass, executionId)` plus
 `routeMessage(executionId, …)` would give one owner node per execution and a mailbox that serialises
@@ -218,8 +247,17 @@ correctness lives, so it can be adopted when it is ready and backed out cheaply 
   conditional append and lease CAS to become clustered itself. The work compounds across the stack
   instead of being duplicated in it.
 
-That is the argument for putting distribution primitives in the log rather than in an actor system:
-Gumbo is the layer Catalyst and Bayou already share.
+**Boudin** is the closest sibling of the three and deserves the most attention: a Temporal-like
+durable workflow framework on Gumbo, whose crash recovery is recognisably the same design as
+Catalyst's — load history, cache prior results, substitute on replay, switch to live at the edge. It
+contributed the dual-tag technique above. It is also *single-worker-process*: there is no lease,
+claim, heartbeat or ownership anywhere in its source, so it sits behind the same Gumbo limitation
+Catalyst does.
+
+That sharpens the argument for putting these primitives in the log rather than in an actor system.
+Gumbo is the layer Catalyst, Bayou and Boudin all share, and multi-writer-safe id assignment plus a
+conditional append would unblock **all three** — Boudin most immediately, since it wants exactly the
+same worker-claiming story.
 
 ## What this does not give you
 
@@ -230,13 +268,14 @@ Being clear about the limits, since the comparison to BEAM invites them:
 - **In-flight non-boundary computation is lost when a node dies.** Work since the last recorded
   boundary is redone on resume. This is the trade Catalyst already made for determinism, and replay
   makes it cheap.
-- **Polling latency.** Until push-based assignment exists, a freshly submitted execution waits up to
-  one poll interval. This is the specific thing Cajun would later fix.
+- **No cross-node visibility of *running* work.** A node cannot ask "who is executing what right
+  now" except through lease rows. That is a monitoring gap, not a correctness one.
 
 ## Open questions
 
-- **Claimable-index shape.** A scan over a status index, a durable work topic, or a separate queue
-  tag? This is the SPI decision worth settling first.
+- **Where CAS belongs on the tag KV.** A `compareAndSetTagValue(tag, key, expected, value)` on
+  `PersistenceAdapter` is the obvious shape, and FDB gives it natively. The file adapter needs it only
+  to be correct within one process, since a shared *file* directory is not the multi-writer target.
 - **Lease duration and heartbeat interval.** Too short causes spurious reclaims under GC pressure;
   too long delays failover. Needs a default plus a knob.
 - **Fencing token vs. `expectedSeq`.** They may be the same thing: `expectedSeq` already fences the
