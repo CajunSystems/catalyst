@@ -231,9 +231,15 @@ The substrate becomes a platform. This is where the other CajunSystems component
   instead of polling) whenever it is ready, and backed out cheaply if it is not. **Bayou** does not
   distribute — it is single-process — but it shares Gumbo with Catalyst, so it is useful *within* a
   node (supervising the claim loop, lease-renewal timers, death watch) and could later consume the
-  same primitives to become clustered itself. The three gaps are all storage-side: conditional
-  append, lease CAS with TTL, and a claimable-work index (there is currently no way to ask the log
-  *what needs running* — every read path starts from an id you already hold).
+  same primitives to become clustered itself. The gaps are all storage-side: conditional append, lease CAS with TTL, and a claimable-work index
+  (there is currently no way to ask the log *what needs running* — every read path starts from an id
+  you already hold). **Measured prerequisite:** Gumbo is not multi-writer safe today — two JVMs on one
+  directory were each handed `seq` 0,1,2 for the same execution and the log then reported 3 of the 6
+  appends. Nothing is physically lost (all six are in `log.dat`); `localId` assignment is process-local
+  and `index.dat` clobbers. `FoundationDBSequencer` does not help — it sequences the global `seqnum`,
+  while `localId` (which *is* Catalyst's `seq`) never passes through the `Sequencer`. So conditional
+  append must be a **Gumbo** primitive rather than a Catalyst-side wrapper, or the check races the
+  assignment beneath it.
 
 ### Eval harness (spec §12)
 - Recorded production executions replayed against **candidate models/prompts** as a regression suite

@@ -93,6 +93,54 @@ thing: losing the node loses the state, so you need membership, a global registr
 Catalyst's state is not in the process — it is in the log, and `resume(id)` can reconstitute it
 anywhere. Solving the weaker problem is what lets the operational story be this small.
 
+## Prerequisite: Gumbo is not multi-writer safe today
+
+This was measured, not assumed. Two JVMs were pointed at one Gumbo directory and each appended three
+events to the same execution:
+
+```
+PROBE[A] assigned seqs: 0 1 2      PROBE[A] read back 3 events
+PROBE[B] assigned seqs: 0 1 2      PROBE[B] read back 3 events
+(a third process opening afterwards)  read back 3 events
+```
+
+Six appends went in; the log reports three. Both writers were handed **the same `seq` values** for
+the same execution, which is precisely the invariant at the top of this document being violated.
+
+Inspecting the raw files shows the damage is narrower than it looks, and therefore fixable:
+
+```
+log.dat (966 bytes) contains: AAA#0 AAA#1 AAA#2 BBB#0 BBB#1 BBB#2   ← all six survive
+```
+
+**Nothing was physically lost.** Every event is on disk. What broke is the *index* and the *id
+space*:
+
+1. **`localId` assignment is process-local.** `SharedLogService.localIdFor(tag)` keeps a
+   `ConcurrentHashMap<LogTag, AtomicLong>`, seeded once and lazily from
+   `adapter.getLocalIdCountForTag(tag)` — which in both the file adapter *and* the FoundationDB
+   adapter reads an in-memory `AtomicLong`, never storage. Two processes therefore seed identically
+   and diverge silently. Note this is not fixed by the FDB backend: `FoundationDBSequencer` sequences
+   only the **global `seqnum`** through a single `{root}/"seq"` key. `localId` never passes through
+   the `Sequencer` at all — and `localId` is exactly what Catalyst uses as `seq`.
+2. **`index.dat` is written per-process**, so the last process to close clobbers the other's view.
+3. **No cross-process guard.** There is no file lock on the directory; a second process opens a live
+   log without complaint.
+
+The single-process restart path is sound, and worth stating because it shows the recovery machinery
+already exists: a fresh process correctly continued at `3 4 5` after a previous one wrote `0 1 2`,
+because the index is rebuilt from a log scan on open. The gap is concurrency, not durability.
+
+### What this implies for conditional append
+
+It relocates the fix. Catalyst cannot layer conditional append *above* Gumbo, because Gumbo assigns
+the id: a Catalyst-side `expectedSeq` check would race the assignment underneath it — classic
+time-of-check/time-of-use. The comparison and the assignment have to be atomic **in the same store**.
+
+So `append(…, expectedSeq)` must be a **Gumbo primitive**, with `EventLog` merely exposing it. That
+reinforces, on correctness grounds, the conclusion the previous section reached on reuse grounds:
+these primitives belong in the log, not in Catalyst and not in an actor system.
+
 ## SPI changes
 
 Three gaps, all in storage. None of them require an actor system.
@@ -165,18 +213,32 @@ Being clear about the limits, since the comparison to BEAM invites them:
   too long delays failover. Needs a default plus a knob.
 - **Fencing token vs. `expectedSeq`.** They may be the same thing: `expectedSeq` already fences the
   write, so a separate token may be redundant. Worth resolving before implementing leases.
-- **Multiple `SharedLogService` instances over one Gumbo directory.** The file adapter is
-  single-process; a shared-log cluster is a Gumbo-side prerequisite for any of this and its
-  concurrency semantics need confirming rather than assuming.
+- **How Gumbo should assign `localId` across writers.** Routing it through the `Sequencer` (per-tag
+  rather than global) is the obvious move, since `FoundationDBSequencer` already demonstrates the
+  transactional pattern — but a per-tag FDB key per execution has cost implications worth weighing
+  against deriving `localId` from a persisted per-tag counter updated in the same transaction as the
+  append.
+- **Index durability under concurrent writers.** `index.dat` is currently written per-process and
+  clobbers. Rebuilding from a log scan on open already works; the question is whether that is
+  sufficient at scale or whether the index must become append-only.
 
 ## Phasing
 
-1. **Conditional append** in the `EventLog` SPI and Gumbo. Additive, testable single-node today, and
-   the piece everything else rests on.
-2. **Shared-log Gumbo cluster** — the durability substrate. Prerequisite for more than one node.
+0. **Gumbo multi-writer safety** — cross-process `localId` assignment and a non-clobbering index.
+   Measured above; this is a hard prerequisite and it is Gumbo-side work, not Catalyst work. Until it
+   lands, two Catalyst nodes on one log corrupt each other's executions, and no amount of care above
+   the log prevents it.
+1. **Conditional append**, implemented as a Gumbo primitive and exposed through the `EventLog` SPI.
+   Additive, testable single-node today, and the piece the correctness argument rests on.
+2. **Shared-log Gumbo cluster** — the durability substrate for more than one node.
 3. **Claim loop** — lease CAS plus the claimable index, driving the existing `resume(id)`. This is
    the point at which "start another instance" begins to work.
 4. **Push-based placement** — Cajun, or anything else, swapped in behind `KeyedLock`, which was
    deliberately left as the single seam for exactly this.
 
-Steps 1 and 3 are where the design risk is. Step 4 is where the convenience is, and it is optional.
+Steps 0 and 1 are where the design risk is, and both are in Gumbo. Step 4 is where the convenience
+is, and it is optional.
+
+A useful consequence of the ordering: steps 0 and 1 are worth doing regardless of whether Catalyst
+ever distributes. A log that assigns ids safely across writers and supports compare-and-append is
+simply a better log, and Bayou would benefit from the same work.
