@@ -131,6 +131,34 @@ The single-process restart path is sound, and worth stating because it shows the
 already exists: a fresh process correctly continued at `3 4 5` after a previous one wrote `0 1 2`,
 because the index is rebuilt from a log scan on open. The gap is concurrency, not durability.
 
+### Why the gap exists — and why it is narrow
+
+Gumbo's tags come from [Boki](https://github.com/ut-osa/boki), where they are *virtual log-stream
+identifiers*: one physical log serving many logical streams. That is exactly the right partitioning
+for per-execution streams, and Catalyst's one-tag-per-execution is the intended usage. The
+abstraction is not what needs fixing.
+
+The defect is visible in Gumbo's own Boki mapping table:
+
+| Boki concept | Gumbo |
+|---|---|
+| **Per-engine** `localid` | `LogEntry.localId()` — **per-tag** counter assigned at append time |
+
+`localId` was repurposed from per-*engine* to per-*tag* while keeping per-engine assignment. In Boki
+a node-local `AtomicLong` is correct by construction — each engine has its own localid space, and the
+sequencer reconciles them into the global `seqnum` afterwards. Under the redefinition, `localId`
+became a per-entity cursor shared by every writer of that tag, but the assignment stayed
+process-local. The semantics moved; the implementation did not.
+
+That also explains why `seqnum` is fine and `localId` is not. The distributed story for `seqnum` was
+anticipated and delivered (`FoundationDBSequencer`); `localId` never got the same treatment because
+in Boki it never needed it.
+
+The practical consequence is that the fix is not novel design work — it is applying the existing
+`Sequencer` pattern at tag granularity. And because the tag's current `localId` is already the
+tracked quantity, `expectedSeq` is a comparison against something the store holds anyway, which is
+what makes conditional append cheap to add rather than a new subsystem.
+
 ### What this implies for conditional append
 
 It relocates the fix. Catalyst cannot layer conditional append *above* Gumbo, because Gumbo assigns
@@ -213,11 +241,11 @@ Being clear about the limits, since the comparison to BEAM invites them:
   too long delays failover. Needs a default plus a knob.
 - **Fencing token vs. `expectedSeq`.** They may be the same thing: `expectedSeq` already fences the
   write, so a separate token may be redundant. Worth resolving before implementing leases.
-- **How Gumbo should assign `localId` across writers.** Routing it through the `Sequencer` (per-tag
-  rather than global) is the obvious move, since `FoundationDBSequencer` already demonstrates the
-  transactional pattern — but a per-tag FDB key per execution has cost implications worth weighing
-  against deriving `localId` from a persisted per-tag counter updated in the same transaction as the
-  append.
+- **Cost of per-tag sequencing.** Applying the `Sequencer` pattern at tag granularity is the natural
+  fix (see above), but a distinct FDB key per execution is a very different access pattern from one
+  global counter. Worth weighing against deriving `localId` from a persisted per-tag counter updated
+  in the *same transaction* as the append — which would also make `expectedSeq` free, since the
+  comparison and the increment become one operation.
 - **Index durability under concurrent writers.** `index.dat` is currently written per-process and
   clobbers. Rebuilding from a log scan on open already works; the question is whether that is
   sufficient at scale or whether the index must become append-only.
