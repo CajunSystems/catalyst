@@ -325,6 +325,26 @@ jobs:
             || { echo "FAIL: streaming demo did not pass its assertions"; exit 1; }
           echo "v0.2 Streaming exit criterion holds: $CHUNKS chunks live, one recorded completion, replay with zero model calls."
 
+      # The v0.2 timeline exit criterion (spec §12): an execution's folded state renders to a read-only
+      # HTML report. "self-contained: true" is the load-bearing assertion — a report with no scripts and
+      # no external references is one you can attach to a ticket or open from file:// years later.
+      # "deterministic: true" pins that it stays a pure fold of the log, not a live view.
+      - name: v0.2 Timeline exit demo (folded execution renders to a self-contained HTML report)
+        run: |
+          set -uo pipefail
+          CP="catalyst-api/target/classes:$(cat catalyst-api/target/cp.txt)"
+
+          echo "--- render an execution's timeline ---"
+          OUT="$(java -cp "$CP" com.cajunsystems.catalyst.api.Demo timeline)"
+          echo "$OUT"
+          echo "$OUT" | grep -q "self-contained (no scripts, no external refs): true" \
+            || { echo "FAIL: the report referenced something external"; exit 1; }
+          echo "$OUT" | grep -q "deterministic for a given log: true" \
+            || { echo "FAIL: the report is not a pure fold of the log"; exit 1; }
+          echo "$OUT" | grep -q "\[timeline\] timeline criterion holds" \
+            || { echo "FAIL: timeline demo did not pass its assertions"; exit 1; }
+          echo "v0.2 Timeline exit criterion holds: folded execution rendered to a portable HTML report."
+
       # The -javaagent launch the README documents, exercised the way a user would: the agent jar alone,
       # with NO Byte Buddy on the application classpath (a -javaagent jar does not get its Maven
       # dependencies). This gates two failure modes that are invisible to the in-process tests — an

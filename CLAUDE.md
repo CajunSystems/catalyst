@@ -40,6 +40,9 @@ intended source, but if `jitpack.io` is blocked, install Gumbo locally first:
   task packages into calls on `catalyst-core`'s `AutoCapture` bridge. The bridge lives in **core**, not
   here, so instrumented classes link without the agent. Depends on Byte Buddy; tests fork a JVM per
   class (agent installs are JVM-wide).
+- `catalyst-timeline` — `TimelineReport`: renders a folded `ExecutionState` as a self-contained HTML
+  page (header + roll-ups + step table). Read-only, post-hoc, pure function of the log; depends on
+  `catalyst-core` only — no templating engine, no web server. All interpolated log content is escaped.
 - `catalyst-otel` — `CatalystTracer`: folds an execution's event log into an OpenTelemetry trace
   (root span + per-boundary child spans + lifecycle annotations). Read-only, post-hoc, no runtime hook.
   Depends on the OpenTelemetry **API** only; the app supplies the SDK + exporter. Tested offline with
@@ -134,6 +137,13 @@ intended source, but if `jitpack.io` is blocked, install Gumbo locally first:
   executes between `CompletionRequested` and `CompletionReceived`, and a capture there would append
   into that gap and break replay. `LangChain4jModel.streaming(...)` bridges LangChain4j's async
   callbacks over a `BlockingQueue` so the sink runs on the **task's** thread, not the provider's.
+- **v0.2 Timeline UI** — `TimelineAcceptanceTest` + `Demo timeline`: a folded execution renders to a
+  self-contained HTML report via `TimelineReport.html(state)` / `writeTo(state, path)`. Same shape as
+  the OTel exporter: consumes `inspect(id)` (a fold), no runtime hook, so the log stays the only source
+  of truth. Two properties are gated because they are what make a report useful: **self-contained**
+  (no scripts/external refs — portable, openable from `file://`) and **deterministic** (a pure fold, so
+  reports diff cleanly). Everything interpolated is HTML-escaped — tool names, effect labels and
+  payloads are log content. Oversized payloads are elided at 2000 chars rather than inlined.
 - **v0.2 Observability / OTel exporter** — `OtelAcceptanceTest` + `Demo otel`: an execution's event log
   folds into one OpenTelemetry trace via `catalyst-otel`'s `CatalystTracer.export(id, events)` — a root
   span for the run, a child span per boundary (model/tool/effect/memory; model/tool carry real latency,

@@ -27,6 +27,7 @@ import com.cajunsystems.catalyst.model.Prompt;
 import com.cajunsystems.catalyst.mock.MockModel;
 import com.cajunsystems.catalyst.otel.CatalystTracer;
 import com.cajunsystems.catalyst.runtime.CatalystRuntime;
+import com.cajunsystems.catalyst.timeline.TimelineReport;
 import com.cajunsystems.catalyst.runtime.ExecutionHandle;
 import io.opentelemetry.api.trace.SpanKind;
 import io.opentelemetry.api.trace.StatusCode;
@@ -119,6 +120,8 @@ public final class Demo {
             autoCaptureDemo(Files.createTempDirectory("catalyst-autocapture-"));
         } else if (args.length >= 1 && args[0].equals("streaming")) {
             streamingDemo(Files.createTempDirectory("catalyst-streaming-"));
+        } else if (args.length >= 1 && args[0].equals("timeline")) {
+            timelineDemo(Files.createTempDirectory("catalyst-timeline-"));
         } else if (args.length >= 1 && args[0].equals("schema")) {
             schemaDemo();
         } else {
@@ -730,6 +733,75 @@ public final class Demo {
             }
             System.out.println("[streaming] streaming criterion holds: incremental delivery on the live"
                     + " run, one recorded completion, exact replay with zero model calls.");
+        }
+    }
+
+    /**
+     * The v0.2 timeline exit demo (spec §12): an execution's folded state is rendered as a
+     * self-contained HTML report — the read-only view over {@code inspect(id)}.
+     *
+     * <p>Like the OTel exporter, this is post-hoc and read-only: it consumes an {@code ExecutionState},
+     * which is itself only a fold of the log, and installs no runtime hook. So the report needs no
+     * cooperation from the execution that produced it — any log, live or long finished, renders.
+     */
+    private static void timelineDemo(Path dir) throws Exception {
+        MockModel model = summarizerModel();
+        Path sandbox = Files.createDirectory(dir.resolve("sandbox"));
+
+        com.cajunsystems.catalyst.tools.FilesystemTool fs =
+                new com.cajunsystems.catalyst.tools.FilesystemTool(sandbox);
+
+        // A task with one of every boundary kind, so the report has something to show.
+        Task<String> mixed = ctx -> {
+            String summary = ctx.model().complete(STEP1).message();
+            ctx.call(fs, com.cajunsystems.catalyst.tools.FilesystemTool.Command.write("out.txt", summary));
+            ctx.memory().put("summary", summary);
+            String stamp = ctx.effect("stamp", () -> "2024-01-01T00:00:00Z");
+            String finalAnswer = ctx.model().complete(STEP2).message();
+            return summary + "|" + finalAnswer + "|" + stamp;
+        };
+
+        try (CatalystRuntime runtime = Catalyst.builder()
+                .log(GumboEventLog.at(Files.createDirectory(dir.resolve("log"))))
+                .model(model)
+                .costModel(CostModel.perMillionTokens(3.0, 15.0))
+                .build()) {
+
+            ExecutionHandle<String> handle = runtime.execute(mixed, ExecutionOptions.withKey(KEY));
+            handle.result();
+            ExecutionState state = runtime.inspect(handle.id());
+
+            Path report = TimelineReport.writeTo(state, dir.resolve("timeline.html"));
+            String html = Files.readString(report);
+            Timeline t = state.timelineView();
+
+            System.out.println("[timeline] recorded execution " + handle.id().value());
+            System.out.println("[timeline] steps folded: " + state.timeline().size()
+                    + " (" + t.modelCalls() + " model, " + t.toolCalls() + " tool)");
+            System.out.println("[timeline] report written: " + report + " (" + html.length() + " bytes)");
+
+            // Self-contained is the property that makes a report portable — attach it to a ticket,
+            // commit it as a build artifact, open it from file:// with nothing else present.
+            boolean selfContained = !html.contains("http://") && !html.contains("https://")
+                    && !html.contains("<script") && !html.contains("<link") && !html.contains("<img");
+            System.out.println("[timeline] self-contained (no scripts, no external refs): " + selfContained);
+
+            // The report is a pure function of the fold, so the same log always renders the same page.
+            boolean deterministic = TimelineReport.html(state).equals(TimelineReport.html(state));
+            System.out.println("[timeline] deterministic for a given log: " + deterministic);
+
+            if (!selfContained) throw new AssertionError("report referenced something external");
+            if (!deterministic) throw new AssertionError("report is not a pure fold of the log");
+            for (String kind : new String[]{"MODEL", "TOOL", "EFFECT", "MEMORY_WRITE", "COMPLETED"}) {
+                if (!html.contains(">" + kind + "<")) {
+                    throw new AssertionError("report is missing a " + kind + " step");
+                }
+            }
+            if (!html.contains(handle.id().value())) {
+                throw new AssertionError("report does not identify the execution");
+            }
+            System.out.println("[timeline] timeline criterion holds: the folded execution rendered to a"
+                    + " self-contained, deterministic HTML report.");
         }
     }
 

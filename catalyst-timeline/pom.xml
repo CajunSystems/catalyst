@@ -1,0 +1,34 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<project xmlns="http://maven.apache.org/POM/4.0.0"
+         xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance"
+         xsi:schemaLocation="http://maven.apache.org/POM/4.0.0 http://maven.apache.org/xsd/maven-4.0.0.xsd">
+    <modelVersion>4.0.0</modelVersion>
+
+    <parent>
+        <groupId>com.cajunsystems</groupId>
+        <artifactId>catalyst-parent</artifactId>
+        <version>0.1.0-SNAPSHOT</version>
+    </parent>
+
+    <artifactId>catalyst-timeline</artifactId>
+    <name>Catalyst Timeline</name>
+    <description>Read-only HTML report over an execution's folded timeline (spec §12).</description>
+
+    <dependencies>
+        <!--
+          catalyst-core only, and nothing else on purpose. The report is a pure function from a folded
+          ExecutionState to a self-contained HTML string — no templating engine, no web server, no
+          runtime hook. The log is still the only source of truth; this just renders a fold of it.
+        -->
+        <dependency>
+            <groupId>com.cajunsystems</groupId>
+            <artifactId>catalyst-core</artifactId>
+        </dependency>
+
+        <dependency>
+            <groupId>com.cajunsystems</groupId>
+            <artifactId>catalyst-runtime</artifactId>
+            <scope>test</scope>
+        </dependency>
+    </dependencies>
+</project>

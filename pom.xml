@@ -21,6 +21,7 @@
         <module>catalyst-tools</module>
         <module>catalyst-langchain4j</module>
         <module>catalyst-otel</module>
+        <module>catalyst-timeline</module>
         <module>catalyst-api</module>
     </modules>
 
@@ -85,6 +86,11 @@
             <dependency>
                 <groupId>com.cajunsystems</groupId>
                 <artifactId>catalyst-agent</artifactId>
+                <version>${catalyst.version}</version>
+            </dependency>
+            <dependency>
+                <groupId>com.cajunsystems</groupId>
+                <artifactId>catalyst-timeline</artifactId>
                 <version>${catalyst.version}</version>
             </dependency>
 
