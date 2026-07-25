@@ -15,6 +15,7 @@ import com.cajunsystems.catalyst.log.EventLog;
 import com.cajunsystems.catalyst.model.Completion;
 import com.cajunsystems.catalyst.model.CompletionRequest;
 import com.cajunsystems.catalyst.model.Model;
+import com.cajunsystems.catalyst.model.TokenSink;
 import com.fasterxml.jackson.databind.JsonNode;
 import com.fasterxml.jackson.databind.ObjectMapper;
 import org.slf4j.Logger;
@@ -214,20 +215,51 @@ public final class ReplayingContext implements Context {
 
     @Override
     public Model model() {
-        return this::completeRecorded;
+        return new RecordingModel();
     }
 
-    private Completion completeRecorded(CompletionRequest request) {
+    /**
+     * The model handed to task code. Both entry points fold onto one recorded boundary: streaming
+     * changes how the text is <em>delivered</em>, never what is recorded, so a streamed execution and
+     * a non-streamed one produce the same events and replay identically.
+     */
+    private final class RecordingModel implements Model {
+        @Override
+        public Completion complete(CompletionRequest request) {
+            return modelBoundary(request, null);
+        }
+
+        @Override
+        public Completion stream(CompletionRequest request, TokenSink sink) {
+            if (sink == null) throw new IllegalArgumentException("sink");
+            return modelBoundary(request, sink);
+        }
+    }
+
+    /**
+     * The model boundary. With {@code sink == null} this is a plain completion; otherwise the text is
+     * streamed to the sink first and the assembled completion is recorded exactly as before. On the
+     * substituted path the recorded message is re-emitted to the sink as a single chunk — the task
+     * rebuilds its result from what it receives, so a replay that delivered nothing would diverge at
+     * the task's own output.
+     */
+    private Completion modelBoundary(CompletionRequest request, TokenSink sink) {
         Optional<Boundary> recorded = pollExpected(CompletionReceived.class, "model completion");
         if (recorded.isPresent()) {
             Boundary b = recorded.get();
             String actualHash = Hashing.canonicalRequestHash(request);
             if (b.hash() == null || b.hash().equals(actualHash)) {
+                Completion completion;
                 try {
-                    return eventMapper.treeToValue(((CompletionReceived) b.event()).completion(), Completion.class);
+                    completion = eventMapper.treeToValue(
+                            ((CompletionReceived) b.event()).completion(), Completion.class);
                 } catch (Exception e) {
                     throw new IllegalStateException("Failed to substitute recorded completion", e);
                 }
+                if (sink != null && !completion.message().isEmpty()) {
+                    guarded(sink).accept(completion.message());
+                }
+                return completion;
             }
             // hash mismatch → STRICT throws, BRANCH forks and falls through to live
             forkOrThrow(b.seq(), "model request " + b.hash(), "model request " + actualHash);
@@ -240,13 +272,34 @@ public final class ReplayingContext implements Context {
         append(new PromptBuilt(now(), Hashing.sha256(canonicalPrompt(request)), eventMapper.valueToTree(request.prompt())));
         append(new CompletionRequested(now(), requestHash));
         long t0 = System.nanoTime();
-        Completion completion = realModel.complete(request);
+        Completion completion = sink == null
+                ? realModel.complete(request)
+                : realModel.stream(request, guarded(sink));
         long latencyMillis = (System.nanoTime() - t0) / 1_000_000;
         append(new CompletionReceived(now(), eventMapper.valueToTree(completion),
                 completion.usage().promptTokens(), completion.usage().completionTokens(),
                 latencyMillis, costModel.usd(completion.usage().promptTokens(), completion.usage().completionTokens()),
                 completion.finishReason()));
         return completion;
+    }
+
+    /**
+     * Wraps a sink so auto-capture is suppressed while it runs. The sink is task code executing
+     * <em>inside</em> this boundary — between {@code CompletionRequested} and {@code CompletionReceived}
+     * — so a capture in it would append its event in that gap. Replay would then meet an
+     * {@code EffectRecorded} where it expected the completion and report a structural divergence.
+     * Applied on both the live and the substituted path, so the sink sees identical conditions either
+     * way.
+     */
+    private TokenSink guarded(TokenSink sink) {
+        return text -> {
+            boolean previousSuppression = AutoCapture.suppress();
+            try {
+                sink.accept(text);
+            } finally {
+                AutoCapture.restore(previousSuppression);
+            }
+        };
     }
 
     private String canonicalPrompt(CompletionRequest request) {
