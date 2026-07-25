@@ -305,11 +305,6 @@ jobs:
       # writes — so "chunks during record" > 1 alongside "model calls during replay: 0" is the whole
       # semantics: real incremental delivery live, full substitution on replay.
       - name: v0.2 Streaming exit demo (incremental delivery, one recorded completion, exact replay)
-      # The v0.2 timeline exit criterion (spec §12): an execution's folded state renders to a read-only
-      # HTML report. "self-contained: true" is the load-bearing assertion — a report with no scripts and
-      # no external references is one you can attach to a ticket or open from file:// years later.
-      # "deterministic: true" pins that it stays a pure fold of the log, not a live view.
-      - name: v0.2 Timeline exit demo (folded execution renders to a self-contained HTML report)
         run: |
           set -uo pipefail
           CP="catalyst-api/target/classes:$(cat catalyst-api/target/cp.txt)"
@@ -329,6 +324,16 @@ jobs:
           echo "$OUT" | grep -q "\[streaming\] streaming criterion holds" \
             || { echo "FAIL: streaming demo did not pass its assertions"; exit 1; }
           echo "v0.2 Streaming exit criterion holds: $CHUNKS chunks live, one recorded completion, replay with zero model calls."
+
+      # The v0.2 timeline exit criterion (spec §12): an execution's folded state renders to a read-only
+      # HTML report. "self-contained: true" is the load-bearing assertion — a report with no scripts and
+      # no external references is one you can attach to a ticket or open from file:// years later.
+      # "deterministic: true" pins that it stays a pure fold of the log, not a live view.
+      - name: v0.2 Timeline exit demo (folded execution renders to a self-contained HTML report)
+        run: |
+          set -uo pipefail
+          CP="catalyst-api/target/classes:$(cat catalyst-api/target/cp.txt)"
+
           echo "--- render an execution's timeline ---"
           OUT="$(java -cp "$CP" com.cajunsystems.catalyst.api.Demo timeline)"
           echo "$OUT"
