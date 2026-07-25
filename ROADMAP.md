@@ -219,8 +219,21 @@ The substrate becomes a platform. This is where the other CajunSystems component
 - `await`/signal APIs on `Context` — no schema change needed (the slot is reserved).
 
 ### Distributed execution (spec §12)
-- Execution across **Cajun** actor nodes over a shared **Gumbo cluster** — same `EventLog` SPI, a
-  one-line bootstrap change from single-node. History and replay preserved across nodes.
+- Execution across many nodes over a shared **Gumbo cluster** — same `EventLog` SPI, history and
+  replay preserved across nodes. Design recorded in [`docs/distribution.md`](docs/distribution.md):
+  **the log is the arbiter, not a coordination service.** Single-writer-per-execution is enforced by
+  a *conditional append* (`append(id, event, expectedSeq)`) rather than by a distributed lock, so a
+  stale writer is rejected by storage even if the coordination layer is wrong. Nodes then compete for
+  work through shared storage — lease CAS to claim, the existing `resume(id)` to run, lease expiry to
+  reclaim — with no membership protocol, no leader election and no seed list: start another instance
+  and it participates. That makes placement an *optimisation*, not a correctness dependency, so
+  **Cajun**'s `ClusterActorSystem` can be swapped in behind `KeyedLock` (push-based assignment
+  instead of polling) whenever it is ready, and backed out cheaply if it is not. **Bayou** does not
+  distribute — it is single-process — but it shares Gumbo with Catalyst, so it is useful *within* a
+  node (supervising the claim loop, lease-renewal timers, death watch) and could later consume the
+  same primitives to become clustered itself. The three gaps are all storage-side: conditional
+  append, lease CAS with TTL, and a claimable-work index (there is currently no way to ask the log
+  *what needs running* — every read path starts from an id you already hold).
 
 ### Eval harness (spec §12)
 - Recorded production executions replayed against **candidate models/prompts** as a regression suite
