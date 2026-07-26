@@ -115,6 +115,10 @@ thing: losing the node loses the state, so you need membership, a global registr
 Catalyst's state is not in the process — it is in the log, and `resume(id)` can reconstitute it
 anywhere. Solving the weaker problem is what lets the operational story be this small.
 
+> The full set of Gumbo defects and missing primitives this design depends on — with the evidence for
+> each, a suggested order, and the tests that would have caught them — is written up separately in
+> [`gumbo-requirements.md`](gumbo-requirements.md).
+
 ## Prerequisite: Gumbo is not multi-writer safe today
 
 This was measured, not assumed. Two JVMs were pointed at one Gumbo directory and each appended three
