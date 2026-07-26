@@ -15,6 +15,7 @@ import com.cajunsystems.gumbo.core.LogEntry;
 import com.cajunsystems.gumbo.core.LogTag;
 import com.cajunsystems.gumbo.persistence.FileBasedPersistenceAdapter;
 import com.cajunsystems.gumbo.persistence.InMemoryPersistenceAdapter;
+import com.cajunsystems.gumbo.persistence.LogAlreadyOpenException;
 import com.cajunsystems.gumbo.persistence.PersistenceAdapter;
 import com.cajunsystems.gumbo.service.SharedLogConfig;
 import com.cajunsystems.gumbo.service.SharedLogService;
@@ -33,8 +34,8 @@ import java.util.concurrent.ConcurrentHashMap;
 /**
  * A durable {@link EventLog} backed by the Gumbo shared log (spec §8) — the flagship embedded mode.
  * The mapping is direct: each execution is one Gumbo {@link LogTag}
- * ({@code catalyst-exec/<id>}); Gumbo's per-tag {@code localId} is Catalyst's dense per-execution
- * {@code seq}; a {@code TypedLogView<CatalystEvent>} handles serialization; and the idempotency
+ * ({@code catalyst-exec/<id>}); Gumbo's per-tag {@code streamVersion} is Catalyst's dense
+ * per-execution {@code seq}; a {@code TypedLogView<CatalystEvent>} handles serialization; and the idempotency
  * index is a durable tag-scoped key-value store. Swapping the persistence adapter switches between
  * file-backed durability and in-memory — the same SPI a future Gumbo <em>cluster</em> backend uses.
  */
@@ -47,7 +48,7 @@ public final class GumboEventLog implements EventLog {
     private final SharedLogService service;
     private final EventLogSerializer serializer;
     private final Map<ExecutionId, TypedLogView<CatalystEvent>> views = new ConcurrentHashMap<>();
-    /** Cache of the last seq (Gumbo localId) per execution, so latestSeq is O(1) after an append. */
+    /** Cache of the last seq (Gumbo streamVersion) per execution, so latestSeq is O(1) after an append. */
     private final Map<ExecutionId, Long> lastSeq = new ConcurrentHashMap<>();
     private final LogView indexView;
     private final LogView snapshotView;
@@ -109,6 +110,11 @@ public final class GumboEventLog implements EventLog {
                     .persistenceAdapter(adapter)
                     .build();
             return new GumboEventLog(SharedLogService.open(config), codec);
+        } catch (LogAlreadyOpenException e) {
+            // The file adapter is single-writer and says so precisely. Keep its message at the top
+            // level rather than burying it as a cause — a directory already held by another process
+            // is a configuration mistake, and the whole value of the check is that it is legible.
+            throw new UncheckedIOException(e.getMessage(), e);
         } catch (IOException e) {
             throw new UncheckedIOException("Failed to open Gumbo log", e);
         }
@@ -121,30 +127,30 @@ public final class GumboEventLog implements EventLog {
 
     @Override
     public long append(ExecutionId executionId, CatalystEvent event) {
-        long seq = viewFor(executionId).append(event).join().localId();
+        long seq = viewFor(executionId).append(event).join().streamVersion();
         lastSeq.merge(executionId, seq, Math::max);
         return seq;
     }
 
     @Override
     public List<SequencedEvent> read(ExecutionId executionId) {
-        List<LogEntry> entries = viewFor(executionId).rawView().readAll().join();
-        List<SequencedEvent> events = new ArrayList<>(entries.size());
-        for (LogEntry entry : entries) {
-            events.add(new SequencedEvent(entry.localId(), serializer.deserialize(entry.dataUnsafe())));
-        }
-        return events;
+        return decode(viewFor(executionId).rawView().readAll().join());
     }
 
     @Override
     public List<SequencedEvent> readFrom(ExecutionId executionId, long afterSeqExclusive) {
-        if (afterSeqExclusive < 0) return read(executionId);
-        // Gumbo localId == Catalyst seq; readAfter returns entries strictly greater than the argument,
-        // so the durable log reads only the tail rather than the whole stream.
-        List<LogEntry> entries = viewFor(executionId).rawView().readAfter(afterSeqExclusive).join();
+        // Catalyst's seq is the execution tag's own streamVersion, so the tail read must be
+        // version-keyed. readAfter is keyed on the log's *global* seqnum, which coincides with the
+        // stream's numbering only while the log holds a single execution — with a second execution
+        // sharing it, that read silently returns events already folded into the snapshot and the
+        // reducer re-applies them. readAfterVersion takes -1 as "the whole stream".
+        return decode(viewFor(executionId).rawView().readAfterVersion(afterSeqExclusive).join());
+    }
+
+    private List<SequencedEvent> decode(List<LogEntry> entries) {
         List<SequencedEvent> events = new ArrayList<>(entries.size());
         for (LogEntry entry : entries) {
-            events.add(new SequencedEvent(entry.localId(), serializer.deserialize(entry.dataUnsafe())));
+            events.add(new SequencedEvent(entry.streamVersion(), serializer.deserialize(entry.dataUnsafe())));
         }
         return events;
     }
@@ -153,10 +159,10 @@ public final class GumboEventLog implements EventLog {
     public long latestSeq(ExecutionId executionId) {
         Long cached = lastSeq.get(executionId);
         if (cached != null) return cached;
-        // Cold path (e.g. right after reopen, before any append): scan once and cache.
-        List<LogEntry> entries = viewFor(executionId).rawView().readAll().join();
-        if (entries.isEmpty()) return -1;
-        long seq = entries.get(entries.size() - 1).localId();
+        // Cold path (e.g. right after reopen, before any append): ask the tag for its own tip, which
+        // Gumbo maintains — and which is -1 for an execution that has never been written.
+        long seq = viewFor(executionId).rawView().getLatestVersion();
+        if (seq < 0) return -1;
         lastSeq.merge(executionId, seq, Math::max);
         return seq;
     }

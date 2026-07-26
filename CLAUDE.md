@@ -14,7 +14,7 @@ mvn install            # full reactor + tests
 mvn -pl catalyst-core -am install   # a single module and its deps
 ```
 
-**Gumbo dependency:** `catalyst-gumbo` depends on `com.cajunsystems:gumbo:0.2.0`. JitPack is the
+**Gumbo dependency:** `catalyst-gumbo` depends on `com.cajunsystems:gumbo:0.3.0`. JitPack is the
 intended source, but if `jitpack.io` is blocked, install Gumbo locally first:
 `mvn -f /path/to/gumbo/pom.xml install -DskipTests`.
 
@@ -28,8 +28,10 @@ intended source, but if `jitpack.io` is blocked, install Gumbo locally first:
   work. This is the heart of the system.
 - `catalyst-runtime` — `CatalystRuntime` (virtual-thread scheduler, lifecycle, idempotency) +
   `InMemoryEventLog`.
-- `catalyst-gumbo` — `GumboEventLog`: one Gumbo `LogTag` per execution; Gumbo `localId` == Catalyst
-  `seq`; durable KV for the idempotency index.
+- `catalyst-gumbo` — `GumboEventLog`: one Gumbo `LogTag` per execution; Gumbo `streamVersion` ==
+  Catalyst `seq`; durable KV for the idempotency index. Tail reads must be **version-keyed**
+  (`readAfterVersion`), not `readAfter` — the latter is keyed on the log's global `seqnum`, which
+  equals a stream's own numbering only while the log holds one execution (see "Gumbo 0.3.0" below).
 - `catalyst-tools`, `catalyst-api` — built-in tools (`ClockTool`, `CalculatorTool`, `HttpTool`,
   `FilesystemTool`) and the `Catalyst` facade.
 - `catalyst-langchain4j` — `LangChain4jModel`: wraps any LangChain4j `ChatModel` (real providers).
@@ -151,5 +153,19 @@ intended source, but if `jitpack.io` is blocked, install Gumbo locally first:
   as span events on the root. Root status is OK/ERROR from the folded terminal state. Read-only and
   post-hoc (consumes `runtime.log().read(id)`), so the log *is* the trace. The module depends on the
   OTel **API** only; tests drive a real SDK into an in-memory exporter offline.
+- **Gumbo 0.3.0** — `GumboEventLogTest` (two shared-log cases + the single-writer case) +
+  `SnapshotAcceptanceTest.warmInspectMatchesColdWhenAnotherExecutionSharesTheLog`: the log-layer fixes
+  from `docs/gumbo-requirements.md`. The one that mattered is **D4** — Catalyst's `seq` is a per-tag
+  position, but `readFrom` passed it to `readAfter`, which is keyed on the log's *global* `seqnum`. The
+  two numbers are equal only while a log holds one execution, so with a second execution present the
+  snapshot warm read returned the whole stream and the reducer re-folded the snapshot's own prefix —
+  every timeline step, token count and cost double-counted. Fixed by `readAfterVersion`;
+  `latestSeq`'s cold path is `getLatestVersion()`. **0.3.0 does not fix this on its own** — it adds the
+  version-keyed API, and Catalyst has to call it, which is why the upgrade alone left the whole suite
+  green. Also: `localId` → `streamVersion` (0.2.0 accessors still work, deprecated), and the file
+  adapter now takes an exclusive directory lock — `GumboEventLog` surfaces its message rather than
+  burying it, and the lock is released on close/process death so crash→resume still reopens.
+  **When adding a log-layer test, put a second execution in the log**: a single-execution fixture is
+  the one configuration where these bugs are invisible, which is how D4 shipped.
 
 CI (`.github/workflows/ci.yml`) runs all exit demos as gates — it is the source of truth per phase.

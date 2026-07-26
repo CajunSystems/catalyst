@@ -32,7 +32,7 @@
         <catalyst.version>0.1.0-SNAPSHOT</catalyst.version>
         <jackson.version>2.17.2</jackson.version>
         <slf4j.version>2.0.12</slf4j.version>
-        <gumbo.version>0.2.0</gumbo.version>
+        <gumbo.version>0.3.0</gumbo.version>
         <langchain4j.version>1.8.0</langchain4j.version>
         <opentelemetry.version>1.45.0</opentelemetry.version>
         <bytebuddy.version>1.15.11</bytebuddy.version>
@@ -42,11 +42,11 @@
     </properties>
 
     <!--
-      Gumbo (com.cajunsystems:gumbo:0.2.0) is the durable log backend. The intended delivery was
+      Gumbo (com.cajunsystems:gumbo:0.3.0) is the durable log backend. The intended delivery was
       JitPack, but jitpack.io is blocked by this environment's egress policy, so Gumbo is resolved
       from the local Maven repository instead: build it once with
           mvn -f /path/to/gumbo/pom.xml install -DskipTests
-      which installs com.cajunsystems:gumbo:0.2.0 into ~/.m2. Its own dependencies resolve from
+      which installs com.cajunsystems:gumbo:0.3.0 into ~/.m2. Its own dependencies resolve from
       Maven Central. No Gumbo source is vendored into this build.
     -->
 

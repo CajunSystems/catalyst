@@ -19,7 +19,7 @@ jobs:
     name: Build & test (JDK 21)
     runs-on: ubuntu-latest
     env:
-      GUMBO_VERSION: "0.2.0"
+      GUMBO_VERSION: "0.3.0"
     steps:
       - name: Checkout Catalyst
         uses: actions/checkout@v4
