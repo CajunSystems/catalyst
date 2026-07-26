@@ -90,8 +90,10 @@ Coordinates: `com.cajunsystems:catalyst-*`. Root package `com.cajunsystems.catal
 
 ## How Catalyst maps onto Gumbo
 
-Each execution is one Gumbo `LogTag` (`catalyst-exec/<id>`). Gumbo's per-tag `localId` is Catalyst's
-dense per-execution `seq`; a `TypedLogView<CatalystEvent>` handles serialization; and the
+Each execution is one Gumbo `LogTag` (`catalyst-exec/<id>`). Gumbo's per-tag `streamVersion` is
+Catalyst's dense per-execution `seq` — so every tail read is version-keyed (`readAfterVersion`), never
+keyed on the log's global `seqnum`, which only coincides with a stream's own numbering while the log
+holds a single execution; a `TypedLogView<CatalystEvent>` handles serialization; and the
 idempotency-key → execution index is a durable, tag-scoped key-value store. Swapping the Gumbo
 persistence adapter switches between file-backed durability and in-memory — the same SPI a future
 Gumbo *cluster* backend will use.
@@ -100,12 +102,12 @@ Gumbo *cluster* backend will use.
 
 Requires **JDK 21** and Maven.
 
-Catalyst depends on Gumbo (`com.cajunsystems:gumbo:0.2.0`). The intended delivery is JitPack, but if
+Catalyst depends on Gumbo (`com.cajunsystems:gumbo:0.3.0`). The intended delivery is JitPack, but if
 `jitpack.io` is blocked (e.g. by an egress policy) build Gumbo into your local Maven repo first:
 
 ```bash
 git clone https://github.com/CajunSystems/gumbo
-mvn -f gumbo/pom.xml install -DskipTests     # installs com.cajunsystems:gumbo:0.2.0 into ~/.m2
+mvn -f gumbo/pom.xml install -DskipTests     # installs com.cajunsystems:gumbo:0.3.0 into ~/.m2
 
 # then, in this repo:
 mvn install
@@ -116,7 +118,7 @@ mvn install
 `Demo` tells the `kill -9` story across two real processes:
 
 ```bash
-CP=$(find . -name 'classes' -type d | tr '\n' ':')$(find ~/.m2 -name 'gumbo-0.2.0.jar' -o -name 'jackson-*-2.17.2.jar' -o -name 'slf4j-*-2.0.12.jar' -o -name 'kryo-*.jar' | tr '\n' ':')
+CP=$(find . -name 'classes' -type d | tr '\n' ':')$(find ~/.m2 -name 'gumbo-0.3.0.jar' -o -name 'jackson-*-2.17.2.jar' -o -name 'slf4j-*-2.0.12.jar' -o -name 'kryo-*.jar' | tr '\n' ':')
 
 # 1) record the first step, then die abruptly (exit 137 = kill -9), leaving a durable partial log
 java -cp "$CP" com.cajunsystems.catalyst.api.Demo /tmp/catalyst-demo record

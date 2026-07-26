@@ -91,6 +91,53 @@ class SnapshotAcceptanceTest {
         }
     }
 
+    /**
+     * The end-to-end regression for Gumbo D4 (docs/gumbo-requirements.md). The warm path folds the
+     * snapshot plus everything the log reports after it, so a tail read keyed on the log's global
+     * seqnum rather than the execution's own stream version hands the reducer events already folded
+     * into the snapshot. It re-applies them — the reducer's contract is "exactly the events after the
+     * snapshot point" and it does not defend against violations — and every roll-up double-counts.
+     *
+     * <p>Invisible with one execution per log, which is why the whole suite above missed it: a
+     * stream version and a global seqnum are the same number until a second execution shares the log.
+     */
+    @Test
+    void warmInspectMatchesColdWhenAnotherExecutionSharesTheLog(@TempDir Path dir) {
+        CountingLog log = new CountingLog(GumboEventLog.at(dir));
+        try (CatalystRuntime runtime = Catalyst.builder()
+                .log(log)
+                .snapshotInterval(100)
+                .build()) {
+
+            // A neighbour in the same log, so this execution's seq no longer equals its global seqnum.
+            runtime.execute(COUNTER, ExecutionOptions.withKey("neighbour:1")).result();
+
+            var handle = runtime.execute(COUNTER, ExecutionOptions.withKey("shared:1"));
+            assertThat(handle.result()).isEqualTo(STEPS * (STEPS - 1) / 2);
+            ExecutionId id = handle.id();
+
+            ExecutionState cold = runtime.inspect(id);          // folds the whole log, writes a snapshot
+            assertThat(log.readSnapshot(id)).as("a checkpoint was written").isPresent();
+
+            log.resetReadFromCount();
+            ExecutionState warm = runtime.inspect(id);          // restores the snapshot, folds the tail
+            assertThat(log.eventsFoldedViaReadFrom())
+                    .as("the warm read returns only this execution's tail, not the whole stream")
+                    .isLessThan(100);
+
+            // The fold is identical to a cold fold and to a full re-fold — no event applied twice.
+            ExecutionState fullRefold = Reducer.fold(id, log.read(id));
+            assertThat(warm.status()).isEqualTo(Status.COMPLETED);
+            assertThat(warm.trajectory()).isEqualTo(cold.trajectory()).isEqualTo(fullRefold.trajectory());
+            // One step per effect plus CREATED/STARTED/COMPLETED. A tail read that replays the
+            // snapshot's own prefix roughly doubles this.
+            assertThat(warm.trajectory()).as("every step folded exactly once").hasSize(STEPS + 3);
+            assertThat(warm.lastSeq()).isEqualTo(fullRefold.lastSeq());
+            assertThat(warm.cost()).isEqualTo(fullRefold.cost());
+            assertThat(warm.result()).isEqualTo(fullRefold.result());
+        }
+    }
+
     @Test
     void disablingSnapshotsAlwaysFoldsTheFullLog(@TempDir Path dir) {
         CountingLog log = new CountingLog(GumboEventLog.at(dir));

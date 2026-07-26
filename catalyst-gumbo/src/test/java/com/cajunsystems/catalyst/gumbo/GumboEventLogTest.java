@@ -8,12 +8,15 @@ import com.fasterxml.jackson.databind.node.TextNode;
 import org.junit.jupiter.api.Test;
 import org.junit.jupiter.api.io.TempDir;
 
+import java.io.UncheckedIOException;
+import java.nio.channels.OverlappingFileLockException;
 import java.nio.charset.StandardCharsets;
 import java.nio.file.Path;
 import java.time.Instant;
 import java.util.List;
 
 import static org.assertj.core.api.Assertions.assertThat;
+import static org.assertj.core.api.Assertions.assertThatThrownBy;
 
 class GumboEventLogTest {
 
@@ -86,6 +89,52 @@ class GumboEventLogTest {
         }
     }
 
+    /**
+     * The regression for Gumbo D4 (docs/gumbo-requirements.md): a tail read must be keyed on the
+     * execution's own stream version, not on the log's global seqnum. The two coincide only while the
+     * log holds a single execution — true of every other test here, false of every real deployment.
+     */
+    @Test
+    void readFromReturnsOnlyThisExecutionsTailWhenAnotherExecutionSharesTheLog() {
+        try (GumboEventLog log = GumboEventLog.inMemory()) {
+            ExecutionId other = ExecutionId.random();
+            ExecutionId id = ExecutionId.random();
+            // Interleave, so `id`'s stream versions (0..4) sit at global seqnums 1,3,5,7,9.
+            for (int i = 0; i < 5; i++) {
+                log.append(other, new CatalystEvent.EffectRecorded(T, "other-" + i, new TextNode("o" + i)));
+                log.append(id, new CatalystEvent.EffectRecorded(T, "e" + i, new TextNode("v" + i)));
+            }
+
+            assertThat(log.readFrom(id, 1)).extracting(SequencedEvent::seq).containsExactly(2L, 3L, 4L);
+            assertThat(log.readFrom(id, 4)).isEmpty();
+            assertThat(log.readFrom(id, -1)).extracting(SequencedEvent::seq)
+                    .containsExactly(0L, 1L, 2L, 3L, 4L);
+            // And the events themselves are this execution's, not the neighbour's.
+            assertThat(log.readFrom(id, 1))
+                    .extracting(e -> ((CatalystEvent.EffectRecorded) e.event()).label())
+                    .containsExactly("e2", "e3", "e4");
+        }
+    }
+
+    /** As above, on the file-backed adapter and across a reopen, where the read goes through Gumbo natively. */
+    @Test
+    void readFromOnAFileBackedSharedLogReadsOnlyThisExecutionsTail(@TempDir Path dir) {
+        ExecutionId other = ExecutionId.random();
+        ExecutionId id = ExecutionId.random();
+        try (GumboEventLog log = GumboEventLog.at(dir)) {
+            for (int i = 0; i < 5; i++) {
+                log.append(other, new CatalystEvent.EffectRecorded(T, "other-" + i, new TextNode("o" + i)));
+                log.append(id, new CatalystEvent.EffectRecorded(T, "e" + i, new TextNode("v" + i)));
+            }
+        }
+        try (GumboEventLog reopened = GumboEventLog.at(dir)) {
+            assertThat(reopened.readFrom(id, 2)).extracting(SequencedEvent::seq).containsExactly(3L, 4L);
+            assertThat(reopened.readFrom(id, 4)).isEmpty();
+            assertThat(reopened.readFrom(id, -1)).hasSize(5);
+            assertThat(reopened.latestSeq(id)).isEqualTo(4);
+        }
+    }
+
     @Test
     void snapshotRoundTripsAndSurvivesReopen(@TempDir Path dir) {
         ExecutionId id = ExecutionId.random();
@@ -100,6 +149,27 @@ class GumboEventLogTest {
                 assertThat(s.throughSeq()).isEqualTo(42);
                 assertThat(s.state()).isEqualTo(state);
             });
+        }
+    }
+
+    /**
+     * Gumbo D1/D2/D3: a second writer on one directory used to be accepted silently, then assign the
+     * same seqs and clobber the first's index. It is now refused, and the refusal has to stay legible
+     * — a log held by another process is a configuration mistake, not something to debug from a cause
+     * chain. The lock is released on close, so a sequential reopen (crash → resume) still works.
+     */
+    @Test
+    void aSecondWriterOnTheSameDirectoryIsRefusedWithAClearMessage(@TempDir Path dir) {
+        try (GumboEventLog first = GumboEventLog.at(dir)) {
+            first.append(ExecutionId.random(), new CatalystEvent.ExecutionStarted(T, 1, "n"));
+            assertThatThrownBy(() -> GumboEventLog.at(dir))
+                    .isInstanceOf(UncheckedIOException.class)
+                    .hasMessageContaining("already open")
+                    .hasRootCauseInstanceOf(OverlappingFileLockException.class);
+        }
+        // Released on close: the resume-after-crash path must still be able to reopen the directory.
+        try (GumboEventLog reopened = GumboEventLog.at(dir)) {
+            assertThat(reopened).isNotNull();
         }
     }
 
