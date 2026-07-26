@@ -81,6 +81,53 @@ moved; the implementation did not.**
 **Fix.** Make the tag's current version storage-owned, and assign it in the same transaction as the
 append. This is the `FoundationDBSequencer` pattern applied at tag granularity.
 
+### Resolved design question: is the fix to *align* `localId` with Boki, or to stop exposing it?
+
+The natural reading of "the semantics moved; the implementation did not" is that the fix is to move
+the semantics back — restore `localId` to Boki's per-engine meaning, where a node-local `AtomicLong`
+is correct by construction. That is a coherent change, but it is **orthogonal to this defect**,
+because Boki's `localid` and the thing Catalyst actually consumes are two different quantities that
+Gumbo has merged into one field:
+
+| | Boki `localid` | What Catalyst needs |
+|---|---|---|
+| Scope | Per **engine** | Per **stream (tag)** |
+| Purpose | Write-path pre-sequencing — an id before global order is assigned | Per-entity cursor, and the fence for optimistic concurrency |
+| Visibility | **Internal** to the write path | **External**, part of the client contract |
+| Lifetime | Superseded once the sequencer assigns `seqnum` | Permanent — it is how a client addresses a position in its stream |
+
+Restoring per-engine semantics would make `localId` correct *and* useless to clients: it would no
+longer identify a position in a stream, so D4's version-keyed read would still need a new number, and
+A1's fence would still need a third. The two changes do not compete.
+
+**Decision: do not expose `localId` at all. Expose `streamVersion` — per-tag, storage-owned, dense.**
+If Gumbo later pursues Boki's parallel data path, `localId` comes back as an internal write-path
+detail that never appears in `AppendResult`. Clients never had a use for it.
+
+**Dense, or the tag's latest global `seqnum`?** Reusing `seqnum` as the per-tag cursor is tempting —
+it already exists, it is already storage-owned, and it is already unique. Choose **dense** anyway, for
+two reasons:
+
+- **No log migration.** A dense, storage-owned counter seeded from persisted state simply continues
+  the sequence existing logs already carry, so every log written to date stays readable and every
+  recorded cursor stays valid. Redefining the exposed version as the global `seqnum` would silently
+  invalidate stored positions in downstream state — Catalyst's snapshots persist a `throughSeq`, and a
+  snapshot written under the old meaning would fold from the wrong point under the new one, with no
+  error at the seam. Sparse numbering buys nothing that would justify that.
+- **Density is a real ergonomic asset**, not just aesthetics. A durable execution runtime reports
+  positions to humans: "diverged at step 7" is actionable, "diverged at seqnum 918,442" is not. The
+  same property makes logs diffable and makes `expectedVersion` arithmetic obvious.
+
+The supporting fact, verified against the Catalyst tree rather than assumed: **Catalyst performs no
+arithmetic on `seq`** — every use is an ordering comparison. Density is asserted in exactly one test
+and documented as an invariant in `CLAUDE.md`, but nothing structurally depends on contiguity. So the
+choice is genuinely free on the client side, which is why it should be made on migration cost and
+readability.
+
+Finally, the fence in A1 uses **this same `streamVersion`** — a conditional append is
+"append iff the tag is still at version N". No separate quantity, no second counter to keep
+consistent, and the comparison and the increment collapse into one storage operation.
+
 ## D2. The index is written per-process and clobbers
 
 **Severity: high.**
@@ -227,13 +274,15 @@ is done. Two refinements:
 
 - **Return it consistently** from every append entry point, so fields can be added later
   (`commitVersion`, `partition`, `transactionId`) without breaking callers.
-- **Rename `localId` to `streamVersion`.** The word *version* tells a reader that optimistic
-  concurrency lives here; *localId* tells them nothing, and actively misleads — it is a fossil of
-  Boki's per-engine semantics, which is precisely why it does not describe what the field now means.
-  Consider removing it from the public API entirely: clients should care about a stream's version, not
-  about an internal identifier.
+- **Replace `localId` with `streamVersion`** — a rename in effect, but not only a rename: per the
+  design decision resolved under D1, `localId` should leave the public API rather than be renamed in
+  place. The word *version* tells a reader that optimistic concurrency lives here; *localId* tells them
+  nothing, and actively misleads — it is a fossil of Boki's per-engine semantics, which is precisely
+  why it does not describe what the field now means. `streamVersion` is per-tag, storage-owned and
+  dense, and it is the same quantity A1 conditions on and A2 reads from; if Boki-style per-engine
+  `localId` is ever reintroduced, it belongs on the write path, not in `AppendResult`.
 
-  For Catalyst this rename is cheap: `localId` appears in exactly one module
+  For Catalyst this change is cheap: `localId` appears in exactly one module
   (`catalyst-gumbo/GumboEventLog`), six lines, all at a single mapping seam.
 
 ## A6. Atomic multi-tag append as a first-class operation
@@ -283,7 +332,7 @@ Ordered by (blocking-ness × cost), not by conceptual elegance.
 |---|---|---|
 | 1 | **D3** — exclusive directory lock, fail fast | Smallest possible change; converts silent corruption into a loud error. Buys safety immediately while the rest is designed. |
 | 2 | **A2** — version-keyed reads | Fixes a live corruption bug (D4) in a downstream framework. Independent of everything else. |
-| 3 | **A5** — rename to `streamVersion`, return `AppendResult` | Do the rename *before* new APIs are written against the old name. Cheap now, expensive later. |
+| 3 | **A5** — `localId` out, `streamVersion` in; return `AppendResult` | Do it *before* new APIs are written against the old name — A1 and A2 both name this quantity, so settling it first stops two more surfaces inheriting the fossil. Cheap now, expensive later. |
 | 4 | **D1 + A1** — storage-owned version + conditional append | The cornerstone. One change: if the version is storage-owned and assigned in the append transaction, conditional append is nearly free, because the comparison and the increment become one operation. |
 | 5 | **D2** — non-clobbering index | Required for multi-writer to be usable, but pointless before D1. |
 | 6 | **A3** — KV compare-and-set | Unlocks leases and work claiming. Depends on nothing above, but is only *useful* once D1/A1 land. |
