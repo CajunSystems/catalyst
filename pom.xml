@@ -42,13 +42,26 @@
     </properties>
 
     <!--
-      Gumbo (com.cajunsystems:gumbo:0.3.0) is the durable log backend. The intended delivery was
-      JitPack, but jitpack.io is blocked by this environment's egress policy, so Gumbo is resolved
-      from the local Maven repository instead: build it once with
-          mvn -f /path/to/gumbo/pom.xml install -DskipTests
-      which installs com.cajunsystems:gumbo:0.3.0 into ~/.m2. Its own dependencies resolve from
-      Maven Central. No Gumbo source is vendored into this build.
+      Gumbo is the durable log backend, delivered by JitPack, which builds it from the tag in
+      the CajunSystems/gumbo repository.
+
+      The coordinate is com.github.CajunSystems:gumbo, not the com.cajunsystems:gumbo that
+      Gumbo's own pom declares. JitPack rewrites the groupId to com.github.{owner} when it
+      publishes, so the string that resolves depends on where the jar came from: build Gumbo
+      locally with `mvn install` and it lands in ~/.m2 as com.cajunsystems:gumbo; fetch the
+      same jar from JitPack and it is com.github.CajunSystems:gumbo. This build uses the
+      JitPack one, so it resolves on any machine with network access rather than only on one
+      where Gumbo has been built by hand.
+
+      No Gumbo source is vendored into this build; its own dependencies resolve from Central.
     -->
+
+    <repositories>
+        <repository>
+            <id>jitpack.io</id>
+            <url>https://jitpack.io</url>
+        </repository>
+    </repositories>
 
     <dependencyManagement>
         <dependencies>
@@ -135,7 +148,7 @@
                 <version>${bytebuddy.version}</version>
             </dependency>
             <dependency>
-                <groupId>com.cajunsystems</groupId>
+                <groupId>com.github.CajunSystems</groupId>
                 <artifactId>gumbo</artifactId>
                 <version>${gumbo.version}</version>
                 <exclusions>

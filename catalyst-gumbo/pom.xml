@@ -24,7 +24,7 @@
             <artifactId>catalyst-events</artifactId>
         </dependency>
         <dependency>
-            <groupId>com.cajunsystems</groupId>
+            <groupId>com.github.CajunSystems</groupId>
             <artifactId>gumbo</artifactId>
         </dependency>
         <dependency>
