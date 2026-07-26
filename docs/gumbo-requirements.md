@@ -118,11 +118,30 @@ two reasons:
   positions to humans: "diverged at step 7" is actionable, "diverged at seqnum 918,442" is not. The
   same property makes logs diffable and makes `expectedVersion` arithmetic obvious.
 
-The supporting fact, verified against the Catalyst tree rather than assumed: **Catalyst performs no
-arithmetic on `seq`** — every use is an ordering comparison. Density is asserted in exactly one test
-and documented as an invariant in `CLAUDE.md`, but nothing structurally depends on contiguity. So the
-choice is genuinely free on the client side, which is why it should be made on migration cost and
-readability.
+**What the client side actually depends on.** Catalyst treats `seq` as an ordinal almost everywhere —
+substitution, replay alignment and cursor comparison are all ordering, and none of them would notice
+gaps. There is **one** exception, and it is worth naming precisely rather than rounding off:
+`CatalystRuntime.maybeSnapshot` decides when to checkpoint with
+
+```java
+if (folded.lastSeq() - sinceSeqExclusive < snapshotInterval) return;
+```
+
+which reads a *difference between two versions* as an *event count*. That identity holds only under
+dense numbering. Against a sparse version the subtraction measures the span of the shared global
+sequence rather than this execution's own progress, so the interval is overshot and checkpoints fire
+early — a degraded heuristic, not corruption, but a real dependency all the same.
+
+Density is also a **tested contract**, not only a documented invariant:
+`GumboEventLogTest.appendAssignsDenseSeqAndReadsInOrder` asserts `0, 1, 2`, and a second case asserts
+each execution is dense from 0 *independent of how the two interleave in the shared log* — which is
+exactly the property a sparse version would abolish. `ReplayTest` pins a specific seq as well.
+
+So the choice is not free on the client side, and the earlier framing understated it: dense is what
+the current implementation already relies on in one place and verifies in another. That makes it the
+recommendation for a third reason beyond migration cost and readability — sparse numbering would
+require changing shipped behaviour and rewriting passing tests to accommodate a storage-side change
+that buys nothing in return.
 
 Finally, the fence in A1 uses **this same `streamVersion`** — a conditional append is
 "append iff the tag is still at version N". No separate quantity, no second counter to keep
@@ -352,7 +371,9 @@ caught every issue in this document.
 2. **Two tags in one log, tail read on the second.** Assert `readFromVersion(tag, n)` returns exactly
    the entries after version `n` **of that tag**. *(Currently fails: returns the whole stream.)*
 3. **Restart continuation.** One process writes, exits, another continues. Assert versions continue
-   rather than restart. *(Currently passes — keep it that way.)*
+   rather than restart, **and remain dense across the restart** — density is a client-visible contract
+   (see D1), so any change to how versions are assigned has to preserve it, including across a reopen.
+   *(Currently passes — keep it that way.)*
 4. **Conditional append rejection.** Two writers at the same expected version; assert exactly one
    succeeds and the other is rejected rather than silently accepted.
 5. **Capability honesty.** For each adapter, assert every capability it reports `true` for actually
