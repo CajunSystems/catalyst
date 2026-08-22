@@ -14,9 +14,13 @@ mvn install            # full reactor + tests
 mvn -pl catalyst-core -am install   # a single module and its deps
 ```
 
-**Gumbo dependency:** `catalyst-gumbo` depends on `com.cajunsystems:gumbo:0.3.0`. JitPack is the
-intended source, but if `jitpack.io` is blocked, install Gumbo locally first:
-`mvn -f /path/to/gumbo/pom.xml install -DskipTests`.
+**Gumbo dependency:** `catalyst-gumbo` depends on **`com.github.CajunSystems:gumbo:0.3.0`**,
+resolved from JitPack (declared in the root pom) — an ordinary build needs no setup. The groupId is
+*not* the `com.cajunsystems` that Gumbo's own pom declares; JitPack rewrites it to
+`com.github.{owner}` on publish. So a hand-built `mvn -f /path/to/gumbo/pom.xml install -DskipTests`
+installs `com.cajunsystems:gumbo`, which this build does not reference and which therefore will not
+satisfy the dependency. To work from a local Gumbo build, rewrite the project groupId in that
+checkout's pom to `com.github.CajunSystems` before installing.
 
 ## Architecture (where things live)
 
