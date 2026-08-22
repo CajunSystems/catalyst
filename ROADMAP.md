@@ -231,15 +231,30 @@ The substrate becomes a platform. This is where the other CajunSystems component
   instead of polling) whenever it is ready, and backed out cheaply if it is not. **Bayou** does not
   distribute — it is single-process — but it shares Gumbo with Catalyst, so it is useful *within* a
   node (supervising the claim loop, lease-renewal timers, death watch) and could later consume the
-  same primitives to become clustered itself. The gaps are all storage-side: conditional append, lease CAS with TTL, and a claimable-work index
-  (there is currently no way to ask the log *what needs running* — every read path starts from an id
-  you already hold). **Measured prerequisite:** Gumbo is not multi-writer safe today — two JVMs on one
-  directory were each handed `seq` 0,1,2 for the same execution and the log then reported 3 of the 6
-  appends. Nothing is physically lost (all six are in `log.dat`); `localId` assignment is process-local
-  and `index.dat` clobbers. `FoundationDBSequencer` does not help — it sequences the global `seqnum`,
-  while `localId` (which *is* Catalyst's `seq`) never passes through the `Sequencer`. So conditional
-  append must be a **Gumbo** primitive rather than a Catalyst-side wrapper, or the check races the
-  assignment beneath it.
+  same primitives to become clustered itself.
+- ✅ **The `EventLog` seam for conditional append has landed** — `append(id, event, expectedSeq)` plus
+  `supportsConditionalAppend()`, rejecting a stale writer with `StaleWriterException`. The default
+  **throws** rather than falling back to an unconditional append: a log that quietly ignored
+  `expectedSeq` would look like it was participating in the protocol while providing none of it,
+  which surfaces as a corrupted history rather than as an error. `InMemoryEventLog` fences under the
+  monitor that assigns the seq; `GumboEventLog` delegates to Gumbo's own fence, where the compare and
+  the increment are one storage operation — Catalyst's `seq` *is* the execution tag's
+  `streamVersion`, so there is no translation in between. Covered by `ConditionalAppendTest` and
+  three `GumboEventLogTest` cases (with a second execution in the log), each verified to fail when
+  the fence is removed. What remains for distribution is the claim loop above it, not the primitive.
+- **Status of the storage-side prerequisites**, all measured rather than assumed. Gumbo 0.3.0 closed
+  the blocker: versions are assigned *in storage* now, not by a per-process counter, so the two-JVM
+  probe that handed both writers `seq` 0,1,2 no longer applies — and the file adapter takes an
+  exclusive directory lock, so a second process is refused loudly instead of corrupting silently.
+  Lease CAS arrived in 0.4.0. Two gaps are left, and both are Gumbo-side:
+  - **0.4.0 is merged but untagged**, so JitPack cannot build it and the lease CAS is unreachable
+    from this build — Catalyst is pinned to 0.3.0 for that reason alone.
+  - **Claimable work** turned out to need no new SPI (dual-tagging into a shared queue tag, one
+    atomic append — see `docs/distribution.md`) but the queue tag *cannot be cursored by version*:
+    an entry carries one `streamVersion`, from its primary tag, so a version-keyed tail read on a
+    fan-out tag can silently skip work. Seqnum-keyed reads are correct there in the meantime. The
+    proper fix costs a log migration and was ranked last in Gumbo's backlog on that cost — before
+    this design depended on it.
 
 ### In-doubt model completions (found while designing distribution)
 - A crash between `CompletionRequested` and `CompletionReceived` leaves the provider call **in

@@ -172,4 +172,14 @@ checkout's pom to `com.github.CajunSystems` before installing.
   **When adding a log-layer test, put a second execution in the log**: a single-execution fixture is
   the one configuration where these bugs are invisible, which is how D4 shipped.
 
+- **Conditional append (v1 distribution seam)** — `ConditionalAppendTest` (runtime) +
+  three `GumboEventLogTest` cases: `EventLog.append(id, event, expectedSeq)` rejects a writer the
+  stream has moved past with `StaleWriterException`, and `supportsConditionalAppend()` says whether a
+  log can do it at all. The default **throws** — never falls back to an unconditional append, since a
+  log that ignored `expectedSeq` would look like it was fencing while fencing nothing. `GumboEventLog`
+  delegates to Gumbo's storage-side fence (Catalyst's `seq` *is* the tag's `streamVersion`, so no
+  translation); the conflict arrives wrapped in `LogWriteException` inside `CompletionException`, so
+  it is matched on the whole cause chain, not the top type. Not yet used by the runtime — the
+  in-process invariant is still `KeyedLock` + `inFlight`; this is the seam a claim loop writes to.
+
 CI (`.github/workflows/ci.yml`) runs all exit demos as gates — it is the source of truth per phase.

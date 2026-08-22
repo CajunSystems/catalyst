@@ -4,6 +4,7 @@ import com.cajunsystems.catalyst.ExecutionId;
 import com.cajunsystems.catalyst.events.CatalystEvent;
 import com.cajunsystems.catalyst.events.SequencedEvent;
 import com.cajunsystems.catalyst.log.Snapshot;
+import com.cajunsystems.catalyst.log.StaleWriterException;
 import com.fasterxml.jackson.databind.node.TextNode;
 import org.junit.jupiter.api.Test;
 import org.junit.jupiter.api.io.TempDir;
@@ -132,6 +133,74 @@ class GumboEventLogTest {
             assertThat(reopened.readFrom(id, 4)).isEmpty();
             assertThat(reopened.readFrom(id, -1)).hasSize(5);
             assertThat(reopened.latestSeq(id)).isEqualTo(4);
+        }
+    }
+
+    /**
+     * The fence: an append conditioned on a seq the stream has moved past is rejected, and rejected
+     * by storage rather than by anything Catalyst decided beforehand.
+     *
+     * <p>Two executions share the log, as every test at this layer should. The tag a fence applies
+     * to and the number it compares are both per-execution, and a single-execution fixture is the
+     * one configuration where a per-stream position and the log's global sequence are the same
+     * number — which is how the last defect at this seam shipped.
+     */
+    @Test
+    void conditionalAppendRejectsAWriterTheStreamHasMovedPast() {
+        try (GumboEventLog log = GumboEventLog.inMemory()) {
+            ExecutionId other = ExecutionId.random();
+            ExecutionId id = ExecutionId.random();
+            for (int i = 0; i < 4; i++) log.append(other, new CatalystEvent.ExecutionStarted(T, i, "node-0"));
+
+            assertThat(log.supportsConditionalAppend()).isTrue();
+            assertThat(log.append(id, new CatalystEvent.ExecutionCreated(T, "Task", "h", "cfg", ""), 0))
+                    .isEqualTo(0);
+            assertThat(log.append(id, new CatalystEvent.ExecutionStarted(T, 1, "node-0"), 1))
+                    .isEqualTo(1);
+
+            // A node that read the stream at seq 1 and has been overtaken since.
+            assertThatThrownBy(() -> log.append(id, new CatalystEvent.ExecutionStarted(T, 1, "node-1"), 1))
+                    .isInstanceOf(StaleWriterException.class)
+                    .hasMessageContaining(id.value());
+
+            assertThat(log.read(id)).extracting(SequencedEvent::seq)
+                    .as("a rejected append writes nothing")
+                    .containsExactly(0L, 1L);
+            assertThat(log.latestSeq(id)).isEqualTo(1);
+            assertThat(log.read(other)).as("and touches no other execution").hasSize(4);
+        }
+    }
+
+    /**
+     * The rejection carries where the stream actually is, which is what a caller needs to recover:
+     * re-read from there, rebuild, decide again. Blind retry of the same append is the one response
+     * that is always wrong.
+     */
+    @Test
+    void aRejectedAppendReportsWhereTheStreamActuallyIs() {
+        try (GumboEventLog log = GumboEventLog.inMemory()) {
+            ExecutionId id = ExecutionId.random();
+            for (int i = 0; i < 3; i++) log.append(id, new CatalystEvent.ExecutionStarted(T, i, "node-0"));
+
+            assertThatThrownBy(() -> log.append(id, new CatalystEvent.ExecutionStarted(T, 9, "zombie"), 1))
+                    .isInstanceOfSatisfying(StaleWriterException.class, e -> {
+                        assertThat(e.expectedSeq()).isEqualTo(1);
+                        assertThat(e.actualSeq()).isEqualTo(3);
+                    });
+        }
+    }
+
+    @Test
+    void conditionalAppendIsFencedOnAFileBackedLogToo(@TempDir Path dir) {
+        try (GumboEventLog log = GumboEventLog.at(dir)) {
+            ExecutionId other = ExecutionId.random();
+            ExecutionId id = ExecutionId.random();
+            log.append(other, new CatalystEvent.ExecutionCreated(T, "Task", "h", "cfg", ""));
+            log.append(id, new CatalystEvent.ExecutionCreated(T, "Task", "h", "cfg", ""), 0);
+
+            assertThatThrownBy(() -> log.append(id, new CatalystEvent.ExecutionStarted(T, 1, "node-1"), 0))
+                    .isInstanceOf(StaleWriterException.class);
+            assertThat(log.read(id)).hasSize(1);
         }
     }
 

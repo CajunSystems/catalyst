@@ -21,6 +21,55 @@ public interface EventLog extends AutoCloseable {
      */
     long append(ExecutionId executionId, CatalystEvent event);
 
+    /**
+     * Appends {@code event} only if {@code executionId}'s stream is still at {@code expectedSeq} —
+     * that is, only if the event would be assigned that sequence number — and rejects the append
+     * with {@link StaleWriterException} otherwise.
+     *
+     * <p>This is the fence that makes single-writer-per-execution enforceable rather than merely
+     * arranged. Catalyst holds the invariant in-process today with {@code KeyedLock} plus an
+     * in-flight set, which is sufficient within one JVM and worth nothing across two. A lease, a
+     * lock service or a placement map can each tell a node it owns an execution, but none of them
+     * can tell it that it <em>still</em> owns it at the moment its write lands — a GC pause between
+     * the two is enough for a zombie to append into a stream someone else has taken over. With the
+     * check in storage, the zombie's write is refused and the coordination layer is free to be
+     * wrong.
+     *
+     * <p><strong>The default throws</strong>, and deliberately does not fall back to an
+     * unconditional append. A log that quietly ignored {@code expectedSeq} would look like it was
+     * participating in the protocol while providing none of it, which surfaces as a corrupted
+     * history rather than as an error — the worst available failure shape for a correctness
+     * primitive. Callers check {@link #supportsConditionalAppend()} first, or handle the exception.
+     *
+     * @param expectedSeq the seq this append must be assigned; equivalently, one past the stream's
+     *                    current tip. Use {@code 0} for the first event of a stream
+     * @return {@code expectedSeq}, for symmetry with {@link #append(ExecutionId, CatalystEvent)}
+     * @throws StaleWriterException          if the stream is not at {@code expectedSeq}
+     * @throws UnsupportedOperationException if this log cannot fence an append
+     */
+    default long append(ExecutionId executionId, CatalystEvent event, long expectedSeq) {
+        throw new UnsupportedOperationException(
+                getClass().getSimpleName() + " does not support conditional append;"
+                + " it cannot compare the stream position and append atomically");
+    }
+
+    /**
+     * Whether {@link #append(ExecutionId, CatalystEvent, long)} can reject a stale writer.
+     *
+     * <p>Ask before relying on it: distributed execution requires it, and a runtime should refuse
+     * to distribute over a log that reports {@code false} rather than discover the difference from
+     * a stream two nodes have both written to.
+     *
+     * <p>Necessary, not sufficient, for running executions across processes. An implementation may
+     * fence perfectly within one JVM and not at all between two — that is exactly what a
+     * single-writer file-backed log does — so a distributed runtime also needs to know the log
+     * itself is multi-writer. That property belongs to the storage layer and is reported by it;
+     * this seam reports only whether the fence exists.
+     */
+    default boolean supportsConditionalAppend() {
+        return false;
+    }
+
     /** Reads all events for {@code executionId} in sequence order. Empty if none. */
     List<SequencedEvent> read(ExecutionId executionId);
 
