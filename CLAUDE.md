@@ -14,7 +14,7 @@ mvn install            # full reactor + tests
 mvn -pl catalyst-core -am install   # a single module and its deps
 ```
 
-**Gumbo dependency:** `catalyst-gumbo` depends on **`com.github.CajunSystems:gumbo:0.4.0`**,
+**Gumbo dependency:** `catalyst-gumbo` depends on **`com.github.CajunSystems:gumbo:0.5.0`**,
 resolved from JitPack (declared in the root pom) — an ordinary build needs no setup. The groupId is
 *not* the `com.cajunsystems` that Gumbo's own pom declares; JitPack rewrites it to
 `com.github.{owner}` on publish. So a hand-built `mvn -f /path/to/gumbo/pom.xml install -DskipTests`
@@ -181,6 +181,12 @@ checkout's pom to `com.github.CajunSystems` before installing.
   translation); the conflict arrives wrapped in `LogWriteException` inside `CompletionException`, so
   it is matched on the whole cause chain, not the top type. Not yet used by the runtime — the
   in-process invariant is still `KeyedLock` + `inFlight`; this is the seam a claim loop writes to.
+  Both capability answers **delegate** to Gumbo's `capabilities()` (0.5.0+) rather than asserting:
+  `supportsConditionalAppend()` and `supportsMultiWriter()`. Read them as a **pair** — a
+  file-backed log is fenced (compare and append under its own monitor) and *not* multi-writer, and
+  distribution needs both. Note Gumbo composes `multiWriter` from storage **and** its sequencer, so
+  no log Catalyst builds today reports `true`: the default sequencer is a per-process `AtomicLong`,
+  which no storage fence can compensate for since the seqnum never passes through it.
 
 - **In-doubt model completions** — `ReplayingContextInDoubtCompletionTest`: a `CompletionRequested`
   with no `CompletionReceived` is a provider call that may have been accepted and *billed*, so it
