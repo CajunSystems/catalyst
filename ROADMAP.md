@@ -247,8 +247,8 @@ The substrate becomes a platform. This is where the other CajunSystems component
   probe that handed both writers `seq` 0,1,2 no longer applies — and the file adapter takes an
   exclusive directory lock, so a second process is refused loudly instead of corrupting silently.
   Lease CAS arrived in 0.4.0. Two gaps are left, and both are Gumbo-side:
-  - **0.4.0 is merged but untagged**, so JitPack cannot build it and the lease CAS is unreachable
-    from this build — Catalyst is pinned to 0.3.0 for that reason alone.
+  - ~~**0.4.0 is merged but untagged**~~ — tagged and picked up: Catalyst is on gumbo 0.4.0, so the
+    lease CAS (A3) is reachable. Nothing consumes it yet; the claim loop is what would.
   - **Claimable work** turned out to need no new SPI (dual-tagging into a shared queue tag, one
     atomic append — see `docs/distribution.md`) but the queue tag *cannot be cursored by version*:
     an entry carries one `streamVersion`, from its primary tag, so a version-keyed tail read on a

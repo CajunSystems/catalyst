@@ -29,16 +29,15 @@ This document records them, with the evidence for each.
 > does — the old call kept compiling and kept being wrong. A dependency bump is not a fix until the
 > caller moves.
 >
-> **The same lesson, one layer up: a merged release is not a released one.** Gumbo 0.4.0 is cut and
-> merged but the tag was never pushed, and JitPack builds from tags — so A3, the compare-and-set that
-> the whole lease and claim story rests on, exists and is unreachable from this build. Catalyst is
-> still pinned to 0.3.0 for that reason alone.
+> **The same lesson, one layer up, and it cost a release cycle: a merged release is not a released
+> one.** Gumbo 0.4.0 was cut and merged with the tag never pushed, and JitPack builds from tags — so
+> A3, the compare-and-set the whole lease and claim story rests on, existed and was unreachable.
+> Resolved: `0.4.0` now tags `ceb0e0e` and this build is on it.
 >
-> **What Catalyst needs next, in order:** the 0.4.0 tag; A4 released (the runtime should refuse to
-> distribute against a log reporting `multiWriter() == false` rather than find out later); and the
-> multi-tag version defect, which [`distribution.md`](distribution.md) depends on for claimable work
-> and which was filed last in Gumbo's backlog on log-migration cost — a ranking made before anything
-> depended on it.
+> **What Catalyst needs next, in order:** A4 released (the runtime should refuse to distribute against
+> a log reporting `multiWriter() == false` rather than find out later); and the multi-tag version
+> defect, which [`distribution.md`](distribution.md) depends on for claimable work and which was filed
+> last in Gumbo's backlog on log-migration cost — a ranking made before anything depended on it.
 
 ## How these conclusions were reached
 
