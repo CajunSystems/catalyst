@@ -102,16 +102,21 @@ Gumbo *cluster* backend will use.
 
 Requires **JDK 21** and Maven.
 
-Catalyst depends on Gumbo (`com.cajunsystems:gumbo:0.3.0`). The intended delivery is JitPack, but if
-`jitpack.io` is blocked (e.g. by an egress policy) build Gumbo into your local Maven repo first:
+Catalyst depends on Gumbo, resolved from [JitPack](https://jitpack.io) — declared in the root pom, so
+an ordinary build needs no setup:
 
 ```bash
-git clone https://github.com/CajunSystems/gumbo
-mvn -f gumbo/pom.xml install -DskipTests     # installs com.cajunsystems:gumbo:0.3.0 into ~/.m2
-
-# then, in this repo:
 mvn install
 ```
+
+The coordinate is **`com.github.CajunSystems:gumbo:0.3.0`**, not the `com.cajunsystems:gumbo` that
+Gumbo's own pom declares: JitPack rewrites the groupId to `com.github.{owner}` when it publishes, so
+which string resolves depends on where the jar came from. Building Gumbo by hand
+(`mvn -f gumbo/pom.xml install -DskipTests`) installs it into `~/.m2` under `com.cajunsystems`, which
+**this build does not reference** — a local install alone will not satisfy the dependency. If you
+need to work from a local Gumbo build (an unreleased change, or an environment that blocks
+`jitpack.io`), rewrite the project groupId in your Gumbo checkout's pom to `com.github.CajunSystems`
+before installing, so the artifact lands under the coordinate Catalyst asks for.
 
 ## The M0 exit demo (crash & resume)
 
