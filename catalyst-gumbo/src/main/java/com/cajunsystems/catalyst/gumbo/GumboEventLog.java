@@ -9,10 +9,13 @@ import com.cajunsystems.catalyst.events.FileBlobStore;
 import com.cajunsystems.catalyst.events.SequencedEvent;
 import com.cajunsystems.catalyst.log.EventLog;
 import com.cajunsystems.catalyst.log.Snapshot;
+import com.cajunsystems.catalyst.log.StaleWriterException;
 import com.cajunsystems.gumbo.api.LogView;
 import com.cajunsystems.gumbo.api.TypedLogView;
+import com.cajunsystems.gumbo.core.AppendRequest;
 import com.cajunsystems.gumbo.core.LogEntry;
 import com.cajunsystems.gumbo.core.LogTag;
+import com.cajunsystems.gumbo.core.VersionConflictException;
 import com.cajunsystems.gumbo.persistence.FileBasedPersistenceAdapter;
 import com.cajunsystems.gumbo.persistence.InMemoryPersistenceAdapter;
 import com.cajunsystems.gumbo.persistence.LogAlreadyOpenException;
@@ -121,8 +124,27 @@ public final class GumboEventLog implements EventLog {
     }
 
     private TypedLogView<CatalystEvent> viewFor(ExecutionId id) {
-        return views.computeIfAbsent(id,
-                k -> service.getTypedView(LogTag.of(EXEC_NAMESPACE, k.value()), serializer));
+        return views.computeIfAbsent(id, k -> service.getTypedView(tagFor(k), serializer));
+    }
+
+    private static LogTag tagFor(ExecutionId id) {
+        return LogTag.of(EXEC_NAMESPACE, id.value());
+    }
+
+    /**
+     * Finds the rejection in a cause chain, or {@code null} if the failure was something else.
+     *
+     * <p>It arrives buried: Gumbo wraps it in a {@code LogWriteException} and the future wraps that
+     * in a {@code CompletionException}, so the top type says nothing about what happened. Matching
+     * on the whole chain rather than the top is the same lesson the retry gate learned — a
+     * classification that inspects only the outermost throwable classifies the wrapper.
+     */
+    private static VersionConflictException conflictIn(Throwable t) {
+        for (Throwable c = t; c != null; c = c.getCause()) {
+            if (c instanceof VersionConflictException v) return v;
+            if (c.getCause() == c) break;
+        }
+        return null;
     }
 
     @Override
@@ -130,6 +152,54 @@ public final class GumboEventLog implements EventLog {
         long seq = viewFor(executionId).append(event).join().streamVersion();
         lastSeq.merge(executionId, seq, Math::max);
         return seq;
+    }
+
+    /**
+     * Conditional append, straight onto Gumbo's fence: Catalyst's {@code seq} <em>is</em> the
+     * execution tag's {@code streamVersion}, so "append only if this execution is still at seq N"
+     * is "append only if this tag is still at version N" with no translation in between.
+     *
+     * <p>The comparison happens inside the adapter's own append, which is what makes it a fence
+     * rather than a check — a compare here, above storage, would race the assignment underneath it,
+     * and this seam exists precisely to stop correctness depending on a caller being right about
+     * where a stream is.
+     *
+     * <p>The single-tag form is deliberate. Gumbo's multi-tag fence needs the conditioned tag named
+     * explicitly, because the primary tag of a multi-tag request is {@code tags.iterator().next()}
+     * over an immutable {@code Set}, whose iteration order Java salts per JVM run. Catalyst writes
+     * one tag per execution, so the question does not arise here — but it will the moment an
+     * execution is dual-tagged into a shared work queue, and then the fenced tag must be named.
+     */
+    @Override
+    public long append(ExecutionId executionId, CatalystEvent event, long expectedSeq) {
+        AppendRequest request = AppendRequest.to(tagFor(executionId), serializer.serialize(event));
+        long seq;
+        try {
+            seq = service.append(request, expectedSeq).join().streamVersion();
+        } catch (RuntimeException e) {
+            VersionConflictException conflict = conflictIn(e);
+            if (conflict == null) throw e;
+            throw new StaleWriterException(executionId, expectedSeq, conflict.actualVersion());
+        }
+        lastSeq.merge(executionId, seq, Math::max);
+        return seq;
+    }
+
+    /**
+     * True: every persistence adapter Gumbo ships has assigned versions in storage and fenced on
+     * them since 0.3.0.
+     *
+     * <p>Worth being precise about what that buys, because the two halves are separable. The fence
+     * is real on all of them — the compare and the increment are one operation. Whether it holds
+     * against a writer in <em>another process</em> is a different question, answered by the adapter:
+     * one transaction on FoundationDB, one JVM's monitor on the file adapter (which is sufficient
+     * there only because it refuses a second process outright). Distributed execution needs both,
+     * and this method reports only the first. The second becomes askable when Gumbo's declared
+     * capabilities land downstream, at which point this delegates rather than asserts.
+     */
+    @Override
+    public boolean supportsConditionalAppend() {
+        return true;
     }
 
     @Override

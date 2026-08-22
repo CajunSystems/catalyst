@@ -14,7 +14,7 @@ mvn install            # full reactor + tests
 mvn -pl catalyst-core -am install   # a single module and its deps
 ```
 
-**Gumbo dependency:** `catalyst-gumbo` depends on **`com.github.CajunSystems:gumbo:0.3.0`**,
+**Gumbo dependency:** `catalyst-gumbo` depends on **`com.github.CajunSystems:gumbo:0.4.0`**,
 resolved from JitPack (declared in the root pom) — an ordinary build needs no setup. The groupId is
 *not* the `com.cajunsystems` that Gumbo's own pom declares; JitPack rewrites it to
 `com.github.{owner}` on publish. So a hand-built `mvn -f /path/to/gumbo/pom.xml install -DskipTests`
@@ -171,5 +171,25 @@ checkout's pom to `com.github.CajunSystems` before installing.
   burying it, and the lock is released on close/process death so crash→resume still reopens.
   **When adding a log-layer test, put a second execution in the log**: a single-execution fixture is
   the one configuration where these bugs are invisible, which is how D4 shipped.
+
+- **Conditional append (v1 distribution seam)** — `ConditionalAppendTest` (runtime) +
+  three `GumboEventLogTest` cases: `EventLog.append(id, event, expectedSeq)` rejects a writer the
+  stream has moved past with `StaleWriterException`, and `supportsConditionalAppend()` says whether a
+  log can do it at all. The default **throws** — never falls back to an unconditional append, since a
+  log that ignored `expectedSeq` would look like it was fencing while fencing nothing. `GumboEventLog`
+  delegates to Gumbo's storage-side fence (Catalyst's `seq` *is* the tag's `streamVersion`, so no
+  translation); the conflict arrives wrapped in `LogWriteException` inside `CompletionException`, so
+  it is matched on the whole cause chain, not the top type. Not yet used by the runtime — the
+  in-process invariant is still `KeyedLock` + `inFlight`; this is the seam a claim loop writes to.
+
+- **In-doubt model completions** — `ReplayingContextInDoubtCompletionTest`: a `CompletionRequested`
+  with no `CompletionReceived` is a provider call that may have been accepted and *billed*, so it
+  routes through `InDoubtPolicy` exactly as a dangling `ToolRequested` does (it previously just
+  re-issued the call). Keyed on the recorded `requestHash` — a different request at that boundary is
+  a divergence, not a recovery. `RETRY` completes the dangling request instead of opening a second
+  one, so the recovered log stays one request / one result and replays normally. **The trap:** a
+  model failure also leaves an unmatched `CompletionRequested` (model failures record nothing), so
+  `seed()` clears the pending request on `RetryRequested` — a verdict, not a doubt. Without that,
+  every retried model failure becomes an `InDoubtException` under the default `FAIL`.
 
 CI (`.github/workflows/ci.yml`) runs all exit demos as gates — it is the source of truth per phase.

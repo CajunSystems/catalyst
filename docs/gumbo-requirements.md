@@ -8,19 +8,36 @@ sits behind several of the same limitations.
 
 This document records them, with the evidence for each.
 
-> **Status: addressed in Gumbo 0.3.0.** D1–D4, A1, A2, A4 and A5 all landed; Catalyst is on 0.3.0 and
-> has adopted the version-keyed read, which closes the live corruption under D4. The verification is
-> in `GumboEventLogTest` (a tail read with a second execution in the log, on both adapters, plus the
-> single-writer refusal) and in
+> **Status: most of this has landed.**
+>
+> | Item | Where |
+> |---|---|
+> | D1, D3, A1, A2, A5 | Gumbo 0.3.0 |
+> | D4 | closed on the Catalyst side by adopting `readAfterVersion` (0.3.0 only *added* it) |
+> | A3 | Gumbo 0.4.0 |
+> | A4 | Gumbo, merged and unreleased |
+> | D2, A6 | open |
+> | Multi-tag entries carry one version | open, and now the item Catalyst's v1 depends on |
+>
+> The D4 verification is in `GumboEventLogTest` (a tail read with a second execution in the log, on
+> both adapters, plus the single-writer refusal) and in
 > `SnapshotAcceptanceTest.warmInspectMatchesColdWhenAnotherExecutionSharesTheLog`, which reproduces
 > the warm-fold corruption end to end and fails if the seqnum-keyed read is restored.
 >
 > One thing this cost us worth recording: **upgrading to 0.3.0 changed nothing by itself.** The whole
 > suite stayed green because 0.3.0 *adds* `readAfterVersion` rather than changing what `readAfter`
 > does — the old call kept compiling and kept being wrong. A dependency bump is not a fix until the
-> caller moves. The remaining open items are A3 (KV compare-and-set) and A6 (multi-tag ergonomics),
-> neither of which Catalyst uses yet; see the 0.3.0 CHANGELOG for the known limitation on secondary
-> tags in a multi-tag append, which Catalyst does not hit because it appends to one tag per execution.
+> caller moves.
+>
+> **The same lesson, one layer up, and it cost a release cycle: a merged release is not a released
+> one.** Gumbo 0.4.0 was cut and merged with the tag never pushed, and JitPack builds from tags — so
+> A3, the compare-and-set the whole lease and claim story rests on, existed and was unreachable.
+> Resolved: `0.4.0` now tags `ceb0e0e` and this build is on it.
+>
+> **What Catalyst needs next, in order:** A4 released (the runtime should refuse to distribute against
+> a log reporting `multiWriter() == false` rather than find out later); and the multi-tag version
+> defect, which [`distribution.md`](distribution.md) depends on for claimable work and which was filed
+> last in Gumbo's backlog on log-migration cost — a ranking made before anything depended on it.
 
 ## How these conclusions were reached
 

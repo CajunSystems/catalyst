@@ -231,27 +231,49 @@ The substrate becomes a platform. This is where the other CajunSystems component
   instead of polling) whenever it is ready, and backed out cheaply if it is not. **Bayou** does not
   distribute — it is single-process — but it shares Gumbo with Catalyst, so it is useful *within* a
   node (supervising the claim loop, lease-renewal timers, death watch) and could later consume the
-  same primitives to become clustered itself. The gaps are all storage-side: conditional append, lease CAS with TTL, and a claimable-work index
-  (there is currently no way to ask the log *what needs running* — every read path starts from an id
-  you already hold). **Measured prerequisite:** Gumbo is not multi-writer safe today — two JVMs on one
-  directory were each handed `seq` 0,1,2 for the same execution and the log then reported 3 of the 6
-  appends. Nothing is physically lost (all six are in `log.dat`); `localId` assignment is process-local
-  and `index.dat` clobbers. `FoundationDBSequencer` does not help — it sequences the global `seqnum`,
-  while `localId` (which *is* Catalyst's `seq`) never passes through the `Sequencer`. So conditional
-  append must be a **Gumbo** primitive rather than a Catalyst-side wrapper, or the check races the
-  assignment beneath it.
+  same primitives to become clustered itself.
+- ✅ **The `EventLog` seam for conditional append has landed** — `append(id, event, expectedSeq)` plus
+  `supportsConditionalAppend()`, rejecting a stale writer with `StaleWriterException`. The default
+  **throws** rather than falling back to an unconditional append: a log that quietly ignored
+  `expectedSeq` would look like it was participating in the protocol while providing none of it,
+  which surfaces as a corrupted history rather than as an error. `InMemoryEventLog` fences under the
+  monitor that assigns the seq; `GumboEventLog` delegates to Gumbo's own fence, where the compare and
+  the increment are one storage operation — Catalyst's `seq` *is* the execution tag's
+  `streamVersion`, so there is no translation in between. Covered by `ConditionalAppendTest` and
+  three `GumboEventLogTest` cases (with a second execution in the log), each verified to fail when
+  the fence is removed. What remains for distribution is the claim loop above it, not the primitive.
+- **Status of the storage-side prerequisites**, all measured rather than assumed. Gumbo 0.3.0 closed
+  the blocker: versions are assigned *in storage* now, not by a per-process counter, so the two-JVM
+  probe that handed both writers `seq` 0,1,2 no longer applies — and the file adapter takes an
+  exclusive directory lock, so a second process is refused loudly instead of corrupting silently.
+  Lease CAS arrived in 0.4.0. Two gaps are left, and both are Gumbo-side:
+  - ~~**0.4.0 is merged but untagged**~~ — tagged and picked up: Catalyst is on gumbo 0.4.0, so the
+    lease CAS (A3) is reachable. Nothing consumes it yet; the claim loop is what would.
+  - **Claimable work** turned out to need no new SPI (dual-tagging into a shared queue tag, one
+    atomic append — see `docs/distribution.md`) but the queue tag *cannot be cursored by version*:
+    an entry carries one `streamVersion`, from its primary tag, so a version-keyed tail read on a
+    fan-out tag can silently skip work. Seqnum-keyed reads are correct there in the meantime. The
+    proper fix costs a log migration and was ranked last in Gumbo's backlog on that cost — before
+    this design depended on it.
 
 ### In-doubt model completions (found while designing distribution)
-- A crash between `CompletionRequested` and `CompletionReceived` leaves the provider call **in
-  doubt**: it may have been accepted and billed, but no result reached the log, so a resume re-issues
-  it. Measured on the current single-node code — a log ending at `CompletionRequested` resumed and
-  invoked the model a second time. Catalyst already handles this for **tools** (`seed()` detects a
-  `ToolRequested` with no `ToolCompleted` and routes recovery through `InDoubtPolicy`), but there is
-  no equivalent for model completions: a trailing `CompletionRequested` sets `pendingRequestHash` and
-  is otherwise ignored. Closing the asymmetry — an in-doubt policy for model calls, keyed on the
-  recorded `requestHash` — is what "zero duplicate model calls" needs in order to hold under node
-  failure rather than only under graceful resume. Worth doing independently of distribution, which
-  merely makes the window far more frequent.
+- ✅ **Closed.** A crash between `CompletionRequested` and `CompletionReceived` left the provider call
+  **in doubt** — it may have been accepted and billed with only the result lost on the way back — and
+  a resume re-issued it. Measured before the fix: a log ending at `CompletionRequested` resumed and
+  invoked the model a second time. Catalyst already handled this for **tools** (`seed()` detects a
+  `ToolRequested` with no `ToolCompleted` and routes recovery through `InDoubtPolicy`); the model
+  path had no equivalent, because a trailing `CompletionRequested` set `pendingRequestHash` and was
+  otherwise ignored. It now routes through the same `InDoubtPolicy`, keyed on the recorded
+  `requestHash` so a recovery cannot attach itself to a different question (a divergent request at
+  that boundary is a `NonDeterministicReplayException`). A `RETRY` **completes the dangling request**
+  rather than opening a second one, so a recovered log is one request paired with one result and
+  replays like an execution that never crashed. The discriminator that keeps retry semantics intact:
+  a `RetryRequested` recorded after the request is a *verdict*, not a doubt — the provider call threw
+  and the process lived to say so — and re-runs live as before. That distinction is pinned by its own
+  test, because getting it wrong turns every retried model failure into an `InDoubtException` under
+  the default policy. This is what "zero duplicate model calls" needs in order to hold under node
+  failure rather than only under graceful resume; distribution merely makes the window far more
+  frequent.
 
 ### Eval harness (spec §12)
 - Recorded production executions replayed against **candidate models/prompts** as a regression suite

@@ -85,6 +85,14 @@ public final class ReplayingContext implements Context {
     private ToolRequested danglingTool;
     private long danglingToolSeq = -1;
     /**
+     * A trailing {@code CompletionRequested} with no {@code CompletionReceived}: a provider call that
+     * was in flight at crash. It may have been accepted and billed with the result lost on the way
+     * back, so re-issuing it is a real cost, not just a repeated computation — the same in-doubt
+     * shape a tool has, on the boundary where it is most expensive to get wrong.
+     */
+    private CompletionRequested danglingCompletion;
+    private long danglingCompletionSeq = -1;
+    /**
      * The seq of the {@code ToolCompleted} recording the most recent live tool failure, and the exact
      * exception instance it rethrew — so the runtime can attribute a propagating throwable to the
      * boundary that raised it ({@link #failedBoundarySeq}). {@code -1} until a live tool fails.
@@ -149,16 +157,32 @@ public final class ReplayingContext implements Context {
         long lastRecordedSeq = recorded.isEmpty() ? -1 : recorded.get(recorded.size() - 1).seq();
 
         String pendingRequestHash = null;
+        CompletionRequested pendingCompletionRequest = null; // unmatched (in-doubt) if non-null at end
+        long pendingCompletionRequestSeq = -1;
         ToolRequested pendingToolRequest = null; // an unmatched ToolRequested (in-doubt) if non-null at end
         long pendingToolRequestSeq = -1;
         String pendingToolInputHash = null;
         for (SequencedEvent se : recorded) {
             CatalystEvent e = se.event();
             switch (e) {
-                case CompletionRequested cr -> pendingRequestHash = cr.requestHash();
+                case CompletionRequested cr -> {
+                    pendingRequestHash = cr.requestHash();
+                    pendingCompletionRequest = cr;
+                    pendingCompletionRequestSeq = se.seq();
+                }
                 case CompletionReceived cr -> {
                     boundaries.add(new Boundary(se.seq(), e, null, pendingRequestHash));
                     pendingRequestHash = null;
+                    pendingCompletionRequest = null;
+                    pendingCompletionRequestSeq = -1;
+                }
+                case RetryRequested rr -> {
+                    // A retry appended *after* an unmatched CompletionRequested means the provider call
+                    // threw and the process lived to decide what to do about it. That is a failure, not
+                    // a doubt: nothing was recorded for it, and retry-as-attempt re-runs the boundary
+                    // live by design. Only a request with no verdict after it at all is in doubt.
+                    pendingCompletionRequest = null;
+                    pendingCompletionRequestSeq = -1;
                 }
                 case ToolRequested tr -> {
                     pendingToolRequest = tr;
@@ -208,6 +232,13 @@ public final class ReplayingContext implements Context {
         if (pendingToolRequest != null) {
             this.danglingTool = pendingToolRequest;
             this.danglingToolSeq = pendingToolRequestSeq;
+        }
+        // And a completion is in-doubt on the same terms: requested, never received, and no retry
+        // verdict recorded after it. Lifecycle events may follow (ExecutionFailed under FAIL,
+        // ExecutionPaused under ASK) without changing that.
+        if (pendingCompletionRequest != null) {
+            this.danglingCompletion = pendingCompletionRequest;
+            this.danglingCompletionSeq = pendingCompletionRequestSeq;
         }
     }
 
@@ -264,13 +295,73 @@ public final class ReplayingContext implements Context {
             // hash mismatch → STRICT throws, BRANCH forks and falls through to live
             forkOrThrow(b.seq(), "model request " + b.hash(), "model request " + actualHash);
         }
-        requireAppendable("model completion");
-        if (realModel == null) {
-            throw new IllegalStateException("No model configured for this runtime; ctx.model() is unavailable");
+        if (danglingCompletion != null) {
+            return handleInDoubtCompletion(request, sink);
         }
+        requireAppendable("model completion");
+        requireModel();
         String requestHash = Hashing.canonicalRequestHash(request);
         append(new PromptBuilt(now(), Hashing.sha256(canonicalPrompt(request)), eventMapper.valueToTree(request.prompt())));
         append(new CompletionRequested(now(), requestHash));
+        return invokeAndRecord(request, sink);
+    }
+
+    /**
+     * Recovery for a completion that was requested and never received — the provider may have
+     * accepted and billed the call with only the result lost, so a resume that re-issued it silently
+     * would spend real money to hide a real question.
+     *
+     * <p>Catalyst has always done this for tools. The asymmetry was not a decision: a trailing
+     * {@code CompletionRequested} set the pending request hash and was otherwise ignored, so the
+     * resume simply ran the boundary live again. Measured on the single-node code before this
+     * change, a log ending at {@code CompletionRequested} resumed and called the model a second time.
+     *
+     * <p>Keyed on the recorded {@code requestHash}: recovering an in-doubt call only means anything
+     * if it is the <em>same</em> call. A task that reaches this boundary asking something else has
+     * diverged, and re-issuing under the old request's doubt would attach the recovery to the wrong
+     * question — so that is a determinism failure, reported as one.
+     *
+     * <p>A {@code RETRY} completes the dangling request rather than opening a new one: the log keeps
+     * one {@code CompletionRequested} paired with one {@code CompletionReceived}, so a recovered
+     * execution replays exactly like one that never crashed. Same shape as the tool path, which
+     * appends only the {@code ToolCompleted}.
+     */
+    private Completion handleInDoubtCompletion(CompletionRequest request, TokenSink sink) {
+        CompletionRequested pending = danglingCompletion;
+        long pendingSeq = danglingCompletionSeq;
+        danglingCompletion = null;
+        String actualHash = Hashing.canonicalRequestHash(request);
+        if (!pending.requestHash().equals(actualHash)) {
+            throw new NonDeterministicReplayException(pendingSeq,
+                    "in-doubt model request " + pending.requestHash(), "model request " + actualHash);
+        }
+        return switch (inDoubtPolicy) {
+            case RETRY -> {
+                requireAppendable("in-doubt retry of model completion");
+                requireModel();
+                yield invokeAndRecord(request, sink);
+            }
+            case FAIL -> throw new InDoubtException(
+                    "In-doubt model completion (crashed between request and completion); the provider"
+                    + " call may have been accepted and billed");
+            case ASK -> {
+                append(new ExecutionPaused(now(), "in-doubt model completion"));
+                throw new ExecutionPausedSignal("in-doubt model completion");
+            }
+        };
+    }
+
+    private void requireModel() {
+        if (realModel == null) {
+            throw new IllegalStateException("No model configured for this runtime; ctx.model() is unavailable");
+        }
+    }
+
+    /**
+     * Calls the provider and records the completion. The request marker is the caller's business: a
+     * live call opens one, an in-doubt retry closes the one already in the log.
+     */
+    private Completion invokeAndRecord(CompletionRequest request, TokenSink sink) {
         long t0 = System.nanoTime();
         Completion completion = sink == null
                 ? realModel.complete(request)

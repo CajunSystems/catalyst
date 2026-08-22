@@ -5,6 +5,7 @@ import com.cajunsystems.catalyst.events.CatalystEvent;
 import com.cajunsystems.catalyst.events.SequencedEvent;
 import com.cajunsystems.catalyst.log.EventLog;
 import com.cajunsystems.catalyst.log.Snapshot;
+import com.cajunsystems.catalyst.log.StaleWriterException;
 
 import java.util.ArrayList;
 import java.util.List;
@@ -30,6 +31,28 @@ public final class InMemoryEventLog implements EventLog {
             stream.add(new SequencedEvent(seq, event));
             return seq;
         }
+    }
+
+    /**
+     * Fenced by the same monitor that assigns the seq, so the comparison and the append cannot be
+     * separated by another thread. That makes the fence real here — within this process, which is
+     * the only place this log exists. A stale writer in another JVM is not a case that can arise
+     * for a log that is one JVM's heap.
+     */
+    @Override
+    public long append(ExecutionId executionId, CatalystEvent event, long expectedSeq) {
+        List<SequencedEvent> stream = streams.computeIfAbsent(executionId, k -> new ArrayList<>());
+        synchronized (stream) {
+            long next = stream.size();
+            if (next != expectedSeq) throw new StaleWriterException(executionId, expectedSeq, next);
+            stream.add(new SequencedEvent(next, event));
+            return next;
+        }
+    }
+
+    @Override
+    public boolean supportsConditionalAppend() {
+        return true;
     }
 
     @Override
