@@ -70,6 +70,26 @@ public interface EventLog extends AutoCloseable {
         return false;
     }
 
+    /**
+     * Whether this log can be written by several processes at once with their sequence numbers
+     * assigned consistently.
+     *
+     * <p>The other half of the distribution prerequisite, and the reason
+     * {@link #supportsConditionalAppend()} is necessary without being sufficient. A log can fence
+     * perfectly within one JVM and not at all between two — a file-backed log does exactly that,
+     * comparing and appending under its own monitor, which is sound only because it refuses a
+     * second process outright. Ask for both before running executions across nodes, and refuse to
+     * start when either is missing, rather than discovering the difference from a stream two nodes
+     * have both written to.
+     *
+     * <p>Defaults to {@code false}, in the direction that fails safe: a runtime that believes a log
+     * is single-writer declines to distribute over it, where one that believes the opposite
+     * corrupts history quietly.
+     */
+    default boolean supportsMultiWriter() {
+        return false;
+    }
+
     /** Reads all events for {@code executionId} in sequence order. Empty if none. */
     List<SequencedEvent> read(ExecutionId executionId);
 

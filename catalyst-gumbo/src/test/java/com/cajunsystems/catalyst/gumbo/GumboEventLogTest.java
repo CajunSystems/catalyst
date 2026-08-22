@@ -2,8 +2,11 @@ package com.cajunsystems.catalyst.gumbo;
 
 import com.cajunsystems.catalyst.ExecutionId;
 import com.cajunsystems.catalyst.events.CatalystEvent;
+import com.cajunsystems.catalyst.events.EventCodec;
 import com.cajunsystems.catalyst.events.SequencedEvent;
 import com.cajunsystems.catalyst.log.Snapshot;
+import com.cajunsystems.gumbo.core.LogCapabilities;
+import com.cajunsystems.gumbo.persistence.InMemoryPersistenceAdapter;
 import com.cajunsystems.catalyst.log.StaleWriterException;
 import com.fasterxml.jackson.databind.node.TextNode;
 import org.junit.jupiter.api.Test;
@@ -201,6 +204,84 @@ class GumboEventLogTest {
             assertThatThrownBy(() -> log.append(id, new CatalystEvent.ExecutionStarted(T, 1, "node-1"), 0))
                     .isInstanceOf(StaleWriterException.class);
             assertThat(log.read(id)).hasSize(1);
+        }
+    }
+
+    /**
+     * What a runtime must read before deciding it may distribute: the log fences, and it is not
+     * multi-writer. Both halves matter and they are separable — a file-backed log compares and
+     * appends under its own monitor, which is sound only because it refuses a second process
+     * outright. Fenced within one JVM is not fenced across two.
+     */
+    @Test
+    void aFileBackedLogIsFencedButNotMultiWriter(@TempDir Path dir) {
+        try (GumboEventLog log = GumboEventLog.at(dir)) {
+            assertThat(log.supportsConditionalAppend()).isTrue();
+            assertThat(log.supportsMultiWriter())
+                    .as("single-writer by construction — it holds an exclusive directory lock")
+                    .isFalse();
+        }
+    }
+
+    @Test
+    void anInMemoryLogIsFencedButNotMultiWriter() {
+        try (GumboEventLog log = GumboEventLog.inMemory()) {
+            assertThat(log.supportsConditionalAppend()).isTrue();
+            assertThat(log.supportsMultiWriter()).isFalse();
+        }
+    }
+
+    /**
+     * The answers are asked for, not asserted. An adapter that disclaims the fence is reported as
+     * disclaiming it — which no hardcoded {@code true} could do, and which is the whole distinction
+     * this delegation exists to make. Gumbo's capabilities are per-adapter, so a third-party
+     * adapter that cannot compare and increment atomically is described by its own answer rather
+     * than by a claim this class makes about adapters it has never seen.
+     */
+    @Test
+    void theFenceAnswerComesFromTheAdapterRatherThanFromThisClass() {
+        try (GumboEventLog log = GumboEventLog.open(new UnfencedAdapter(), EventCodec.builder().build())) {
+            assertThat(log.supportsConditionalAppend()).isFalse();
+        }
+    }
+
+    /**
+     * And the multi-writer answer is composed, not forwarded. This adapter claims multi-writer,
+     * and the log still reports {@code false} — because Gumbo requires a sequencer whose global
+     * seqnum spans processes too, and the default is a per-process counter.
+     *
+     * <p>So no log Catalyst builds through these factories is multi-writer today, however capable
+     * its storage. That is worth pinning rather than assuming: it is the difference between a
+     * distributed runtime refusing to start and one discovering the problem from a stream two
+     * nodes have both written to.
+     *
+     * <p>Being straight about what this one proves: unlike the fence test above, it would also
+     * pass against a hardcoded {@code false}, because every configuration reachable from here
+     * reports {@code false} anyway. It pins the contract, not the delegation. It starts
+     * distinguishing them the moment a distributed sequencer is configurable through these
+     * factories — which is the change that would make the answer flip.
+     */
+    @Test
+    void claimingMultiWriterStorageIsNotEnoughOnItsOwn() {
+        try (GumboEventLog log = GumboEventLog.open(new MultiWriterClaimingAdapter(),
+                EventCodec.builder().build())) {
+            assertThat(log.supportsMultiWriter())
+                    .as("storage says yes; the default sequencer is a per-process AtomicLong")
+                    .isFalse();
+        }
+    }
+
+    /** Declares no fence, to prove the answer tracks the adapter. */
+    private static final class UnfencedAdapter extends InMemoryPersistenceAdapter {
+        @Override public LogCapabilities capabilities() {
+            return LogCapabilities.builder(super.capabilities()).conditionalAppend(false).build();
+        }
+    }
+
+    /** Claims cross-process storage, which the sequencer half still has to agree with. */
+    private static final class MultiWriterClaimingAdapter extends InMemoryPersistenceAdapter {
+        @Override public LogCapabilities capabilities() {
+            return LogCapabilities.builder(super.capabilities()).multiWriter(true).build();
         }
     }
 

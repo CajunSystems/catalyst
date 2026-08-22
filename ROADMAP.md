@@ -242,13 +242,22 @@ The substrate becomes a platform. This is where the other CajunSystems component
   `streamVersion`, so there is no translation in between. Covered by `ConditionalAppendTest` and
   three `GumboEventLogTest` cases (with a second execution in the log), each verified to fail when
   the fence is removed. What remains for distribution is the claim loop above it, not the primitive.
+- ✅ **Both capability answers are now asked for, not asserted** — `supportsConditionalAppend()` and
+  the new `supportsMultiWriter()` delegate to Gumbo 0.5.0's `capabilities()`. The first used to be a
+  hardcoded `true`, correct for every adapter Gumbo ships and wrong in shape: a client asserting a
+  guarantee on storage's behalf is the mistake that produced D4. Read them as a pair — a file-backed
+  log is fenced and *not* multi-writer, which is precisely the configuration a runtime must refuse
+  to distribute over. **No log Catalyst builds today reports `multiWriter`**, because Gumbo composes
+  it from storage *and* the sequencer, and the default sequencer is a per-process counter that no
+  storage fence can compensate for.
 - **Status of the storage-side prerequisites**, all measured rather than assumed. Gumbo 0.3.0 closed
   the blocker: versions are assigned *in storage* now, not by a per-process counter, so the two-JVM
   probe that handed both writers `seq` 0,1,2 no longer applies — and the file adapter takes an
   exclusive directory lock, so a second process is refused loudly instead of corrupting silently.
   Lease CAS arrived in 0.4.0. Two gaps are left, and both are Gumbo-side:
-  - ~~**0.4.0 is merged but untagged**~~ — tagged and picked up: Catalyst is on gumbo 0.4.0, so the
-    lease CAS (A3) is reachable. Nothing consumes it yet; the claim loop is what would.
+  - ~~**0.4.0 is merged but untagged**~~ — tagged and picked up. Catalyst is now on gumbo **0.5.0**,
+    so both the lease CAS (A3) and declared capabilities (A4) are reachable. Nothing consumes the
+    CAS yet; the claim loop is what would.
   - **Claimable work** turned out to need no new SPI (dual-tagging into a shared queue tag, one
     atomic append — see `docs/distribution.md`) but the queue tag *cannot be cursored by version*:
     an entry carries one `streamVersion`, from its primary tag, so a version-keyed tail read on a

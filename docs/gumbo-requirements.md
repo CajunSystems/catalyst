@@ -15,7 +15,7 @@ This document records them, with the evidence for each.
 > | D1, D3, A1, A2, A5 | Gumbo 0.3.0 |
 > | D4 | closed on the Catalyst side by adopting `readAfterVersion` (0.3.0 only *added* it) |
 > | A3 | Gumbo 0.4.0 |
-> | A4 | Gumbo, merged and unreleased |
+> | A4 | Gumbo 0.5.0 |
 > | D2, A6 | open |
 > | Multi-tag entries carry one version | open, and now the item Catalyst's v1 depends on |
 >
@@ -34,10 +34,16 @@ This document records them, with the evidence for each.
 > A3, the compare-and-set the whole lease and claim story rests on, existed and was unreachable.
 > Resolved: `0.4.0` now tags `ceb0e0e` and this build is on it.
 >
-> **What Catalyst needs next, in order:** A4 released (the runtime should refuse to distribute against
-> a log reporting `multiWriter() == false` rather than find out later); and the multi-tag version
-> defect, which [`distribution.md`](distribution.md) depends on for claimable work and which was filed
-> last in Gumbo's backlog on log-migration cost — a ranking made before anything depended on it.
+> **A4 is released and adopted.** `GumboEventLog` delegates both capability answers to
+> `SharedLog.capabilities()` instead of asserting them, so a runtime can read `multiWriter()` and
+> refuse to distribute rather than find out later. The one surprise on adoption: no log Catalyst
+> builds reports `multiWriter` at all, because Gumbo composes it from storage *and* the sequencer,
+> and the default sequencer is a per-process counter — a fence in storage cannot compensate, since
+> the seqnum never passes through it.
+>
+> **What Catalyst needs next:** the multi-tag version defect, which
+> [`distribution.md`](distribution.md) depends on for claimable work and which was filed last in
+> Gumbo's backlog on log-migration cost — a ranking made before anything depended on it.
 
 ## How these conclusions were reached
 

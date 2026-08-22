@@ -107,7 +107,17 @@ public final class GumboEventLog implements EventLog {
                 .build();
     }
 
-    private static GumboEventLog open(PersistenceAdapter adapter, EventCodec codec) {
+    /**
+     * Package-private rather than private so a test can supply an adapter with a different set of
+     * declared capabilities.
+     *
+     * <p>Widening this by one level buys something specific: without it, the capability answers
+     * below cannot be distinguished from hardcoded constants, because every adapter reachable
+     * through the public factories answers the same way — fenced, not multi-writer. A commit whose
+     * subject is "ask the log instead of asserting on its behalf" should not ship a test that
+     * assumes the asking happens.
+     */
+    static GumboEventLog open(PersistenceAdapter adapter, EventCodec codec) {
         try {
             SharedLogConfig config = SharedLogConfig.builder()
                     .persistenceAdapter(adapter)
@@ -186,20 +196,45 @@ public final class GumboEventLog implements EventLog {
     }
 
     /**
-     * True: every persistence adapter Gumbo ships has assigned versions in storage and fenced on
-     * them since 0.3.0.
+     * Asks the log rather than asserting on its behalf — which is what changed when Gumbo 0.5.0
+     * shipped declared capabilities.
      *
-     * <p>Worth being precise about what that buys, because the two halves are separable. The fence
-     * is real on all of them — the compare and the increment are one operation. Whether it holds
-     * against a writer in <em>another process</em> is a different question, answered by the adapter:
-     * one transaction on FoundationDB, one JVM's monitor on the file adapter (which is sufficient
-     * there only because it refuses a second process outright). Distributed execution needs both,
-     * and this method reports only the first. The second becomes askable when Gumbo's declared
-     * capabilities land downstream, at which point this delegates rather than asserts.
+     * <p>This method used to return a hardcoded {@code true}, justified by the observation that
+     * every adapter Gumbo ships has fenced since 0.3.0. That was correct and it was the wrong
+     * shape: a client asserting a guarantee on storage's behalf is precisely the mistake that
+     * produced this project's worst defect, where a per-execution cursor was passed to a
+     * seqnum-keyed read because nothing said otherwise and the resulting fold silently
+     * double-counted. A capability that cannot be interrogated will eventually be assumed.
+     *
+     * <p>It also stops being true for a custom adapter. Gumbo's own answer is per-adapter, so a
+     * third-party {@code PersistenceAdapter} that cannot compare and increment atomically reports
+     * {@code false} here now, instead of being described by a claim this class made about
+     * adapters it has never seen.
      */
     @Override
     public boolean supportsConditionalAppend() {
-        return true;
+        return service.capabilities().conditionalAppend();
+    }
+
+    /**
+     * Whether this log is safe for writers in different processes — the half a fence cannot supply
+     * on its own.
+     *
+     * <p>Gumbo composes this from both of its layers, and the composition is the point: storage
+     * that assigns per-tag versions across processes, <em>and</em> a sequencer whose global
+     * {@code seqnum} spans them. Its default sequencer is a per-process {@code AtomicLong}, so a
+     * FoundationDB adapter behind it reports {@code false} despite arbitrating every version
+     * correctly — the seqnum would still collide, and the adapters index by it.
+     *
+     * <p>In practice today: {@code true} only for a FoundationDB-backed log with a distributed
+     * sequencer. {@link #at(Path)} is file-backed and single-writer by construction — it takes an
+     * exclusive directory lock and refuses a second process — so it fences (see
+     * {@link #supportsConditionalAppend()}) without being multi-writer. That pair, fenced and not
+     * multi-writer, is exactly what a runtime needs to read before deciding it may distribute.
+     */
+    @Override
+    public boolean supportsMultiWriter() {
+        return service.capabilities().multiWriter();
     }
 
     @Override
