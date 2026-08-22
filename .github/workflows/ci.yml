@@ -411,3 +411,34 @@ jobs:
           echo "$OUT" | grep -q "CAPTURED_LABELS=\[auto:Instant.now#0, auto:UUID.randomUUID#1\]" \
             || { echo "FAIL: -javaagent launch did not capture through the application's bridge"; exit 1; }
           echo "v0.2 Auto-capture packaging holds: -javaagent works standalone and binds the app's bridge."
+
+      # The v1 in-doubt criterion: a node that dies between CompletionRequested and
+      # CompletionReceived leaves the provider call in doubt — possibly accepted and billed, with no
+      # result in the log. Before this, a resume silently re-issued it (and orphaned a second request);
+      # now it routes through InDoubtPolicy, the same way an in-doubt tool always has.
+      - name: v1 In-doubt model completions exit demo (crash mid-completion → policy, not a silent re-issue)
+        run: |
+          set -uo pipefail
+          CP="catalyst-api/target/classes:$(cat catalyst-api/target/cp.txt)"
+          DIR="$(mktemp -d)"
+
+          echo "--- process 1: record the request, then die before the response (exit 137) ---"
+          rc=0
+          java -cp "$CP" com.cajunsystems.catalyst.api.Demo "$DIR" indoubtrecord || rc=$?
+          echo "record exit code: $rc"
+          if [ "$rc" -ne 137 ]; then echo "FAIL: record did not die mid-completion (exit $rc)"; exit 1; fi
+
+          echo "--- process 2: resume the crashed execution ---"
+          OUT="$(java -cp "$CP" com.cajunsystems.catalyst.api.Demo "$DIR" indoubtresume)"
+          echo "$OUT"
+          echo "$OUT" | grep -q "default policy surfaced the in-doubt call" \
+            || { echo "FAIL: the in-doubt completion was not surfaced"; exit 1; }
+          echo "$OUT" | grep -q "provider calls under FAIL: 0" \
+            || { echo "FAIL: the in-doubt completion was silently re-issued"; exit 1; }
+          echo "$OUT" | grep -q "provider calls under RETRY: 1" \
+            || { echo "FAIL: RETRY did not re-issue exactly once"; exit 1; }
+          echo "$OUT" | grep -q "repaired log: 1 request(s), 1 response(s)" \
+            || { echo "FAIL: recovery left the stream malformed (orphaned request)"; exit 1; }
+          echo "$OUT" | grep -q "external calls during replay: 0" \
+            || { echo "FAIL: the repaired log did not replay exactly"; exit 1; }
+          echo "v1 in-doubt criterion holds: the crash window is governed by policy, not paid for twice."

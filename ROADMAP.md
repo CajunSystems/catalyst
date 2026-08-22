@@ -242,16 +242,28 @@ The substrate becomes a platform. This is where the other CajunSystems component
   assignment beneath it.
 
 ### In-doubt model completions (found while designing distribution)
-- A crash between `CompletionRequested` and `CompletionReceived` leaves the provider call **in
-  doubt**: it may have been accepted and billed, but no result reached the log, so a resume re-issues
-  it. Measured on the current single-node code — a log ending at `CompletionRequested` resumed and
-  invoked the model a second time. Catalyst already handles this for **tools** (`seed()` detects a
-  `ToolRequested` with no `ToolCompleted` and routes recovery through `InDoubtPolicy`), but there is
-  no equivalent for model completions: a trailing `CompletionRequested` sets `pendingRequestHash` and
-  is otherwise ignored. Closing the asymmetry — an in-doubt policy for model calls, keyed on the
-  recorded `requestHash` — is what "zero duplicate model calls" needs in order to hold under node
-  failure rather than only under graceful resume. Worth doing independently of distribution, which
-  merely makes the window far more frequent.
+- ✅ **Shipped.** A crash between `CompletionRequested` and `CompletionReceived` leaves the provider
+  call **in doubt**: it may have been accepted, produced and billed, but no result reached the log.
+  Catalyst had always routed the equivalent *tool* window through `InDoubtPolicy` (`seed()` detects a
+  `ToolRequested` with no `ToolCompleted`); model completions had no counterpart — a trailing
+  `CompletionRequested` set `pendingRequestHash` and was otherwise ignored — so a resume re-issued the
+  call silently. Measured before the fix: the provider was called a second time **and** the stream was
+  left with two `CompletionRequested` events to one response, so recovery both double-paid and
+  malformed the log. `seed()` now records a `danglingModel` counterpart to `danglingTool`, keyed on the
+  recorded `requestHash`, and `modelBoundary` routes it through the same policy: `FAIL` (default)
+  surfaces it, `RETRY` re-issues once by explicit opt-in, `ASK` pauses for an operator. `RETRY`
+  completes the dangling request **in place** — only `CompletionReceived` is appended, never a second
+  request — so the repaired stream has the shape of one that never crashed and still replays exactly.
+  A locally-thrown provider call is deliberately *not* in doubt: the process survived to record its
+  decision, so the `RetryPolicy` continues to own it (the `RetryRequested` in the log is what
+  distinguishes the two, since a failed completion records no result event). This is what "zero
+  duplicate model calls" needs in order to hold under node failure rather than only under graceful
+  resume — worth having independently of distribution, which merely makes the window far more
+  frequent. Gated by the v1 In-doubt exit demo in CI (a real `kill -9` between request and response).
+  *Not closed (noted): if the task's first live boundary after the recorded prefix is a different
+  boundary than the one in flight, the dangling request is never resolved and stays orphaned in the
+  log — the same pre-existing gap the tool side has, and only reachable via nondeterministic task
+  code.*
 
 ### Eval harness (spec §12)
 - Recorded production executions replayed against **candidate models/prompts** as a regression suite

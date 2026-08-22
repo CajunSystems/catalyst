@@ -157,6 +157,21 @@ checkout's pom to `com.github.CajunSystems` before installing.
   as span events on the root. Root status is OK/ERROR from the folded terminal state. Read-only and
   post-hoc (consumes `runtime.log().read(id)`), so the log *is* the trace. The module depends on the
   OTel **API** only; tests drive a real SDK into an in-memory exporter offline.
+- **v1 In-doubt model completions** — `InDoubtModelAcceptanceTest` + `ReplayingContextInDoubtModelTest`
+  + `InDoubtModelResumeTest` + `Demo indoubtrecord|indoubtresume`: a process is `kill -9`'d between
+  `CompletionRequested` and `CompletionReceived`, and the resume routes the in-flight provider call
+  through `InDoubtPolicy` instead of silently re-issuing it. `seed()` now keeps a `danglingModel`
+  (seq + recorded `requestHash`) alongside `danglingTool`; `modelBoundary` checks it just before going
+  live. `FAIL` (default) raises `InDoubtException`, `ASK` records `ExecutionPaused`, `RETRY` re-issues
+  once and appends **only** `CompletionReceived` — completing the dangling request in place, so the
+  stream keeps its one-request-one-response shape and replays exactly. Two things that bite: (1) a
+  provider call that *threw* leaves the identical log shape (a failed completion records no result
+  event), so `seed()` clears the pending request when a `RetryRequested` follows it — without that,
+  every model retry becomes an `InDoubtException` under the default policy, exactly the trap the tool
+  path documents; (2) `fork()` must clear it too, or a branch inherits the old line's unfinished
+  business. Measured before the fix: the resume called the provider again *and* left two
+  `CompletionRequested` events to one response. Not closed: a dangling request is only resolved if the
+  task's next live boundary is that same model call — the same pre-existing gap the tool side has.
 - **Gumbo 0.3.0** — `GumboEventLogTest` (two shared-log cases + the single-writer case) +
   `SnapshotAcceptanceTest.warmInspectMatchesColdWhenAnotherExecutionSharesTheLog`: the log-layer fixes
   from `docs/gumbo-requirements.md`. The one that mattered is **D4** — Catalyst's `seq` is a per-tag

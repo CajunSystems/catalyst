@@ -37,8 +37,10 @@ log) provides durability.
 - **Two storage backends behind one SPI** — an in-memory log for tests, and a durable
   **Gumbo**-backed file log (the flagship embedded mode).
 - **`MockModel`** (deterministic, for tests/demos) and built-in **`ClockTool`** / **`CalculatorTool`**.
-- **In-doubt tool policy** — a tool call caught mid-flight by a crash is surfaced via a pluggable
-  `InDoubtPolicy` (`RETRY` / `FAIL` / `ASK`) instead of being silently re-executed.
+- **In-doubt boundary policy** — a tool call *or model completion* caught mid-flight by a crash is
+  surfaced via a pluggable `InDoubtPolicy` (`RETRY` / `FAIL` / `ASK`) instead of being silently
+  re-executed. The model case is the one that costs money: the provider may have produced and billed a
+  completion whose result never reached the log, so resuming without a policy pays for it twice.
 - **Strict, self-verifying replay (M1)** — `runtime.replay(id, task)` re-runs a recorded execution
   with every boundary substituted and **zero external calls**. Each boundary is checked against the
   log's canonical request hash / tool-input hash / effect label / memory key; a mismatch under

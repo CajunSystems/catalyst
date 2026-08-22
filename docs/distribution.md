@@ -87,13 +87,16 @@ PROBE model calls AFTER resume:  1   ← the accepted-but-unrecorded call was re
 This is not new to distribution — it is the same crash window that exists single-node — but node
 death makes it far more frequent, so the design must not overstate the guarantee.
 
-Catalyst already has the machinery for this on the *tool* side: `seed()` detects a `ToolRequested`
+Catalyst already had the machinery for this on the *tool* side: `seed()` detects a `ToolRequested`
 with no matching `ToolCompleted` and routes recovery through `InDoubtPolicy` (`RETRY` / `FAIL` /
-`ASK`). There is **no equivalent for model completions** — a trailing `CompletionRequested` sets
-`pendingRequestHash` and is otherwise ignored, with no `danglingModel` counterpart to `danglingTool`.
-Closing that asymmetry (an in-doubt policy for model calls, keyed on the recorded `requestHash`) is a
-prerequisite for honestly claiming exactly-once provider spend under node failure, and is worth doing
-independently of distribution.
+`ASK`). **That asymmetry has since been closed** — `seed()` now records a `danglingModel` counterpart
+to `danglingTool`, keyed on the recorded `requestHash`, and the model boundary routes it through the
+same policy; `RETRY` completes the dangling request in place, so the repaired stream still replays
+exactly. The probe above no longer reproduces: under the default `FAIL` the resume surfaces the
+in-doubt call and contacts no provider. The measured "before" was worse than this document first
+recorded — the resume did not merely re-issue the call, it appended a *second* `CompletionRequested`,
+leaving two requests to one response. So the guarantee below can now be stated honestly for both
+boundary kinds, which is what this design needs before node failure makes the window common.
 
 ## What "just start an instance" looks like
 
@@ -315,8 +318,9 @@ Being clear about the limits, since the comparison to BEAM invites them:
   boundary is redone on resume. This is the trade Catalyst already made for determinism, and replay
   makes it cheap.
 - **An in-flight boundary may be executed twice.** See the in-doubt window above: a provider call
-  accepted but not yet recorded is re-issued on resume. Bounded by `InDoubtPolicy` for tools; not yet
-  bounded at all for model completions.
+  accepted but not yet recorded has no result to substitute. Bounded by `InDoubtPolicy` for both tools
+  and model completions — under the default `FAIL` it is surfaced rather than re-issued, and `RETRY`
+  is an explicit opt-in to the duplicate-spend risk.
 - **No cross-node visibility of *running* work.** A node cannot ask "who is executing what right
   now" except through lease rows. That is a monitoring gap, not a correctness one.
 

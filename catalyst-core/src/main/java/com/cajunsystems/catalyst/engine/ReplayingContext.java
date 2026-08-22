@@ -85,6 +85,14 @@ public final class ReplayingContext implements Context {
     private ToolRequested danglingTool;
     private long danglingToolSeq = -1;
     /**
+     * A trailing {@code CompletionRequested} with no {@code CompletionReceived}: a provider call that
+     * was in flight at crash. The provider may have accepted, produced and billed a completion that
+     * never reached the log, so re-issuing it is a real and silent cost — the same in-doubt shape as a
+     * dangling tool, and routed through the same {@link InDoubtPolicy}. {@code -1} when none.
+     */
+    private long danglingModelSeq = -1;
+    private String danglingModelHash;
+    /**
      * The seq of the {@code ToolCompleted} recording the most recent live tool failure, and the exact
      * exception instance it rethrew — so the runtime can attribute a propagating throwable to the
      * boundary that raised it ({@link #failedBoundarySeq}). {@code -1} until a live tool fails.
@@ -149,16 +157,33 @@ public final class ReplayingContext implements Context {
         long lastRecordedSeq = recorded.isEmpty() ? -1 : recorded.get(recorded.size() - 1).seq();
 
         String pendingRequestHash = null;
+        long pendingRequestSeq = -1;
         ToolRequested pendingToolRequest = null; // an unmatched ToolRequested (in-doubt) if non-null at end
         long pendingToolRequestSeq = -1;
         String pendingToolInputHash = null;
         for (SequencedEvent se : recorded) {
             CatalystEvent e = se.event();
             switch (e) {
-                case CompletionRequested cr -> pendingRequestHash = cr.requestHash();
+                case CompletionRequested cr -> {
+                    pendingRequestHash = cr.requestHash();
+                    pendingRequestSeq = se.seq();
+                }
                 case CompletionReceived cr -> {
                     boundaries.add(new Boundary(se.seq(), e, null, pendingRequestHash));
                     pendingRequestHash = null;
+                    pendingRequestSeq = -1;
+                }
+                case RetryRequested ignored -> {
+                    // A model call that threw locally leaves the same trace as one that crashed —
+                    // a CompletionRequested with no CompletionReceived, because a failed completion
+                    // records no result event. What tells them apart is this: the process survived to
+                    // record its retry decision, so the call is a failure the RetryPolicy already owns,
+                    // not an in-doubt boundary. Clearing the pending request here is load-bearing for
+                    // exactly the reason the ToolCompleted case below documents — leave it and the
+                    // retry dangles into handleInDoubtModel, becoming an InDoubtException under the
+                    // default policy.
+                    pendingRequestHash = null;
+                    pendingRequestSeq = -1;
                 }
                 case ToolRequested tr -> {
                     pendingToolRequest = tr;
@@ -208,6 +233,15 @@ public final class ReplayingContext implements Context {
         if (pendingToolRequest != null) {
             this.danglingTool = pendingToolRequest;
             this.danglingToolSeq = pendingToolRequestSeq;
+        }
+        // The model-side counterpart: a CompletionRequested never matched by a CompletionReceived. Any
+        // RetryRequested after it has already cleared it above, so what survives to here is a crash
+        // between the request and the response — the window in which the provider may have been billed
+        // for a completion the log never saw. Keyed on the recorded request hash so the boundary the
+        // task re-produces can be checked against the one that was actually in flight.
+        if (pendingRequestSeq >= 0) {
+            this.danglingModelSeq = pendingRequestSeq;
+            this.danglingModelHash = pendingRequestHash;
         }
     }
 
@@ -264,6 +298,9 @@ public final class ReplayingContext implements Context {
             // hash mismatch → STRICT throws, BRANCH forks and falls through to live
             forkOrThrow(b.seq(), "model request " + b.hash(), "model request " + actualHash);
         }
+        if (danglingModelSeq >= 0) {
+            return handleInDoubtModel(request, sink);
+        }
         requireAppendable("model completion");
         if (realModel == null) {
             throw new IllegalStateException("No model configured for this runtime; ctx.model() is unavailable");
@@ -281,6 +318,61 @@ public final class ReplayingContext implements Context {
                 latencyMillis, costModel.usd(completion.usage().promptTokens(), completion.usage().completionTokens()),
                 completion.finishReason()));
         return completion;
+    }
+
+    /**
+     * Recovery for a model completion that was in flight when the process died: the log holds the
+     * {@code CompletionRequested} but no {@code CompletionReceived}, so there is nothing to substitute
+     * and no way to know whether the provider produced (and charged for) a completion. Rather than
+     * silently re-issuing — which is what happens with no policy, and which quietly double-bills — the
+     * call is surfaced through the same {@link InDoubtPolicy} that governs tools.
+     *
+     * <p>Under {@code RETRY} only the {@code CompletionReceived} is appended: the recorded
+     * {@code PromptBuilt}/{@code CompletionRequested} pair already stands, and completing it in place
+     * keeps the stream's request/response pairing intact, so the resulting log replays exactly like one
+     * that never crashed.
+     */
+    private Completion handleInDoubtModel(CompletionRequest request, TokenSink sink) {
+        String pendingHash = danglingModelHash;
+        long pendingSeq = danglingModelSeq;
+        // Cleared before the policy runs, so an ASK/FAIL that unwinds cannot be re-entered on the way
+        // out, and a RETRY's own append is never mistaken for a second in-doubt boundary.
+        danglingModelSeq = -1;
+        danglingModelHash = null;
+        String actualHash = Hashing.canonicalRequestHash(request);
+        if (pendingHash != null && !pendingHash.equals(actualHash)) {
+            // The task reached a model boundary, but not the one that was in flight — the recorded
+            // request can no longer be completed by this call, which is a determinism divergence rather
+            // than an in-doubt decision.
+            throw new NonDeterministicReplayException(pendingSeq,
+                    "in-doubt model request " + pendingHash, "model request " + actualHash);
+        }
+        return switch (inDoubtPolicy) {
+            case RETRY -> {
+                requireAppendable("in-doubt retry of model completion");
+                if (realModel == null) {
+                    throw new IllegalStateException(
+                            "No model configured for this runtime; ctx.model() is unavailable");
+                }
+                long t0 = System.nanoTime();
+                Completion completion = sink == null
+                        ? realModel.complete(request)
+                        : realModel.stream(request, guarded(sink));
+                long latencyMillis = (System.nanoTime() - t0) / 1_000_000;
+                append(new CompletionReceived(now(), eventMapper.valueToTree(completion),
+                        completion.usage().promptTokens(), completion.usage().completionTokens(),
+                        latencyMillis,
+                        costModel.usd(completion.usage().promptTokens(), completion.usage().completionTokens()),
+                        completion.finishReason())); // completes the dangling request
+                yield completion;
+            }
+            case FAIL -> throw new InDoubtException("In-doubt model completion at seq " + pendingSeq
+                    + " (crashed between request and completion; the provider may already have billed it)");
+            case ASK -> {
+                append(new ExecutionPaused(now(), "in-doubt model completion at seq " + pendingSeq));
+                throw new ExecutionPausedSignal("in-doubt model completion at seq " + pendingSeq);
+            }
+        };
     }
 
     /**
@@ -544,6 +636,8 @@ public final class ReplayingContext implements Context {
         }
         boundaries.clear();  // everything after the fork runs live
         danglingTool = null; // the fork supersedes any in-doubt tool from the recorded tail
+        danglingModelSeq = -1; // …and any in-doubt model completion, for the same reason
+        danglingModelHash = null;
     }
 
     private void requireAppendable(String what) {

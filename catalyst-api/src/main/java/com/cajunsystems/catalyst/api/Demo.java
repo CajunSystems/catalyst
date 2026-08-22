@@ -122,6 +122,12 @@ public final class Demo {
             streamingDemo(Files.createTempDirectory("catalyst-streaming-"));
         } else if (args.length >= 1 && args[0].equals("timeline")) {
             timelineDemo(Files.createTempDirectory("catalyst-timeline-"));
+        } else if (args.length >= 2 && args[1].equals("indoubtrecord")) {
+            inDoubtRecord(Path.of(args[0]));
+            System.out.println("[indoubt] request durably recorded, no response; simulating kill -9 (exit 137)...");
+            Runtime.getRuntime().halt(137); // die mid-completion: the provider call is now in doubt
+        } else if (args.length >= 2 && args[1].equals("indoubtresume")) {
+            inDoubtResume(Path.of(args[0]));
         } else if (args.length >= 1 && args[0].equals("schema")) {
             schemaDemo();
         } else {
@@ -1033,6 +1039,127 @@ public final class Demo {
      */
     private static MockModel summarizerModel() {
         return answerModel("FINAL");
+    }
+
+    // ── v1 in-doubt model completions ──────────────────────────────────────────
+
+    /** The single model call the in-doubt demo's task makes. */
+    private static final CompletionRequest INDOUBT_REQUEST =
+            CompletionRequest.of(Prompt.builder().user("summarise the incident report").build());
+
+    /**
+     * A named task (a lambda's synthetic class name is not stable across processes, and the resume
+     * phase is a different JVM) that makes exactly one model call.
+     */
+    static final class SummariseOnce implements Task<String> {
+        @Override
+        public String execute(Context ctx) {
+            return ctx.model().complete(INDOUBT_REQUEST).message();
+        }
+    }
+
+    /**
+     * Phase 1 of the in-doubt exit demo: drive a real model boundary far enough to durably record
+     * {@code CompletionRequested}, then have the "provider" kill the process before any response comes
+     * back. What survives on disk is the genuine crash shape — a request with no response — which
+     * cannot be produced by a task failing in-process, because the runtime would survive to record the
+     * outcome.
+     */
+    private static void inDoubtRecord(Path dir) {
+        ExecutionId id = ExecutionId.random();
+        try (GumboEventLog log = GumboEventLog.at(dir)) {
+            Instant t = Instant.now();
+            log.putKey(KEY, id);
+            log.append(id, new CatalystEvent.ExecutionCreated(t, SummariseOnce.class.getName(), "h", "cfg", KEY));
+            log.append(id, new CatalystEvent.ExecutionStarted(t, 1, "node-0"));
+
+            ExecutionInfo info = new ExecutionInfo(id, 1, "SummariseOnce", Map.of());
+            ReplayingContext ctx = new ReplayingContext(id, log, request -> {
+                // Reached only after the context has appended PromptBuilt + CompletionRequested: the
+                // request is on disk, and the provider may well have accepted and billed it.
+                System.out.println("[indoubt] provider call accepted; dying before the response is recorded");
+                Runtime.getRuntime().halt(137);
+                throw new AssertionError("unreachable");
+            }, info, Map.of(), EventJson.shared(), new PayloadCodec(), InDoubtPolicy.FAIL, CostModel.free(),
+                    com.cajunsystems.catalyst.ReplayMode.STRICT, null,
+                    Clock.systemUTC(), LoggerFactory.getLogger("demo.indoubt"), log.read(id), true);
+            System.out.println("[indoubt] execution " + id.value());
+            ctx.model().complete(INDOUBT_REQUEST);
+        }
+    }
+
+    /**
+     * Phase 2: reopen the crashed log and show the three properties that make the window safe.
+     *
+     * <ol>
+     *   <li>The default {@code FAIL} policy <em>surfaces</em> the in-doubt call instead of re-issuing
+     *       it — the regression this closes, where the resume silently paid for a second completion.</li>
+     *   <li>{@code RETRY} re-issues exactly once, by explicit opt-in, and completes the dangling
+     *       request in place rather than opening a second one.</li>
+     *   <li>The repaired log replays strictly with zero further provider calls — proof the recovery
+     *       produced a well-formed stream, not merely a finished one.</li>
+     * </ol>
+     */
+    private static void inDoubtResume(Path dir) {
+        // 1) Default policy: the in-doubt boundary is surfaced, and the provider is NOT called again.
+        //    Driven through a raw context so the probe itself records nothing, leaving the crashed log
+        //    intact for step 2 (a runtime-level FAIL would record ExecutionFailed and go terminal).
+        MockModel failProbe = summarizerModel();
+        ExecutionId id;
+        try (GumboEventLog log = GumboEventLog.at(dir)) {
+            id = log.findByKey(KEY).orElseThrow();
+            ExecutionInfo info = new ExecutionInfo(id, 2, "SummariseOnce", Map.of());
+            ReplayingContext ctx = new ReplayingContext(id, log, failProbe, info, Map.of(),
+                    EventJson.shared(), new PayloadCodec(), InDoubtPolicy.FAIL, CostModel.free(),
+                    com.cajunsystems.catalyst.ReplayMode.STRICT, null,
+                    Clock.systemUTC(), LoggerFactory.getLogger("demo.indoubt"), log.read(id), true);
+            try {
+                ctx.model().complete(INDOUBT_REQUEST);
+                throw new AssertionError("in-doubt completion was not detected");
+            } catch (com.cajunsystems.catalyst.engine.InDoubtException e) {
+                System.out.println("[indoubt] default policy surfaced the in-doubt call: " + e.getMessage());
+            }
+        }
+        System.out.println("[indoubt] provider calls under FAIL: " + failProbe.callCount());
+        if (failProbe.callCount() != 0) {
+            throw new AssertionError("in-doubt completion was re-issued under FAIL");
+        }
+
+        // 2) RETRY: re-issue once, by explicit policy, completing the dangling request in place.
+        MockModel model = summarizerModel();
+        try (CatalystRuntime runtime = Catalyst.builder()
+                .log(GumboEventLog.at(dir))
+                .model(model)
+                .inDoubtPolicy(InDoubtPolicy.RETRY)
+                .task(new SummariseOnce())
+                .build()) {
+
+            Object result = runtime.resume(id).result();
+            ExecutionState state = runtime.inspect(id);
+            System.out.println("[indoubt] resumed " + id.value() + " -> " + state.status());
+            System.out.println("[indoubt] result: " + result);
+            System.out.println("[indoubt] provider calls under RETRY: " + model.callCount());
+            if (model.callCount() != 1) {
+                throw new AssertionError("expected exactly one re-issued call, got " + model.callCount());
+            }
+
+            long requested = runtime.log().read(id).stream()
+                    .filter(se -> se.event() instanceof CatalystEvent.CompletionRequested).count();
+            long received = runtime.log().read(id).stream()
+                    .filter(se -> se.event() instanceof CatalystEvent.CompletionReceived).count();
+            System.out.println("[indoubt] repaired log: " + requested + " request(s), " + received + " response(s)");
+            if (requested != 1 || received != 1) {
+                throw new AssertionError("repaired log is not one-request-one-response");
+            }
+
+            // 3) The repaired stream replays strictly, contacting no provider.
+            int before = model.callCount();
+            ExecutionState replayed = runtime.replay(id, new SummariseOnce());
+            int during = model.callCount() - before;
+            System.out.println("[indoubt] replay of the repaired log -> " + replayed.status()
+                    + "; external calls during replay: " + during);
+            if (during != 0) throw new AssertionError("replay made " + during + " external calls");
+        }
     }
 
     private Demo() {}
