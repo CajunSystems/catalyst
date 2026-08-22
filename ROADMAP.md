@@ -257,16 +257,23 @@ The substrate becomes a platform. This is where the other CajunSystems component
     this design depended on it.
 
 ### In-doubt model completions (found while designing distribution)
-- A crash between `CompletionRequested` and `CompletionReceived` leaves the provider call **in
-  doubt**: it may have been accepted and billed, but no result reached the log, so a resume re-issues
-  it. Measured on the current single-node code — a log ending at `CompletionRequested` resumed and
-  invoked the model a second time. Catalyst already handles this for **tools** (`seed()` detects a
-  `ToolRequested` with no `ToolCompleted` and routes recovery through `InDoubtPolicy`), but there is
-  no equivalent for model completions: a trailing `CompletionRequested` sets `pendingRequestHash` and
-  is otherwise ignored. Closing the asymmetry — an in-doubt policy for model calls, keyed on the
-  recorded `requestHash` — is what "zero duplicate model calls" needs in order to hold under node
-  failure rather than only under graceful resume. Worth doing independently of distribution, which
-  merely makes the window far more frequent.
+- ✅ **Closed.** A crash between `CompletionRequested` and `CompletionReceived` left the provider call
+  **in doubt** — it may have been accepted and billed with only the result lost on the way back — and
+  a resume re-issued it. Measured before the fix: a log ending at `CompletionRequested` resumed and
+  invoked the model a second time. Catalyst already handled this for **tools** (`seed()` detects a
+  `ToolRequested` with no `ToolCompleted` and routes recovery through `InDoubtPolicy`); the model
+  path had no equivalent, because a trailing `CompletionRequested` set `pendingRequestHash` and was
+  otherwise ignored. It now routes through the same `InDoubtPolicy`, keyed on the recorded
+  `requestHash` so a recovery cannot attach itself to a different question (a divergent request at
+  that boundary is a `NonDeterministicReplayException`). A `RETRY` **completes the dangling request**
+  rather than opening a second one, so a recovered log is one request paired with one result and
+  replays like an execution that never crashed. The discriminator that keeps retry semantics intact:
+  a `RetryRequested` recorded after the request is a *verdict*, not a doubt — the provider call threw
+  and the process lived to say so — and re-runs live as before. That distinction is pinned by its own
+  test, because getting it wrong turns every retried model failure into an `InDoubtException` under
+  the default policy. This is what "zero duplicate model calls" needs in order to hold under node
+  failure rather than only under graceful resume; distribution merely makes the window far more
+  frequent.
 
 ### Eval harness (spec §12)
 - Recorded production executions replayed against **candidate models/prompts** as a regression suite

@@ -182,4 +182,14 @@ checkout's pom to `com.github.CajunSystems` before installing.
   it is matched on the whole cause chain, not the top type. Not yet used by the runtime — the
   in-process invariant is still `KeyedLock` + `inFlight`; this is the seam a claim loop writes to.
 
+- **In-doubt model completions** — `ReplayingContextInDoubtCompletionTest`: a `CompletionRequested`
+  with no `CompletionReceived` is a provider call that may have been accepted and *billed*, so it
+  routes through `InDoubtPolicy` exactly as a dangling `ToolRequested` does (it previously just
+  re-issued the call). Keyed on the recorded `requestHash` — a different request at that boundary is
+  a divergence, not a recovery. `RETRY` completes the dangling request instead of opening a second
+  one, so the recovered log stays one request / one result and replays normally. **The trap:** a
+  model failure also leaves an unmatched `CompletionRequested` (model failures record nothing), so
+  `seed()` clears the pending request on `RetryRequested` — a verdict, not a doubt. Without that,
+  every retried model failure becomes an `InDoubtException` under the default `FAIL`.
+
 CI (`.github/workflows/ci.yml`) runs all exit demos as gates — it is the source of truth per phase.
