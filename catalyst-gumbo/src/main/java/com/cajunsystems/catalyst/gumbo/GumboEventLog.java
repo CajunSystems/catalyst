@@ -133,6 +133,18 @@ public final class GumboEventLog implements EventLog {
         }
     }
 
+    /**
+     * The underlying Gumbo service, package-private for tests.
+     *
+     * <p>Catalyst writes one tag per execution, so nothing in this class needs the multi-tag API.
+     * The v1 claimable-work design does — it dual-tags an execution's first event into a shared
+     * queue — and the property that design rests on (a fan-out tag counts its own entries) is worth
+     * pinning against the log Catalyst actually builds, before the claim loop exists to pin it.
+     */
+    SharedLogService service() {
+        return service;
+    }
+
     private TypedLogView<CatalystEvent> viewFor(ExecutionId id) {
         return views.computeIfAbsent(id, k -> service.getTypedView(tagFor(k), serializer));
     }

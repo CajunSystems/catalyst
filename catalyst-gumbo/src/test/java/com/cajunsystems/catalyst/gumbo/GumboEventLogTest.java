@@ -5,7 +5,11 @@ import com.cajunsystems.catalyst.events.CatalystEvent;
 import com.cajunsystems.catalyst.events.EventCodec;
 import com.cajunsystems.catalyst.events.SequencedEvent;
 import com.cajunsystems.catalyst.log.Snapshot;
+import com.cajunsystems.gumbo.core.AppendRequest;
 import com.cajunsystems.gumbo.core.LogCapabilities;
+import com.cajunsystems.gumbo.core.LogEntry;
+import com.cajunsystems.gumbo.core.LogTag;
+import com.cajunsystems.gumbo.service.SharedLogService;
 import com.cajunsystems.gumbo.persistence.InMemoryPersistenceAdapter;
 import com.cajunsystems.catalyst.log.StaleWriterException;
 import com.fasterxml.jackson.databind.node.TextNode;
@@ -15,6 +19,8 @@ import org.junit.jupiter.api.io.TempDir;
 import java.io.UncheckedIOException;
 import java.nio.channels.OverlappingFileLockException;
 import java.nio.charset.StandardCharsets;
+import java.util.ArrayList;
+import java.util.LinkedHashSet;
 import java.nio.file.Path;
 import java.time.Instant;
 import java.util.List;
@@ -282,6 +288,69 @@ class GumboEventLogTest {
     private static final class MultiWriterClaimingAdapter extends InMemoryPersistenceAdapter {
         @Override public LogCapabilities capabilities() {
             return LogCapabilities.builder(super.capabilities()).multiWriter(true).build();
+        }
+    }
+
+    /**
+     * The property Catalyst's claimable-work design rests on, pinned rather than assumed.
+     *
+     * <p>[docs/distribution.md] resolves "how does a node find work to run" by dual-tagging: one
+     * atomic append writes an execution's first event into both its own {@code catalyst-exec/<id>}
+     * stream and a shared {@code catalyst-tasks/<queue>}, so there is no window where an execution
+     * is recorded but not yet claimable. A worker then holds one number — its position in the queue
+     * — and asks for what came after it.
+     *
+     * <p>That read only works if a fan-out tag counts its <em>own</em> entries. It did not until
+     * Gumbo 0.6.0: an entry carried one version from its primary tag and told every tag that number,
+     * so an item enqueued by a workflow whose history sat at 4 was numbered 4, and a worker already
+     * advanced past 4 behind a busier workflow silently never saw it. The design was written against
+     * a guarantee the layer below did not provide, and this repository's own document asserted it
+     * for months before anyone measured it.
+     *
+     * <p>So it is measured here, through the log Catalyst actually builds. Catalyst does not
+     * dual-tag yet — the claim loop is what would — which is exactly why the dependency is worth a
+     * test now: a regression underneath would otherwise surface as work that is never claimed,
+     * long after the change that caused it.
+     */
+    @Test
+    void aFanOutTagIsCursoredByItsOwnVersion() {
+        LogTag queue = LogTag.of("catalyst-tasks", "default");
+        try (GumboEventLog log = GumboEventLog.inMemory()) {
+            SharedLogService service = log.service();
+
+            // Three executions, each with a different amount of history, each enqueueing one item
+            // in the same atomic append that records its creation. Histories descend deliberately:
+            // under the old numbering the queue would have inherited 8, then 4, then 0, and a
+            // cursor that reached 8 would never be handed the rest.
+            int[] historyLengths = {8, 4, 0};
+            for (int i = 0; i < historyLengths.length; i++) {
+                ExecutionId id = ExecutionId.random();
+                LogTag execTag = LogTag.of("catalyst-exec", id.value());
+                for (int h = 0; h < historyLengths[i]; h++) {
+                    log.append(id, new CatalystEvent.ExecutionStarted(T, h, "node-0"));
+                }
+                service.append(
+                        AppendRequest.to(new LinkedHashSet<>(List.of(execTag, queue)),
+                                ("work-" + i).getBytes(StandardCharsets.UTF_8)),
+                        execTag, historyLengths[i]).join();
+            }
+
+            // A worker cursoring the queue: one position, advanced by what it was handed.
+            List<String> claimed = new ArrayList<>();
+            long cursor = -1;
+            for (int round = 0; round < 4; round++) {
+                for (LogEntry e : service.getView(queue).readAfterVersion(cursor).join()) {
+                    claimed.add(new String(e.dataUnsafe(), StandardCharsets.UTF_8));
+                    cursor = Math.max(cursor, e.streamVersion(queue));
+                }
+            }
+
+            assertThat(claimed)
+                    .as("every enqueued item claimed exactly once, whatever its execution's history")
+                    .containsExactly("work-0", "work-1", "work-2");
+            assertThat(cursor)
+                    .as("the queue counts its own entries: three items, positions 0..2")
+                    .isEqualTo(2L);
         }
     }
 

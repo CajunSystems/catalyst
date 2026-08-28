@@ -255,15 +255,16 @@ The substrate becomes a platform. This is where the other CajunSystems component
   probe that handed both writers `seq` 0,1,2 no longer applies — and the file adapter takes an
   exclusive directory lock, so a second process is refused loudly instead of corrupting silently.
   Lease CAS arrived in 0.4.0. Two gaps are left, and both are Gumbo-side:
-  - ~~**0.4.0 is merged but untagged**~~ — tagged and picked up. Catalyst is now on gumbo **0.5.0**,
-    so both the lease CAS (A3) and declared capabilities (A4) are reachable. Nothing consumes the
-    CAS yet; the claim loop is what would.
-  - **Claimable work** turned out to need no new SPI (dual-tagging into a shared queue tag, one
-    atomic append — see `docs/distribution.md`) but the queue tag *cannot be cursored by version*:
-    an entry carries one `streamVersion`, from its primary tag, so a version-keyed tail read on a
-    fan-out tag can silently skip work. Seqnum-keyed reads are correct there in the meantime. The
-    proper fix costs a log migration and was ranked last in Gumbo's backlog on that cost — before
-    this design depended on it.
+  - ~~**0.4.0 is merged but untagged**~~ — tagged and picked up. Catalyst is now on gumbo **0.6.0**:
+    the lease CAS (A3), declared capabilities (A4) and per-tag stream versions are all reachable.
+    Nothing consumes the CAS yet; the claim loop is what would.
+  - ~~**Claimable work** … the queue tag cannot be cursored by version~~ — **fixed in gumbo 0.6.0**
+    and adopted. Every tag an entry carries now has its own dense position, so a shared
+    `catalyst-tasks/<queue>` fed by dual-tagged appends is cursored with `readAfterVersion` like any
+    other stream, and a worker cannot be handed an item numbered below its cursor. It cost a
+    record-layout change but no migration — a per-record marker lets both layouts coexist. Pinned
+    from this side by `GumboEventLogTest.aFanOutTagIsCursoredByItsOwnVersion`, because nothing in
+    Catalyst depends on it yet and a regression would otherwise surface as work never claimed.
 
 ### In-doubt model completions (found while designing distribution)
 - ✅ **Closed.** A crash between `CompletionRequested` and `CompletionReceived` left the provider call

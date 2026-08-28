@@ -17,7 +17,7 @@ This document records them, with the evidence for each.
 > | A3 | Gumbo 0.4.0 |
 > | A4 | Gumbo 0.5.0 |
 > | D2, A6 | open |
-> | Multi-tag entries carry one version | open, and now the item Catalyst's v1 depends on |
+> | Multi-tag entries carry one version | Gumbo 0.6.0, adopted |
 >
 > The D4 verification is in `GumboEventLogTest` (a tail read with a second execution in the log, on
 > both adapters, plus the single-writer refusal) and in
@@ -41,9 +41,10 @@ This document records them, with the evidence for each.
 > and the default sequencer is a per-process counter — a fence in storage cannot compensate, since
 > the seqnum never passes through it.
 >
-> **What Catalyst needs next:** the multi-tag version defect, which
-> [`distribution.md`](distribution.md) depends on for claimable work and which was filed last in
-> Gumbo's backlog on log-migration cost — a ranking made before anything depended on it.
+> **Everything this report asked for is now shipped and adopted.** The multi-tag version defect —
+> the one [`distribution.md`](distribution.md) depended on for claimable work, and the only item
+> with a data-format cost — landed in 0.6.0, and the cost turned out to be a record marker rather
+> than a migration. What remains on Gumbo's own backlog (**D2**, **A6**) blocks nothing here.
 
 ## How these conclusions were reached
 
