@@ -172,6 +172,27 @@ checkout's pom to `com.github.CajunSystems` before installing.
   **When adding a log-layer test, put a second execution in the log**: a single-execution fixture is
   the one configuration where these bugs are invisible, which is how D4 shipped.
 
+- **v1 Distributed execution** — `DistributedAcceptanceTest` + `Demo distributed`: `runtime.submit(queue,
+  task)` publishes an execution instead of running it (one atomic dual-tagged append into
+  `catalyst-exec/<id>` **and** `catalyst-tasks/<queue>`, so it is never recorded-but-unclaimable), and
+  `runtime.worker(queue)` claims it (CAS on Gumbo's tag KV via `WorkQueue`/`Lease`), runs it through the
+  existing `resume(id)`, and releases. Reclaim is lease expiry plus a retry from a small pending set —
+  no reaper, no orphan scan — so a dead worker's execution *resumes* at its recorded boundary rather
+  than restarting. The lease is **placement**; correctness is `FencedEventLog`, which turns every append
+  an attempt makes into a conditional one at the seq it believes it is writing. `Worker.start()` refuses
+  a log that cannot fence. **Two runtimes over one log** in the test on purpose: a single runtime's
+  `KeyedLock` + `inFlight` would make the exclusivity assertion pass with leases removed entirely.
+  Two gotchas, both found only by running it: (1) `GumboEventLog.decode` used `LogEntry.streamVersion()`
+  — the *primary*-tag accessor, and the primary is `tags.iterator().next()`, salted per JVM run — so the
+  first dual-tagged append started numbering executions with the *queue's* position on half of all runs
+  (fix: name the tag). Once anything is dual-tagged the no-arg accessor is unusable. (2) Catalyst runs on
+  virtual threads and Gumbo's async pool defaulted to virtual threads too, so a Catalyst thread blocked
+  on an append held a carrier while the task that would complete it waited for one — four concurrent
+  executions hung a 4-core JVM outright, with nothing pinned and `-Djdk.tracePinnedThreads` silent.
+  Catalyst now hands Gumbo a **platform**-thread pool (its adapters are `synchronized` + fsync anyway),
+  and `Worker`'s loop and per-execution waiters are platform threads. **Not yet runnable across
+  processes**: no log Catalyst builds reports `multiWriter`, so that needs FDB + a distributed sequencer.
+
 - **Conditional append (v1 distribution seam)** — `ConditionalAppendTest` (runtime) +
   three `GumboEventLogTest` cases: `EventLog.append(id, event, expectedSeq)` rejects a writer the
   stream has moved past with `StaleWriterException`, and `supportsConditionalAppend()` says whether a

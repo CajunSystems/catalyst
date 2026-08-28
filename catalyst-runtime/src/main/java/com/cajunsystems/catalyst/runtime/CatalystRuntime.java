@@ -31,7 +31,9 @@ import com.cajunsystems.catalyst.events.CatalystEvent;
 import com.cajunsystems.catalyst.events.EventJson;
 import com.cajunsystems.catalyst.events.SequencedEvent;
 import com.cajunsystems.catalyst.log.EventLog;
+import com.cajunsystems.catalyst.log.FencedEventLog;
 import com.cajunsystems.catalyst.log.Snapshot;
+import com.cajunsystems.catalyst.log.WorkQueue;
 import com.cajunsystems.catalyst.model.Model;
 import com.fasterxml.jackson.core.JsonProcessingException;
 import com.fasterxml.jackson.databind.JsonNode;
@@ -193,6 +195,22 @@ public final class CatalystRuntime implements AutoCloseable {
      */
     private <R> ExecutionHandle<R> scheduleAttempt(Task<R> task, ExecutionId id, String taskType,
                                                    ExecutionOptions opts, Mode mode) {
+        return scheduleAttempt(task, id, taskType, opts, mode, /* fenced */ false);
+    }
+
+    /**
+     * As above, optionally fencing the attempt's appends.
+     *
+     * <p>In-process execution does not fence, and that is not an oversight. Within one JVM the
+     * invariant is already held upstream -- {@code byExecution} plus {@code inFlight} mean a second
+     * attempt is attached to rather than scheduled -- so a fence would re-prove a property that
+     * cannot be violated here, at the cost of making every append conditional. Fencing is what
+     * replaces those two mechanisms when the competing writer is in another process and neither can
+     * see it, so it is switched on exactly where they stop meaning anything: a claimed execution run
+     * by a {@link Worker}.
+     */
+    private <R> ExecutionHandle<R> scheduleAttempt(Task<R> task, ExecutionId id, String taskType,
+                                                   ExecutionOptions opts, Mode mode, boolean fenced) {
         CompletableFuture<R> future = new CompletableFuture<>();
         RunningAttempt attempt = new RunningAttempt();
         inFlight.put(id, future);
@@ -201,13 +219,82 @@ public final class CatalystRuntime implements AutoCloseable {
             inFlight.remove(id, future);
             running.remove(id, attempt);
         });
-        executor.execute(() -> runAttempt(task, id, taskType, opts, mode, future, attempt));
+        executor.execute(() -> runAttempt(task, id, taskType, opts, mode, future, attempt, fenced));
         return new FutureExecutionHandle<>(id, future);
     }
 
     @SuppressWarnings("unchecked")
     private static <R> CompletableFuture<R> cast(CompletableFuture<?> future) {
         return (CompletableFuture<R>) future;
+    }
+
+    /**
+     * Publishes {@code task} to the shared work queue {@code queue} instead of running it here, and
+     * returns the id it was recorded under. Some {@link Worker} -- possibly in another process --
+     * claims it and runs it.
+     *
+     * <p>This is deliberately not {@code execute} with a flag. The two have different return types
+     * for a real reason: {@code execute} can hand back a handle that completes with the task's
+     * result because it is running the task; {@code submit} cannot, because the result will be
+     * produced somewhere this process may never hear from. Papering that over with a handle that
+     * silently never completes would be the worst of both. Callers follow a submitted execution with
+     * {@link #inspect(ExecutionId)}, or attach to it with {@link #resume(ExecutionId)} once it is
+     * terminal.
+     *
+     * <p>Submission is one atomic append, so an execution is never recorded-but-unqueued. It does not
+     * require the log to fence -- publishing work is safe on any log that can host a queue; it is
+     * <em>running</em> claimed work that needs the fence, which is why {@link Worker} is where that
+     * requirement is enforced rather than here.
+     *
+     * <p>The task's type must be registered ({@code Catalyst.builder().task(...)}) in whichever
+     * process ends up running it -- not necessarily this one. A submit-only process needs no
+     * registration at all.
+     *
+     * @throws IllegalStateException if this log cannot host a work queue
+     */
+    public ExecutionId submit(String queue, Task<?> task, ExecutionOptions opts) {
+        WorkQueue q = log.workQueue(queue).orElseThrow(() -> new IllegalStateException(
+                log.getClass().getSimpleName() + " cannot host a work queue, so work cannot be"
+                + " submitted to be run elsewhere; use execute(...) to run it in this process"));
+        String taskType = task.getClass().getName();
+        Optional<String> key = opts.idempotencyKey();
+        if (key.isEmpty()) {
+            ExecutionId id = ExecutionId.random();
+            q.submit(id, createdEvent(taskType, opts, ""));
+            return id;
+        }
+        // Same key → same execution, exactly as execute() resolves it, so a resubmitted request is
+        // not queued twice. The key lock keeps the resolve-and-publish atomic in this process; the
+        // fenced append inside submit() keeps it atomic against another one.
+        return byIdempotencyKey.withLock(key.get(), () -> {
+            Optional<ExecutionId> existing = log.findByKey(key.get());
+            if (existing.isPresent()) return existing.get();
+            ExecutionId id = ExecutionId.random();
+            log.putKey(key.get(), id);
+            q.submit(id, createdEvent(taskType, opts, key.get()));
+            return id;
+        });
+    }
+
+    /** Publishes to the queue named {@code queue} with no options. */
+    public ExecutionId submit(String queue, Task<?> task) {
+        return submit(queue, task, ExecutionOptions.none());
+    }
+
+    /**
+     * A {@link Worker} that claims and runs work from {@code queue} on this runtime.
+     *
+     * @throws IllegalStateException if this log cannot host a queue, or cannot fence appends
+     */
+    public Worker worker(String queue, WorkerConfig config) {
+        WorkQueue q = log.workQueue(queue).orElseThrow(() -> new IllegalStateException(
+                log.getClass().getSimpleName() + " cannot host a work queue"));
+        return new Worker(this, q, config);
+    }
+
+    /** A worker on {@code queue} with default settings. */
+    public Worker worker(String queue) {
+        return worker(queue, WorkerConfig.defaults());
     }
 
     public <R> ExecutionHandle<R> execute(Task<R> task) {
@@ -367,6 +454,16 @@ public final class CatalystRuntime implements AutoCloseable {
      *                                  its recorded task type (a terminal execution needs no registration)
      */
     public ExecutionHandle<?> resume(ExecutionId id, ExecutionOptions opts) {
+        return resume(id, opts, /* fenced */ false);
+    }
+
+    /**
+     * As {@link #resume(ExecutionId, ExecutionOptions)}, optionally fencing every append the attempt
+     * makes. {@link Worker} resumes this way once it holds a claim: the lease says it may run the
+     * execution, and the fence is what makes that safe to act on when the lease turns out to be
+     * stale.
+     */
+    ExecutionHandle<?> resume(ExecutionId id, ExecutionOptions opts, boolean fenced) {
         return byExecution.withLock(id, () -> {
             // Already running here → attach to the in-flight attempt rather than scheduling a duplicate
             // that would interleave events and corrupt the stream (same guard as execute()).
@@ -393,7 +490,7 @@ public final class CatalystRuntime implements AutoCloseable {
                             + "; register it with Catalyst.builder().task(...), or recover by re-submitting the"
                             + " task with its idempotency key via execute(task, ExecutionOptions.withKey(key))."));
 
-            return scheduleAttempt(factory.create(), id, taskType, opts, Mode.RESUME);
+            return scheduleAttempt(factory.create(), id, taskType, opts, Mode.RESUME, fenced);
         });
     }
 
@@ -538,8 +635,19 @@ public final class CatalystRuntime implements AutoCloseable {
     // ── Internals ────────────────────────────────────────────────────────────
 
     private void createExecution(ExecutionId id, String taskType, String key, ExecutionOptions opts) {
+        log.append(id, createdEvent(taskType, opts, key));
+    }
+
+    /**
+     * The {@code ExecutionCreated} event for a new execution, however it is going to be recorded --
+     * appended directly by {@code execute}, or published to a queue by {@code submit}. Shared so the
+     * two cannot drift: a submitted execution that recorded a different config fingerprint than a
+     * locally executed one would replay differently for no reason anybody could see.
+     */
+    private CatalystEvent createdEvent(String taskType, ExecutionOptions opts, String key) {
         String configFingerprint = "replayMode=" + replayMode + ";inDoubt=" + inDoubtPolicy;
-        log.append(id, new CatalystEvent.ExecutionCreated(now(), taskType, argsHash(opts.vars()), configFingerprint, key));
+        return new CatalystEvent.ExecutionCreated(
+                now(), taskType, argsHash(opts.vars()), configFingerprint, key);
     }
 
     /**
@@ -558,7 +666,7 @@ public final class CatalystRuntime implements AutoCloseable {
 
     private <R> void runAttempt(Task<R> task, ExecutionId id, String taskType,
                                 ExecutionOptions opts, Mode mode, CompletableFuture<R> future,
-                                RunningAttempt runningAttempt) {
+                                RunningAttempt runningAttempt, boolean fenced) {
         runningAttempt.thread = Thread.currentThread();
         RetryPolicy policy = opts.retryPolicy().orElse(this.retryPolicy);
         // Outer try: the future is ALWAYS completed on every exit — including setup failures (log I/O,
@@ -587,11 +695,21 @@ public final class CatalystRuntime implements AutoCloseable {
                     state = Reducer.fold(id, recorded);
                 }
                 int attempt = state.attempt() + 1;
+
+                // Every append this attempt makes -- lifecycle, boundaries, terminal -- goes through
+                // `writer`. When the attempt runs under a claim, that is a fenced view of the log
+                // seeded at the tip just read, so a worker that lost its lease is rejected by storage
+                // instead of interleaving into a stream another node has moved on. Re-derived each
+                // iteration because a retry re-reads and the tip has moved.
+                EventLog writer = fenced
+                        ? FencedEventLog.forAttempt(log, id, tipOf(recorded))
+                        : log;
+
                 if (firstIteration && mode == Mode.FRESH) {
-                    log.append(id, new CatalystEvent.ExecutionStarted(now(), attempt, nodeId));
+                    writer.append(id, new CatalystEvent.ExecutionStarted(now(), attempt, nodeId));
                 } else {
                     // A retry IS a resume: it re-enters the task with the recorded prefix substituted.
-                    log.append(id, new CatalystEvent.ExecutionResumed(now(), attempt));
+                    writer.append(id, new CatalystEvent.ExecutionResumed(now(), attempt));
                 }
                 firstIteration = false;
 
@@ -599,7 +717,7 @@ public final class CatalystRuntime implements AutoCloseable {
                 ExecutionInfo info = new ExecutionInfo(id, attempt, effectiveTaskType, opts.metadata());
                 Logger logger = LoggerFactory.getLogger("catalyst.exec." + id.value());
 
-                ReplayingContext ctx = new ReplayingContext(id, log, defaultModel, info, opts.vars(),
+                ReplayingContext ctx = new ReplayingContext(id, writer, defaultModel, info, opts.vars(),
                         eventMapper, payloads, inDoubtPolicy, costModel, replayMode, null, clock, logger,
                         recorded, /* appendEnabled */ true, runningAttempt.token);
 
@@ -607,7 +725,7 @@ public final class CatalystRuntime implements AutoCloseable {
                 // auto-capture counter restarts in step with the recorded prefix it replays.
                 try (AutoCapture.Scope captured = AutoCapture.bind(ctx)) {
                     R result = task.execute(ctx);
-                    log.append(id, new CatalystEvent.ExecutionCompleted(now(), payloads.toTree(result)));
+                    writer.append(id, new CatalystEvent.ExecutionCompleted(now(), payloads.toTree(result)));
                     future.complete(result);
                     return;
                 } catch (ExecutionPausedSignal pause) {
@@ -620,7 +738,7 @@ public final class CatalystRuntime implements AutoCloseable {
                     // (the task acknowledging cancellation). The interrupt() cancel() raises is only a
                     // best-effort nudge to reach that boundary; it never reclassifies a failure.
                     if (t instanceof CancellationSignal) {
-                        recordCancelled(id, runningAttempt.token.reason(), future);
+                        recordCancelled(writer, id, runningAttempt.token.reason(), future);
                         return;
                     }
                     // Decide retry vs. terminal failure. isRetryable gates out failures a retry can never
@@ -629,7 +747,7 @@ public final class CatalystRuntime implements AutoCloseable {
                     Optional<Duration> backoff = isRetryable(t)
                             ? policy.nextBackoff(state.retries(), t) : Optional.empty();
                     if (backoff.isEmpty() || runningAttempt.token.isCancelled()) {
-                        recordFailed(id, t, future);
+                        recordFailed(writer, id, t, future);
                         return;
                     }
                     long backoffMillis = Math.max(0, backoff.get().toMillis());
@@ -638,15 +756,15 @@ public final class CatalystRuntime implements AutoCloseable {
                         // substituting its recorded failure; -1 when the failure is not one (see
                         // ReplayingContext.failedBoundarySeq). Appended BEFORE the sleep so a crash mid-
                         // backoff preserves the budget; ExecutionResumed follows atop the next iteration.
-                        log.append(id, new CatalystEvent.RetryRequested(
+                        writer.append(id, new CatalystEvent.RetryRequested(
                                 now(), String.valueOf(t), backoffMillis, ctx.failedBoundarySeq(t)));
                     } catch (RuntimeException appendFailed) {
                         // Cannot durably record the retry → do not retry; fail with the original cause.
-                        recordFailed(id, t, future);
+                        recordFailed(writer, id, t, future);
                         return;
                     }
                     if (!sleepUnlessCancelled(backoffMillis, runningAttempt.token)) {
-                        recordCancelled(id, runningAttempt.token.reason(), future);
+                        recordCancelled(writer, id, runningAttempt.token.reason(), future);
                         return;
                     }
                     // Clear any stray interrupt so it cannot leak a spurious InterruptedException into the
@@ -657,6 +775,11 @@ public final class CatalystRuntime implements AutoCloseable {
         } catch (Throwable setupFailure) {
             future.completeExceptionally(setupFailure);
         }
+    }
+
+    /** The last recorded seq in {@code recorded}, or {@code -1} for a stream with no events yet. */
+    private static long tipOf(List<SequencedEvent> recorded) {
+        return recorded.isEmpty() ? -1 : recorded.get(recorded.size() - 1).seq();
     }
 
     /**
@@ -689,9 +812,10 @@ public final class CatalystRuntime implements AutoCloseable {
     }
 
     /** Best-effort {@code ExecutionFailed} append (terminal), then completes the future with the cause. */
-    private <R> void recordFailed(ExecutionId id, Throwable t, CompletableFuture<R> future) {
+    private <R> void recordFailed(EventLog writer, ExecutionId id, Throwable t,
+                                  CompletableFuture<R> future) {
         try {
-            log.append(id, new CatalystEvent.ExecutionFailed(now(), String.valueOf(t), log.latestSeq(id)));
+            writer.append(id, new CatalystEvent.ExecutionFailed(now(), String.valueOf(t), writer.latestSeq(id)));
         } catch (RuntimeException ignored) {
             // best-effort failure record; the future still completes exceptionally below
         }
@@ -699,9 +823,10 @@ public final class CatalystRuntime implements AutoCloseable {
     }
 
     /** Best-effort {@code ExecutionCancelled} append (terminal), then completes with CancellationException. */
-    private <R> void recordCancelled(ExecutionId id, String reason, CompletableFuture<R> future) {
+    private <R> void recordCancelled(EventLog writer, ExecutionId id, String reason,
+                                     CompletableFuture<R> future) {
         try {
-            log.append(id, new CatalystEvent.ExecutionCancelled(now(), reason, log.latestSeq(id)));
+            writer.append(id, new CatalystEvent.ExecutionCancelled(now(), reason, writer.latestSeq(id)));
         } catch (RuntimeException ignored) {
             // best-effort cancellation record; the future still completes exceptionally below
         }

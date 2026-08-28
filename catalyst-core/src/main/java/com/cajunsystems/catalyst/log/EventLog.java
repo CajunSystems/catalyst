@@ -128,6 +128,25 @@ public interface EventLog extends AutoCloseable {
         // no-op: see readSnapshot
     }
 
+    /**
+     * The shared work queue named {@code name}, if this log can host one — the seam distributed
+     * execution claims work through (see {@link WorkQueue} and {@code docs/distribution.md}).
+     *
+     * <p>The default returns empty, which is the honest answer for a log with no way to publish an
+     * execution to a second reader. Read empty as "this log runs work in-process only", not as a
+     * failure.
+     *
+     * <p>A queue is only <em>safe</em> on a log that can also fence
+     * ({@link #supportsConditionalAppend()}). The two are reported separately rather than folded
+     * into one answer because they fail differently: a log with no queue cannot distribute at all
+     * and says so on the first call, while a log with a queue and no fence would appear to
+     * distribute right up until two writers met on one execution and the stream stopped folding.
+     * {@code Worker} refuses to start on the second.
+     */
+    default Optional<WorkQueue> workQueue(String name) {
+        return Optional.empty();
+    }
+
     /** Looks up the execution previously registered under an idempotency key, if any. */
     Optional<ExecutionId> findByKey(String idempotencyKey);
 

@@ -232,6 +232,19 @@ The substrate becomes a platform. This is where the other CajunSystems component
   distribute — it is single-process — but it shares Gumbo with Catalyst, so it is useful *within* a
   node (supervising the claim loop, lease-renewal timers, death watch) and could later consume the
   same primitives to become clustered itself.
+- ✅ **The claim loop has landed** — `runtime.submit(queue, task)` publishes an execution to a shared
+  queue instead of running it, and `runtime.worker(queue)` claims and runs it. Submitting is *one
+  atomic append*: the execution's first event is dual-tagged into `catalyst-exec/<id>` and
+  `catalyst-tasks/<queue>`, so there is no window in which an execution is recorded but not yet
+  claimable, and no secondary index to keep consistent. Claiming is a compare-and-set on Gumbo's tag
+  KV (`WorkQueue` / `Lease`); running is the existing `resume(id)`; reclaiming is lease expiry plus a
+  retry, so a dead worker's execution is *resumed* at the boundary it reached rather than restarted.
+  Every append a claimed attempt makes is fenced (`FencedEventLog`), which is what makes the lease
+  safe to be wrong about. `Worker.start()` **refuses** a log that cannot fence. Gated by
+  `DistributedAcceptanceTest` + `Demo distributed`: two workers over one log run six submitted
+  executions exactly once each, and a writer the stream has moved past is rejected by storage.
+  Deliberately not claimed: this is correct on one node and **not yet runnable across processes**,
+  because no log Catalyst can build reports `multiWriter` (see below).
 - ✅ **The `EventLog` seam for conditional append has landed** — `append(id, event, expectedSeq)` plus
   `supportsConditionalAppend()`, rejecting a stale writer with `StaleWriterException`. The default
   **throws** rather than falling back to an unconditional append: a log that quietly ignored

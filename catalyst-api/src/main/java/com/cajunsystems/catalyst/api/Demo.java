@@ -18,8 +18,13 @@ import com.cajunsystems.catalyst.engine.ReplayingContext;
 import com.cajunsystems.catalyst.engine.RetryPolicy;
 import com.cajunsystems.catalyst.engine.Timeline;
 import com.cajunsystems.catalyst.events.CatalystEvent;
+import com.cajunsystems.catalyst.events.SequencedEvent;
 import com.cajunsystems.catalyst.events.EventJson;
 import com.cajunsystems.catalyst.gumbo.GumboEventLog;
+import com.cajunsystems.catalyst.log.EventLog;
+import com.cajunsystems.catalyst.log.FencedEventLog;
+import com.cajunsystems.catalyst.log.StaleWriterException;
+import com.cajunsystems.catalyst.log.WorkQueue;
 import com.cajunsystems.catalyst.model.Completion;
 import com.cajunsystems.catalyst.model.CompletionRequest;
 import com.cajunsystems.catalyst.model.Message;
@@ -29,6 +34,8 @@ import com.cajunsystems.catalyst.otel.CatalystTracer;
 import com.cajunsystems.catalyst.runtime.CatalystRuntime;
 import com.cajunsystems.catalyst.timeline.TimelineReport;
 import com.cajunsystems.catalyst.runtime.ExecutionHandle;
+import com.cajunsystems.catalyst.runtime.Worker;
+import com.cajunsystems.catalyst.runtime.WorkerConfig;
 import io.opentelemetry.api.trace.SpanKind;
 import io.opentelemetry.api.trace.StatusCode;
 import io.opentelemetry.api.trace.Tracer;
@@ -44,6 +51,8 @@ import java.nio.file.Path;
 import java.time.Clock;
 import java.time.Duration;
 import java.time.Instant;
+import java.util.ArrayList;
+import java.util.List;
 import java.util.Map;
 import java.util.concurrent.atomic.AtomicInteger;
 
@@ -122,6 +131,8 @@ public final class Demo {
             streamingDemo(Files.createTempDirectory("catalyst-streaming-"));
         } else if (args.length >= 1 && args[0].equals("timeline")) {
             timelineDemo(Files.createTempDirectory("catalyst-timeline-"));
+        } else if (args.length >= 1 && args[0].equals("distributed")) {
+            distributedDemo(Files.createTempDirectory("catalyst-distributed-"));
         } else if (args.length >= 1 && args[0].equals("schema")) {
             schemaDemo();
         } else {
@@ -130,6 +141,118 @@ public final class Demo {
             record(dir);
             resume(dir);
         }
+    }
+
+    /**
+     * The v1 distributed-execution exit demo: work is submitted to a shared queue instead of being
+     * run where it was created, two independent workers claim and run it, and a worker whose claim
+     * has moved on is rejected by storage rather than trusted.
+     *
+     * <p>The two workers get separate runtimes over one log on purpose. A single runtime already
+     * refuses to start a second concurrent attempt on an execution, so two workers inside one would
+     * demonstrate nothing about claiming; separate runtimes have separate in-flight sets, which is
+     * as close to two processes as one JVM gets.
+     */
+    private static void distributedDemo(Path dir) throws Exception {
+        MockModel model = MockModel.alwaysReturn("OK");
+        try (GumboEventLog shared = GumboEventLog.at(dir)) {
+            EventLog view = nonClosing(shared);
+            try (CatalystRuntime a = Catalyst.builder().log(view).model(model)
+                         .task(new QueuedTask()).build();
+                 CatalystRuntime b = Catalyst.builder().log(view).model(model)
+                         .task(new QueuedTask()).build()) {
+
+                System.out.println("[distributed] log can fence stale writers: "
+                        + shared.supportsConditionalAppend());
+
+                List<ExecutionId> ids = new ArrayList<>();
+                for (int i = 0; i < 6; i++) ids.add(a.submit("default", new QueuedTask()));
+                System.out.println("[distributed] submitted " + ids.size()
+                        + " executions; model calls so far: " + model.callCount()
+                        + "  (submitting records work, it does not run it)");
+
+                try (Worker wa = a.worker("default", demoWorker("node-a")).start();
+                     Worker wb = b.worker("default", demoWorker("node-b")).start()) {
+                    for (ExecutionId id : ids) {
+                        long deadline = System.currentTimeMillis() + 20_000;
+                        while (!a.inspect(id).isTerminal() && System.currentTimeMillis() < deadline) {
+                            Thread.sleep(10);
+                        }
+                    }
+                }
+
+                int completed = 0;
+                int runs = 0;
+                for (ExecutionId id : ids) {
+                    if (a.inspect(id).status() == Status.COMPLETED) completed++;
+                    for (SequencedEvent se : shared.read(id)) {
+                        if (se.event() instanceof CatalystEvent.ExecutionStarted
+                                || se.event() instanceof CatalystEvent.ExecutionResumed) runs++;
+                    }
+                }
+                System.out.println("[distributed] completed: " + completed + "/" + ids.size());
+                System.out.println("[distributed] total runs across both workers: " + runs
+                        + "  (one per execution => claimed exactly once)");
+                System.out.println("[distributed] model calls: " + model.callCount()
+                        + "  (2 per execution, none duplicated)");
+
+                // A worker that still believes the stream is where it left it is refused by storage.
+                ExecutionId finished = ids.get(0);
+                EventLog zombie = FencedEventLog.forAttempt(shared, finished, 0);
+                String rejected;
+                try {
+                    zombie.append(finished, new CatalystEvent.ExecutionResumed(Instant.now(), 99));
+                    rejected = "NOT REJECTED — the fence is not working";
+                } catch (StaleWriterException e) {
+                    rejected = "rejected: expected seq " + e.expectedSeq()
+                            + ", stream is at " + shared.latestSeq(finished);
+                }
+                System.out.println("[distributed] stale writer " + rejected);
+            }
+        }
+    }
+
+    /** A named task the workers can reconstruct from its recorded type. */
+    static final class QueuedTask implements Task<String> {
+        @Override public String execute(Context ctx) throws Exception {
+            ctx.model().complete(CompletionRequest.of(Prompt.builder().user("step one").build()));
+            ctx.model().complete(CompletionRequest.of(Prompt.builder().user("step two").build()));
+            return "done";
+        }
+    }
+
+    private static WorkerConfig demoWorker(String nodeId) {
+        return WorkerConfig.defaults()
+                .withNodeId(nodeId)
+                .withLease(Duration.ofSeconds(5), Duration.ofMillis(500))
+                .withPollInterval(Duration.ofMillis(20));
+    }
+
+    /** The shared log, minus ownership: each runtime would otherwise close it out from under the other. */
+    private static EventLog nonClosing(EventLog inner) {
+        return new EventLog() {
+            @Override public long append(ExecutionId id, CatalystEvent e) { return inner.append(id, e); }
+            @Override public long append(ExecutionId id, CatalystEvent e, long expected) {
+                return inner.append(id, e, expected);
+            }
+            @Override public boolean supportsConditionalAppend() { return inner.supportsConditionalAppend(); }
+            @Override public boolean supportsMultiWriter() { return inner.supportsMultiWriter(); }
+            @Override public List<SequencedEvent> read(ExecutionId id) { return inner.read(id); }
+            @Override public List<SequencedEvent> readFrom(ExecutionId id, long after) {
+                return inner.readFrom(id, after);
+            }
+            @Override public long latestSeq(ExecutionId id) { return inner.latestSeq(id); }
+            @Override public java.util.Optional<com.cajunsystems.catalyst.log.Snapshot> readSnapshot(ExecutionId id) {
+                return inner.readSnapshot(id);
+            }
+            @Override public void writeSnapshot(ExecutionId id, com.cajunsystems.catalyst.log.Snapshot s) {
+                inner.writeSnapshot(id, s);
+            }
+            @Override public java.util.Optional<ExecutionId> findByKey(String k) { return inner.findByKey(k); }
+            @Override public void putKey(String k, ExecutionId id) { inner.putKey(k, id); }
+            @Override public java.util.Optional<WorkQueue> workQueue(String n) { return inner.workQueue(n); }
+            @Override public void close() { /* inner closed by try-with-resources */ }
+        };
     }
 
     /**

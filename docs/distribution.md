@@ -57,6 +57,10 @@ one.
 
 ## Claiming work
 
+**Implemented.** `runtime.submit(queue, task)` publishes an execution to a shared queue instead of
+running it; `runtime.worker(queue)` claims and runs it, wherever that worker happens to be. What
+follows is the design, and it is what the code does.
+
 Correctness is settled by the paragraph above; the rest is efficiency and operations.
 
 1. **Claim** — a node compare-and-sets a lease row for an execution: `(executionId → nodeId,
@@ -119,7 +123,14 @@ anywhere. Solving the weaker problem is what lets the operational story be this 
 > each, a suggested order, and the tests that would have caught them — is written up separately in
 > [`gumbo-requirements.md`](gumbo-requirements.md).
 
-## Prerequisite: Gumbo is not multi-writer safe today
+## Prerequisite: Gumbo was not multi-writer safe (measured, then fixed)
+
+> Kept because the measurement is the useful part. The specific defects below were closed in Gumbo
+> 0.3.0–0.6.0: the file adapter now takes an exclusive directory lock, versions are assigned per tag
+> and rebuilt from the log on open, and the index no longer clobbers. What has *not* changed is the
+> conclusion for deployment — no log Catalyst can build today reports `multiWriter`, because Gumbo
+> composes that from storage **and** its sequencer, and the default sequencer is a per-process
+> `AtomicLong`. Multi-process operation still needs FoundationDB plus a distributed sequencer.
 
 This was measured, not assumed. Two JVMs were pointed at one Gumbo directory and each appended three
 events to the same execution:
@@ -199,11 +210,19 @@ these primitives belong in the log, not in Catalyst and not in an actor system.
 
 Three gaps, all in storage. None of them require an actor system.
 
-| Gap | Today | Needed |
-|---|---|---|
-| Conditional append | `append(id, event)` — unconditional | `append(id, event, expectedSeq)`, rejecting on mismatch |
-| Lease storage | Gumbo's tag KV exists (`setTagValue`/`getTagValue`/`deleteTagValue`) — but get/set only | **compare-and-set + TTL** on the existing KV |
-| Claimable work | ~~no way to ask the log what needs running~~ | **already possible** — dual-tagging delivers it, and since Gumbo 0.6.0 the queue tag can be cursored by version too |
+| Gap | Status |
+|---|---|
+| Conditional append | ✅ `append(id, event, expectedSeq)` rejects a stale writer with `StaleWriterException`; `supportsConditionalAppend()` says whether a log can do it at all |
+| Lease storage | ✅ Gumbo's tag KV grew the conditional writes this needs — `compareAndSetTagValue`, `setTagValueIfAbsent`, `deleteTagValueIf`, `incrementTagValue`, on all three adapters. No TTL at the store: a lease carries its own expiry in its value, so expiry is a comparison rather than a storage feature |
+| Claimable work | ✅ dual-tagging delivers it, and since Gumbo 0.6.0 the queue tag is cursored by its own version like any other stream |
+
+All three are now not merely available but **used**: `WorkQueue` + `Lease` (catalyst-core),
+`GumboWorkQueue` (catalyst-gumbo), `Worker` + `runtime.submit(...)` (catalyst-runtime).
+
+> This table said "compare-and-set + TTL on the existing KV" under **Needed** for longer than it was
+> true: the conditional KV writes had already shipped in Gumbo and nothing here noticed. Worth a line
+> because it is the same failure the rest of this document keeps recording in other forms — a
+> statement about another layer, written once and then trusted.
 
 Smaller than it first appeared, because two of the three are partly solved already.
 
@@ -387,3 +406,46 @@ is, and it is optional.
 A useful consequence of the ordering: steps 0 and 1 are worth doing regardless of whether Catalyst
 ever distributes. A log that assigns ids safely across writers and supports compare-and-append is
 simply a better log, and Bayou would benefit from the same work.
+
+## What building the claim loop actually cost
+
+Two things, neither of which was in the design, and both of which were found by running it rather
+than by reading it. They are recorded here because both are the kind of defect that looks like
+infrastructure flakiness and gets retried away.
+
+### A shared entry has no single position — including on the way *out*
+
+Gumbo 0.6.0 gave every tag on an entry its own version, which is what makes a queue cursor work.
+Catalyst then reintroduced the identical bug one layer up, on the read path: `GumboEventLog` decoded
+entries with `LogEntry.streamVersion()` — the *no-argument* accessor, which answers for the entry's
+primary tag, and the primary tag is `tags.iterator().next()` over an immutable set, an order Java
+salts per JVM run.
+
+While every entry carried one tag the two answers were the same number and the distinction could not
+be observed. The first dual-tagged append changed that: on roughly half of all JVM runs
+`ExecutionCreated` came back numbered with the *queue's* position, so an execution's stream was not
+dense from zero, the fold produced an execution stuck in `STARTING`, and nothing anywhere looked
+wrong. Fixed by naming the tag — `entry.streamVersion(execTag)`.
+
+The lesson is not "call the other method". It is that **the no-argument accessor is only meaningful
+while entries have one tag**, and a codebase that dual-tags anything has lost the right to use it.
+
+### Virtual threads on both sides of a blocking boundary deadlock
+
+Catalyst runs executions on virtual threads. Gumbo, by default, runs its storage work on virtual
+threads too. Every Catalyst append blocks on a Gumbo future which is completed by one of those tasks
+— so a Catalyst thread waiting for an append holds a carrier while the task that would release it
+waits for a carrier. The scheduler has one carrier per core.
+
+On a four-core machine, four concurrent executions were enough: all four carriers parked in
+`appendFenced`, the four completing tasks unschedulable, the JVM hung indefinitely. Nothing was
+pinned and no monitor was held — `-Djdk.tracePinnedThreads` reported nothing — which is what made it
+confusing to diagnose. It is plain carrier exhaustion across a blocking boundary.
+
+Catalyst now hands Gumbo a **platform-thread** pool when it constructs the service. That is also
+what the workload wants on its own merits: the adapters' methods are `synchronized` and do file I/O
+and `fsync`, which is the work virtual threads are worst at. The `Worker`'s own loop and its
+per-execution waiters are platform threads for the same reason.
+
+The general rule this yields: **two virtual-thread schedulers on opposite sides of a blocking call
+is a deadlock waiting for enough concurrency**, and "enough" is as low as the core count.

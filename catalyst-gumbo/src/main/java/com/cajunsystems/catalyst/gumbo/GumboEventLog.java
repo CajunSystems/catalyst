@@ -10,6 +10,7 @@ import com.cajunsystems.catalyst.events.SequencedEvent;
 import com.cajunsystems.catalyst.log.EventLog;
 import com.cajunsystems.catalyst.log.Snapshot;
 import com.cajunsystems.catalyst.log.StaleWriterException;
+import com.cajunsystems.catalyst.log.WorkQueue;
 import com.cajunsystems.gumbo.api.LogView;
 import com.cajunsystems.gumbo.api.TypedLogView;
 import com.cajunsystems.gumbo.core.AppendRequest;
@@ -33,6 +34,8 @@ import java.util.List;
 import java.util.Map;
 import java.util.Optional;
 import java.util.concurrent.ConcurrentHashMap;
+import java.util.concurrent.ExecutorService;
+import java.util.concurrent.Executors;
 
 /**
  * A durable {@link EventLog} backed by the Gumbo shared log (spec §8) — the flagship embedded mode.
@@ -44,19 +47,23 @@ import java.util.concurrent.ConcurrentHashMap;
  */
 public final class GumboEventLog implements EventLog {
 
-    private static final String EXEC_NAMESPACE = "catalyst-exec";
+    static final String EXEC_NAMESPACE = "catalyst-exec";
+    private static final String QUEUE_NAMESPACE = "catalyst-tasks";
     private static final LogTag INDEX_TAG = LogTag.of("catalyst-index", "keys");
     private static final LogTag SNAPSHOT_TAG = LogTag.of("catalyst-index", "snapshots");
 
     private final SharedLogService service;
+    private final ExecutorService ioPool;
     private final EventLogSerializer serializer;
     private final Map<ExecutionId, TypedLogView<CatalystEvent>> views = new ConcurrentHashMap<>();
     /** Cache of the last seq (Gumbo streamVersion) per execution, so latestSeq is O(1) after an append. */
     private final Map<ExecutionId, Long> lastSeq = new ConcurrentHashMap<>();
+    private final Map<String, GumboWorkQueue> queues = new ConcurrentHashMap<>();
     private final LogView indexView;
     private final LogView snapshotView;
 
-    private GumboEventLog(SharedLogService service, EventCodec codec) {
+    private GumboEventLog(SharedLogService service, EventCodec codec, ExecutorService ioPool) {
+        this.ioPool = ioPool;
         this.service = service;
         this.serializer = new EventLogSerializer(codec);
         this.indexView = service.getView(INDEX_TAG);
@@ -108,6 +115,37 @@ public final class GumboEventLog implements EventLog {
     }
 
     /**
+     * The pool Gumbo runs its storage work on: <strong>platform</strong> threads, deliberately, in a
+     * runtime that is otherwise virtual-threads-everywhere.
+     *
+     * <p>Gumbo's default is a virtual-thread-per-task executor, and combining that with Catalyst's
+     * virtual-thread scheduler deadlocks -- not in theory, and not only under pathological load.
+     * Every Catalyst append blocks on a Gumbo future, and that future is completed by a task which,
+     * under the default, is itself a virtual thread needing a carrier. The scheduler has one carrier
+     * per core. So on a four-core machine, four Catalyst threads blocked on four appends consume
+     * every carrier, and the four tasks that would complete those appends can never be scheduled.
+     * Nothing is pinned and no monitor is held; the pool that has to make progress simply cannot get
+     * a thread to make it on. Measured on a 4-core box: eight concurrent executions across two
+     * workers, hung indefinitely with all four carriers parked in {@code appendFenced}.
+     *
+     * <p>Platform threads break the cycle at its only breakable point. It is also what this work
+     * wants regardless of the deadlock: the adapter's methods are {@code synchronized} and do file
+     * I/O and {@code fsync}, which is the workload virtual threads are worst at and platform threads
+     * are for.
+     *
+     * <p>Cached rather than fixed. The pool must always be able to start one more thread: a fixed
+     * pool would reintroduce exactly the same starvation with a different bound the day any storage
+     * operation waits on another.
+     */
+    private static ExecutorService logIoPool() {
+        return Executors.newCachedThreadPool(r -> {
+            Thread t = new Thread(r, "catalyst-log-io");
+            t.setDaemon(true);
+            return t;
+        });
+    }
+
+    /**
      * Package-private rather than private so a test can supply an adapter with a different set of
      * declared capabilities.
      *
@@ -119,10 +157,12 @@ public final class GumboEventLog implements EventLog {
      */
     static GumboEventLog open(PersistenceAdapter adapter, EventCodec codec) {
         try {
+            ExecutorService pool = logIoPool();
             SharedLogConfig config = SharedLogConfig.builder()
                     .persistenceAdapter(adapter)
+                    .asyncPool(pool)
                     .build();
-            return new GumboEventLog(SharedLogService.open(config), codec);
+            return new GumboEventLog(SharedLogService.open(config), codec, pool);
         } catch (LogAlreadyOpenException e) {
             // The file adapter is single-writer and says so precisely. Keep its message at the top
             // level rather than burying it as a cause — a directory already held by another process
@@ -149,7 +189,7 @@ public final class GumboEventLog implements EventLog {
         return views.computeIfAbsent(id, k -> service.getTypedView(tagFor(k), serializer));
     }
 
-    private static LogTag tagFor(ExecutionId id) {
+    static LogTag tagFor(ExecutionId id) {
         return LogTag.of(EXEC_NAMESPACE, id.value());
     }
 
@@ -177,6 +217,51 @@ public final class GumboEventLog implements EventLog {
     }
 
     /**
+     * This log's work queue named {@code name} -- {@code catalyst-tasks/<name>} as a Gumbo tag.
+     *
+     * <p>Always present: every adapter Gumbo ships can carry several tags on one entry and can
+     * compare-and-set a tag value, which is all a queue needs. Whether it is safe to run <em>two
+     * nodes</em> against it is a different question, answered by
+     * {@link #supportsConditionalAppend()} and {@link #supportsMultiWriter()}, and asked by
+     * {@code Worker} rather than here -- a queue with one consumer is a perfectly ordinary way to
+     * run, and refusing to hand one out would conflate "cannot distribute" with "cannot queue".
+     */
+    @Override
+    public Optional<WorkQueue> workQueue(String name) {
+        return Optional.of(queues.computeIfAbsent(name,
+                n -> new GumboWorkQueue(n, LogTag.of(QUEUE_NAMESPACE, n), service, this)));
+    }
+
+    /** Serializes an event with this log's codec, for {@link GumboWorkQueue}'s multi-tag append. */
+    byte[] serialize(CatalystEvent event) {
+        return serializer.serialize(event);
+    }
+
+    /**
+     * Appends a pre-built (possibly multi-tag) request, fenced on {@code fencedTag} at
+     * {@code expectedVersion}, and translates a rejection into {@link StaleWriterException} exactly
+     * as the single-tag path does.
+     *
+     * <p>Shared with {@link #append(ExecutionId, CatalystEvent, long)} so there is one place that
+     * knows a conflict arrives buried in a cause chain, and one place that maintains the
+     * {@code lastSeq} cache. Two copies of that translation is how one of them ends up matching on
+     * the outermost throwable and silently reclassifying every conflict as an I/O failure.
+     */
+    long appendFenced(ExecutionId executionId, AppendRequest request, LogTag fencedTag,
+                      long expectedVersion) {
+        long seq;
+        try {
+            seq = service.append(request, fencedTag, expectedVersion).join().streamVersion();
+        } catch (RuntimeException e) {
+            VersionConflictException conflict = conflictIn(e);
+            if (conflict == null) throw e;
+            throw new StaleWriterException(executionId, expectedVersion, conflict.actualVersion());
+        }
+        lastSeq.merge(executionId, seq, Math::max);
+        return seq;
+    }
+
+    /**
      * Conditional append, straight onto Gumbo's fence: Catalyst's {@code seq} <em>is</em> the
      * execution tag's {@code streamVersion}, so "append only if this execution is still at seq N"
      * is "append only if this tag is still at version N" with no translation in between.
@@ -194,17 +279,9 @@ public final class GumboEventLog implements EventLog {
      */
     @Override
     public long append(ExecutionId executionId, CatalystEvent event, long expectedSeq) {
-        AppendRequest request = AppendRequest.to(tagFor(executionId), serializer.serialize(event));
-        long seq;
-        try {
-            seq = service.append(request, expectedSeq).join().streamVersion();
-        } catch (RuntimeException e) {
-            VersionConflictException conflict = conflictIn(e);
-            if (conflict == null) throw e;
-            throw new StaleWriterException(executionId, expectedSeq, conflict.actualVersion());
-        }
-        lastSeq.merge(executionId, seq, Math::max);
-        return seq;
+        LogTag tag = tagFor(executionId);
+        return appendFenced(executionId, AppendRequest.to(tag, serializer.serialize(event)),
+                tag, expectedSeq);
     }
 
     /**
@@ -251,7 +328,7 @@ public final class GumboEventLog implements EventLog {
 
     @Override
     public List<SequencedEvent> read(ExecutionId executionId) {
-        return decode(viewFor(executionId).rawView().readAll().join());
+        return decode(tagFor(executionId), viewFor(executionId).rawView().readAll().join());
     }
 
     @Override
@@ -261,13 +338,33 @@ public final class GumboEventLog implements EventLog {
         // stream's numbering only while the log holds a single execution — with a second execution
         // sharing it, that read silently returns events already folded into the snapshot and the
         // reducer re-applies them. readAfterVersion takes -1 as "the whole stream".
-        return decode(viewFor(executionId).rawView().readAfterVersion(afterSeqExclusive).join());
+        return decode(tagFor(executionId),
+                viewFor(executionId).rawView().readAfterVersion(afterSeqExclusive).join());
     }
 
-    private List<SequencedEvent> decode(List<LogEntry> entries) {
+    /**
+     * Decodes entries read from {@code tag}'s stream, taking each event's {@code seq} from
+     * <em>that tag's</em> position.
+     *
+     * <p>Naming the tag is load-bearing, not defensive. {@code LogEntry.streamVersion()} with no
+     * argument answers for the entry's <em>primary</em> tag, which is
+     * {@code tags.iterator().next()} over an immutable set -- an order Java salts per JVM run. While
+     * every entry carried exactly one tag the two answers were the same number and the distinction
+     * could not be observed. The moment an execution's first event is also published to a work queue,
+     * the no-argument form starts returning the queue's position for roughly half of all JVM runs,
+     * and that number becomes the execution's {@code seq}: {@code ExecutionCreated} at seq 4, a
+     * stream that is no longer dense from zero, and a fold that produces an execution stuck in
+     * {@code STARTING} forever.
+     *
+     * <p>Which is the same mistake, one layer up, that Gumbo 0.6.0 existed to fix: asking a shared
+     * entry for "the" position when positions are per-tag. The fix below is to ask the question that
+     * has an answer.
+     */
+    private List<SequencedEvent> decode(LogTag tag, List<LogEntry> entries) {
         List<SequencedEvent> events = new ArrayList<>(entries.size());
         for (LogEntry entry : entries) {
-            events.add(new SequencedEvent(entry.streamVersion(), serializer.deserialize(entry.dataUnsafe())));
+            events.add(new SequencedEvent(
+                    entry.streamVersion(tag), serializer.deserialize(entry.dataUnsafe())));
         }
         return events;
     }
@@ -321,5 +418,6 @@ public final class GumboEventLog implements EventLog {
     @Override
     public void close() {
         service.close();
+        if (ioPool != null) ioPool.shutdown();
     }
 }

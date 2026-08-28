@@ -34,14 +34,24 @@ jobs:
       # Catalyst depends on com.cajunsystems:gumbo. The intended source is JitPack, but to keep CI
       # deterministic (and independent of JitPack availability / egress policy) we build the pinned
       # Gumbo release tag and install it into the local Maven repo before building Catalyst.
+      # Gumbo's own pom declares groupId com.cajunsystems, but JitPack republishes it as
+      # com.github.{owner} — and com.github.CajunSystems:gumbo is what this build depends on. So the
+      # groupId has to be rewritten before installing, or this step installs coordinates nothing
+      # references and every build silently resolves from JitPack after all, which is the opposite of
+      # what the step is for. (It did exactly that, unnoticed, from the move to the JitPack
+      # coordinates until this was fixed.)
       - name: Install Gumbo ${{ env.GUMBO_VERSION }} into local Maven repo
         run: |
           set -euo pipefail
-          if [ -d "$HOME/.m2/repository/com/cajunsystems/gumbo/${GUMBO_VERSION}" ]; then
+          if [ -d "$HOME/.m2/repository/com/github/CajunSystems/gumbo/${GUMBO_VERSION}" ]; then
             echo "Gumbo ${GUMBO_VERSION} already cached in ~/.m2 — skipping build."
           else
             git clone --depth 1 --branch "${GUMBO_VERSION}" https://github.com/CajunSystems/gumbo.git /tmp/gumbo
+            # A literal <groupId> cannot be overridden with -D, so rewrite it in the checkout.
+            perl -0pi -e 's{<groupId>com\.cajunsystems</groupId>}{<groupId>com.github.CajunSystems</groupId>}' /tmp/gumbo/pom.xml
             mvn -B --no-transfer-progress -f /tmp/gumbo/pom.xml install -DskipTests
+            test -d "$HOME/.m2/repository/com/github/CajunSystems/gumbo/${GUMBO_VERSION}" \
+              || { echo "FAIL: Gumbo did not install under the coordinates this build depends on"; exit 1; }
           fi
 
       - name: Build and test
@@ -324,6 +334,34 @@ jobs:
           echo "$OUT" | grep -q "\[streaming\] streaming criterion holds" \
             || { echo "FAIL: streaming demo did not pass its assertions"; exit 1; }
           echo "v0.2 Streaming exit criterion holds: $CHUNKS chunks live, one recorded completion, replay with zero model calls."
+
+      # The v1 distributed-execution exit criterion: work is submitted to a shared queue rather than
+      # run where it was created, and two independent workers claim it. "total runs: 6" is the
+      # load-bearing number — one run per execution means the claim excluded the other worker, and it
+      # is what a broken lease breaks first. The stale-writer line gates the property underneath it:
+      # exclusion is an optimisation, and storage refusing a writer the stream has moved past is the
+      # guarantee.
+      - name: Exit demo — v1 distributed execution (claim + fence)
+        run: |
+          set -uo pipefail
+          CP="catalyst-api/target/classes:$(cat catalyst-api/target/cp.txt)"
+
+          echo "--- submit work to a queue; two workers claim and run it ---"
+          OUT="$(java -cp "$CP" com.cajunsystems.catalyst.api.Demo distributed)"
+          echo "$OUT"
+          echo "$OUT" | grep -q "log can fence stale writers: true" \
+            || { echo "FAIL: the log cannot fence, so claimed work is not safe to run"; exit 1; }
+          echo "$OUT" | grep -q "model calls so far: 0" \
+            || { echo "FAIL: submitting ran the work instead of queueing it"; exit 1; }
+          echo "$OUT" | grep -q "completed: 6/6" \
+            || { echo "FAIL: not all submitted work was claimed and completed"; exit 1; }
+          echo "$OUT" | grep -q "total runs across both workers: 6" \
+            || { echo "FAIL: an execution was run by more than one worker"; exit 1; }
+          echo "$OUT" | grep -q "model calls: 12" \
+            || { echo "FAIL: duplicate provider calls across workers"; exit 1; }
+          echo "$OUT" | grep -q "stale writer rejected:" \
+            || { echo "FAIL: a stale writer was not rejected by storage"; exit 1; }
+          echo "v1 distributed execution criterion holds: 6 submitted, each claimed and run once, stale writer refused."
 
       # The v0.2 timeline exit criterion (spec §12): an execution's folded state renders to a read-only
       # HTML report. "self-contained: true" is the load-bearing assertion — a report with no scripts and

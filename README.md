@@ -26,7 +26,7 @@ log) provides durability.
 
 ---
 
-## What works today (M0 + M1 + M2)
+## What works today (v0.1 M0–M2, v0.2, and v1 distributed execution)
 
 - **`Task` / `Context` API** — a task is a unit of AI work; everything it needs (model, tools,
   memory, effects) comes from the `Context` passed to `execute`.
@@ -34,6 +34,13 @@ log) provides durability.
   memory read/write) becomes an event in an append-only log.
 - **Crash recovery** — `kill -9` mid-task, re-submit with the same idempotency key, and the
   execution resumes at the exact event and completes with **zero duplicate model calls**.
+- **Distributed execution** — `runtime.submit(queue, task)` publishes work to a shared queue instead
+  of running it, and `runtime.worker(queue)` claims and runs it. Workers form no cluster, elect no
+  leader and share no membership: they compete through the log. Single-writer-per-execution is
+  enforced by *conditional append*, not by the lease — so a worker whose claim was stolen is rejected
+  by storage rather than trusted — and a dead worker's execution is **resumed at the boundary it
+  reached**, not restarted. Correct on one node today; running it across processes additionally
+  needs a log that reports `multiWriter` (see [`docs/distribution.md`](docs/distribution.md)).
 - **Two storage backends behind one SPI** — an in-memory log for tests, and a durable
   **Gumbo**-backed file log (the flagship embedded mode).
 - **`MockModel`** (deterministic, for tests/demos) and built-in **`ClockTool`** / **`CalculatorTool`**.
@@ -79,7 +86,7 @@ Deferred to later milestones (schema slots already reserved so no breaking chang
 | `catalyst-core` | `Task`, `Context`, `Model`/`Tool`/`Memory`/`EventLog` SPIs, the reducer fold, and `ReplayingContext` (record/substitute engine) |
 | `catalyst-runtime` | `CatalystRuntime`, virtual-thread scheduler, lifecycle, idempotency, in-memory `EventLog` |
 | `catalyst-gumbo` | `GumboEventLog`: durable `EventLog` over the Gumbo shared log |
-| `catalyst-tools` | `ClockTool`, `CalculatorTool` |
+| `catalyst-tools` | `ClockTool`, `CalculatorTool`, `HttpTool` (pluggable `Sender` seam), `FilesystemTool` (sandboxed to a root dir) |
 | `catalyst-langchain4j` | `LangChain4jModel`: adapts any LangChain4j `ChatModel` to Catalyst's `Model` |
 | `catalyst-otel` | `CatalystTracer`: folds an execution's log into an OpenTelemetry trace (API-only; app supplies the SDK) |
 | `catalyst-timeline` | `TimelineReport`: renders a folded execution as a self-contained HTML timeline (no deps beyond core) |
