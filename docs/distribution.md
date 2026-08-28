@@ -203,7 +203,7 @@ Three gaps, all in storage. None of them require an actor system.
 |---|---|---|
 | Conditional append | `append(id, event)` — unconditional | `append(id, event, expectedSeq)`, rejecting on mismatch |
 | Lease storage | Gumbo's tag KV exists (`setTagValue`/`getTagValue`/`deleteTagValue`) — but get/set only | **compare-and-set + TTL** on the existing KV |
-| Claimable work | ~~no way to ask the log what needs running~~ | **the delivery mechanism already exists**; the cursor over it has a caveat — see below |
+| Claimable work | ~~no way to ask the log what needs running~~ | **already possible** — dual-tagging delivers it, and since Gumbo 0.6.0 the queue tag can be cursored by version too |
 
 Smaller than it first appeared, because two of the three are partly solved already.
 
@@ -262,43 +262,34 @@ Better still, Gumbo has **push subscriptions** (`SharedLogService.notifySubscrib
 push already, which removes polling latency from the design and further reduces what a placement
 layer would add.
 
-#### The caveat: a queue tag cannot be cursored by version
+#### Cursoring the queue tag: resolved in Gumbo 0.6.0
 
-This section originally read "already possible" without qualification. That was measured against
-atomic multi-tag append, which does hold — one append, both tags, no window. It was not measured
-against the *cursor*, and the cursor is where it bites.
+This section once read "already possible" without qualification, then carried a caveat, and now
+reads plainly again. The middle step is worth keeping, because it is the part that was measured.
 
-A Gumbo entry carries **one** `streamVersion`, assigned from its primary tag. For a tag an entry
-carries only as a secondary tag, that number belongs to a different stream: it does not count the
-secondary tag's entries and it need not start at zero. Gumbo pins this as a known defect
-(`VersionKeyedReadTest.anAtomicMultiTagAppendLeavesOneStreamMisNumbered`, written as a property —
-*both streams cannot be dense from 0* — because which tag is primary is `Set.copyOf` iteration
-order, salted per JVM). Measured there: an entry dual-tagged into a queue took version 3 from the
-history tag, and the next queue-only append got 4 where the queue's own second entry should be 1.
+"Already possible" was measured against atomic multi-tag append, which does hold — one append, both
+tags, no window. It was **not** measured against the *cursor*, and the cursor is where it bit. A
+Gumbo entry used to carry **one** `streamVersion`, assigned from its primary tag, and every tag it
+touched was told that number. For a tag carried only as a secondary that number belonged to a
+different stream: not dense, not starting at zero, and — the part that loses work — able to go
+*backwards* relative to entries already delivered. A worker holding "I have processed
+`catalyst-tasks/<queue>` through version *N*" could be handed an item numbered below *N*, and a
+version-keyed tail read would skip it. Silently, with nothing in the log looking wrong.
 
-So a worker that remembers "I have processed `catalyst-tasks/<queue>` through version *N*" and asks
-for everything after *N* is doing arithmetic on another stream's numbers. Two consequences, and the
-second is the dangerous one:
+**Gumbo 0.6.0 fixes it at the source.** Every tag an entry carries now gets its own position, so a
+queue tag is dense from zero in its own right and a version-keyed cursor over it advances one place
+per queue entry regardless of how far along each item's workflow happens to be. The fix cost a
+record-layout change but no migration: each record's marker says which layout it is, so an existing
+log keeps reading and simply grows new-format records on the end.
 
-- Versions on the queue tag are **not dense**, so the gaps mean nothing and cannot be used to detect
-  loss.
-- A queue entry can be assigned a version **below** one already delivered, whenever its primary tag
-  is behind — and a version-keyed tail read then skips it. Work silently never claimed, with no
-  error at the seam and nothing in the log that looks wrong.
+So the design needs no workaround. `catalyst-tasks/<queue>` is cursored with `readAfterVersion`,
+the same read `catalyst-exec/<id>` uses, and the claim loop can hold one number per worker.
 
-**What this changes.** Not the design: dual-tagging is still the right mechanism, and delivery is
-still atomic with the history write. What it changes is the read. Until Gumbo carries a version per
-tag per entry, a fan-out tag must be cursored with the **seqnum-keyed** `readByTag` — which is
-correct, is what Boudin does, and is what Gumbo's `readFromVersion` javadoc says to do. The
-version-keyed read stays the right one for `catalyst-exec/<id>`, where the execution tag is always
-primary.
-
-**What it costs to fix properly.** A version per tag per entry changes the on-disk record layout and
-forces a log migration — the one property the `streamVersion` rename was careful to preserve, and
-the only item on Gumbo's backlog with a data-format cost. It was filed last there, on that cost.
-This design is the reason it moved up: the ranking was made before anything depended on it, and
-this depends on it. Catalyst can ship the claim loop on seqnum-keyed queue reads in the meantime,
-which is why this is a caveat and not a blocker.
+**The dependency is pinned, not assumed.** `GumboEventLogTest.aFanOutTagIsCursoredByItsOwnVersion`
+exercises the property through the log Catalyst actually builds, so a future regression in the layer
+below shows up here rather than as work that is never claimed. That is the same lesson this document
+learned the expensive way: the first version of this section asserted a guarantee nobody had
+checked.
 
 On the Gumbo side, conditional append is natural for the FoundationDB adapter (real transactions)
 and enforceable with a local lock in the file adapter, which is sufficient because that adapter is

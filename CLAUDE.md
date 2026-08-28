@@ -14,7 +14,7 @@ mvn install            # full reactor + tests
 mvn -pl catalyst-core -am install   # a single module and its deps
 ```
 
-**Gumbo dependency:** `catalyst-gumbo` depends on **`com.github.CajunSystems:gumbo:0.5.0`**,
+**Gumbo dependency:** `catalyst-gumbo` depends on **`com.github.CajunSystems:gumbo:0.6.0`**,
 resolved from JitPack (declared in the root pom) — an ordinary build needs no setup. The groupId is
 *not* the `com.cajunsystems` that Gumbo's own pom declares; JitPack rewrites it to
 `com.github.{owner}` on publish. So a hand-built `mvn -f /path/to/gumbo/pom.xml install -DskipTests`
@@ -187,6 +187,14 @@ checkout's pom to `com.github.CajunSystems` before installing.
   distribution needs both. Note Gumbo composes `multiWriter` from storage **and** its sequencer, so
   no log Catalyst builds today reports `true`: the default sequencer is a per-process `AtomicLong`,
   which no storage fence can compensate for since the seqnum never passes through it.
+- **Fan-out tag cursors (v1 claimable work)** — `GumboEventLogTest.aFanOutTagIsCursoredByItsOwnVersion`:
+  since gumbo **0.6.0** every tag an entry carries has its own dense position, so a shared
+  `catalyst-tasks/<queue>` fed by dual-tagged appends can be cursored with `readAfterVersion` like
+  any other stream. Before 0.6.0 a queue entry inherited its execution's version and a worker could
+  silently skip work numbered below its cursor — `docs/distribution.md` carried that caveat and no
+  longer does. Catalyst does not dual-tag yet (the claim loop would); the test exists **because**
+  nothing here depends on it yet, so a regression underneath would otherwise surface as work that
+  is never claimed. `GumboEventLog.service()` is package-private for it.
 
 - **In-doubt model completions** — `ReplayingContextInDoubtCompletionTest`: a `CompletionRequested`
   with no `CompletionReceived` is a provider call that may have been accepted and *billed*, so it
