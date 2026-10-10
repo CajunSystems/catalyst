@@ -204,6 +204,74 @@ exporter, the auto-capture agent, streaming completions, and the timeline UI hav
 
 ---
 
+## Next — deployable, then distributed 🔜
+
+v0.2 hardened the single-node runtime; this is the sequenced plan for running it in production, then
+across nodes. Two tracks share one foundation. **Track A** makes a single active node deployable and
+self-recovering on today's file-backed log (a `StatefulSet` of one with a persistent volume; scale by
+sharding executions across independent nodes). **Track B** removes the single-node limit using the
+design in [`docs/distribution.md`](docs/distribution.md). Each item is its own PR with its own tests,
+and items that touch the engine get an exit demo gated in CI, as in v0.2.
+
+**The shared foundation is an execution index.** `EventLog` cannot list its executions today — you
+can read a stream only if you already hold its id — so nothing can find the in-flight work after a
+restart. The startup recovery scan (A2) needs exactly what the distributed claim loop (B4) needs: a
+log-resident list of executions that may need running. Both are served by **dual-tagging**
+`ExecutionCreated` into a shared tag in the same atomic append as the execution's own stream (the
+Boudin technique; cursorable by version since gumbo 0.6.0). Building it once, in A1, means Track B
+inherits its queue instead of inventing a second one.
+
+### Track A — deployable single node
+- **A1. Execution index** — dual-tag `ExecutionCreated` into `catalyst-tasks/<queue>` (default
+  queue for now) and expose it through an additive `EventLog` read (e.g. `executions(afterVersion)`),
+  default-throwing like conditional append so a log that cannot enumerate says so. `InMemoryEventLog`
+  + `GumboEventLog`; tests put a second execution in the log.
+- **A2. Startup recovery** — `runtime.recoverAll()` (and `Catalyst.builder().recoverOnStart(true)`)
+  walks the index, folds each execution (snapshot-warm), and `resume(id)`s every non-terminal one.
+  Unregistered task types are reported, not fatal. Exit demo `Demo recover`: crash with several
+  executions in flight, restart, all finish with zero duplicate model calls.
+- **A3. Blob store ergonomics** — `BlobStore extends AutoCloseable` (default no-op) and
+  `Catalyst.builder().blobStore(...)`, so a remote store (S3/GCS) is a builder line and closes with
+  the log.
+- **A4. Graceful shutdown** — stop accepting submissions, let in-flight attempts reach a boundary or
+  leave them for A2 on the next start; release the Gumbo directory lock promptly so a rescheduled pod
+  can reopen the volume.
+- **A5. Deployment guide** — `docs/deployment.md`: single active node on a `ReadWriteOnce` block
+  volume (not NFS — the directory lock is the single-writer guarantee), `InDoubtPolicy` and
+  `RetryPolicy` choices for node loss, volume snapshots for DR, and sharding by `ExecutionId` hash
+  across independent nodes for scale.
+
+### Track B — distributed execution
+- **B0. Multi-writer log (Gumbo-side, blocking)** — FoundationDB adapter wired through a
+  `GumboEventLog` factory, plus a distributed sequencer, so `supportsMultiWriter()` reports `true`
+  for a real configuration. Until this lands no log Catalyst builds may be shared between nodes.
+- **B1. Fenced runtime writes** — the runtime appends through `append(id, event, expectedSeq)` when
+  the log supports it; a `StaleWriterException` aborts the attempt (another writer owns the stream)
+  rather than failing the execution. Meaningful single-node too, and independent of B0.
+- **B2. Distribution guard** — distributed mode refuses to start unless the log reports **both**
+  `supportsConditionalAppend()` and `supportsMultiWriter()`.
+- **B3. Leases** — lease row per execution via the tag KV's CAS (gumbo 0.4.0+): claim, heartbeat,
+  expiry. Resolve the open question first: whether `expectedSeq` makes a separate fencing token
+  redundant. Lease duration and heartbeat interval get defaults plus a knob.
+- **B4. Claim loop** — each node subscribes to the A1 queue tag, claims via B3, runs `resume(id)`,
+  and reclaims expired leases. Exit demo `Demo distributed`: two runtimes on one multi-writer log,
+  one killed mid-run, the other reclaims and finishes with zero duplicate model calls, and the
+  zombie's late write is rejected by the fence.
+- **B5. Cross-node control** — `cancel`/`pause`/attach for an execution running on another node.
+  Today `cancel(id)` trips an in-process token; across nodes the request has to travel through the
+  log or KV and be observed at the owner's next boundary, preserving "only the owner appends".
+- **B6. Push placement (optional)** — Cajun `ClusterActorSystem` behind `KeyedLock`, replacing
+  subscription-plus-claim with assignment. An optimisation only; correctness stays in B1/B3.
+
+### Order
+**A1 → A2 → B1 → A3 → A4/A5 → (B0 lands in Gumbo) → B2 → B3 → B4 → B5**, then the v1 platform
+items below. Signals (`WAITING`) are sequenced after B4 on purpose: a waiting execution should
+release its lease and a signal should re-enqueue it, so it is designed against the claim loop rather
+than retrofitted onto it. Eval harness and the timeline polish (latency bars, `TrajectoryDiff` view)
+are independent and can slot in anywhere.
+
+---
+
 ## v1 — Agents, signals, distribution 🔭
 
 The substrate becomes a platform. This is where the other CajunSystems components integrate.
