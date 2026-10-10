@@ -224,6 +224,8 @@ Boudin technique; cursorable by version since gumbo 0.6.0). Building it once, in
 Dist inherits its queue instead of inventing a second one.
 
 ### Deploy — one deployable node
+Labels follow the build order (see *Order* below).
+
 - **Deploy-1. Execution index** — dual-tag `ExecutionCreated` **and** the terminal events
   (`ExecutionCompleted` / `ExecutionFailed` / `ExecutionCancelled`) into `catalyst-tasks/<queue>`
   (default queue for now), so a fold of the queue yields the *open* set rather than every execution
@@ -239,18 +241,24 @@ Dist inherits its queue instead of inventing a second one.
   operator or a pending in-doubt verdict is holding. Unregistered task types are reported, not fatal.
   Exit demo `Demo recover`: crash with several executions in flight plus one paused, restart, the
   in-flight ones finish with zero duplicate model calls and the paused one stays paused.
-- **Deploy-3. Signals / `WAITING`** (from v1, pulled forward) — `await`/signal on `Context`, activating
-  the reserved slot. Human-in-the-loop is what single-node users want most, and it does not need
-  leases: re-enqueue on signal is a dual-tagged signal event into the Deploy-1 queue, and Deploy-2
-  already skips `WAITING`. The lease interaction (a waiting execution releases its lease) is
-  specified with Dist-3.
-- **Deploy-4. Blob store ergonomics** — `BlobStore extends AutoCloseable` (default no-op) and
-  `Catalyst.builder().blobStore(...)`, so a remote store (S3/GCS) is a builder line and closes with
-  the log.
-- **Deploy-5. Graceful shutdown** — stop accepting submissions, let in-flight attempts reach a boundary
-  or leave them for Deploy-2 on the next start; release the Gumbo directory lock promptly so a
-  rescheduled pod can reopen the volume.
-- **Deploy-6. Deployment guide + sharding** — `docs/deployment.md`: single active node on a
+- **Deploy-3. Blob store ergonomics** — `BlobStore extends AutoCloseable` (default no-op) and a
+  `.blobStore(...)` builder option, so a remote store (S3/GCS) is a builder line and closes with the
+  log. The store is bound into the `EventCodec` when the log is constructed, so the option only
+  applies when the builder constructs the log itself (the `embedded(path)` path); combined with
+  `.log(...)` — a log the caller already built — it is **rejected** at `build()`, never silently
+  ignored.
+- **Deploy-4. Graceful shutdown** — needs a new engine path, not just a better `close()`. Today
+  `close()` calls `executor.close()`, which blocks until every in-flight attempt finishes (a task
+  waiting on a slow provider holds the pod, and the Gumbo directory lock, indefinitely), and
+  interrupting a worker without the cancel token folds to `ExecutionFailed` — terminal, so Deploy-2
+  would never resume it. Add an **abandon** unwind: shutdown trips an abandon token, the worker raises
+  at its next live boundary (`ReplayingContext.requireAppendable`, next to the cancellation check),
+  and `runAttempt` handles it in its own branch beside `CancellationSignal` — remove from `inFlight`,
+  complete the future exceptionally, **append nothing** — so the execution stays `RUNNING` in the log
+  and Deploy-2 resumes it on the next start. `close()` stops accepting submissions, trips abandon,
+  waits up to a drain timeout, then closes the log and releases the directory lock. Exit demo: shut
+  down mid-run, restart, the execution finishes with zero duplicate model calls.
+- **Deploy-5. Deployment guide + sharding** — `docs/deployment.md`: single active node on a
   `ReadWriteOnce` block volume (not NFS — the directory lock is the single-writer guarantee),
   `InDoubtPolicy` and `RetryPolicy` choices for node loss, volume snapshots for DR. For scale, shard
   across independent nodes **by idempotency key**: the id is minted inside `execute()`, so a client
@@ -258,8 +266,18 @@ Dist inherits its queue instead of inventing a second one.
   other routing lets a same-key re-submission land on a second shard and duplicate model calls.
   Sharded deployments therefore require a key on submit, and the owning node stamps its shard into
   the `ExecutionId` so later id-addressed calls (`inspect`/`resume`/`cancel`) route without a lookup.
+- **Deploy-6. Signals / `WAITING`** (from v1, pulled forward) — `await`/signal on `Context`, activating
+  the reserved slot. Human-in-the-loop is what single-node users want most, and it does not need
+  leases: re-enqueue on signal is a dual-tagged signal event into the Deploy-1 queue. The signal
+  event **folds `WAITING` → `RESUMING`** — it is a state change, not just a wake-up — so a crash
+  between the signal landing and a worker picking it up leaves an execution Deploy-2 resumes rather
+  than a `WAITING` one with an unconsumed signal that nothing would ever re-enqueue. `Demo recover`
+  gains that case: a waiting execution is signalled, the process crashes, and it finishes after
+  restart. The lease interaction (a waiting execution releases its lease) is specified with Dist-3.
 
 ### Dist — distributed execution
+The original phasing rationale is in `docs/distribution.md`; **this list is the sequencing of record.**
+
 - **Dist-0. Multi-writer log (mostly Gumbo-side, blocking)** — done when **all** of: the FoundationDB
   adapter wired through a `GumboEventLog` factory; a distributed sequencer; Gumbo **D2**
   (non-clobbering index) closed or shown not to apply to the FDB `kvSubspace` index, with the
@@ -268,17 +286,21 @@ Dist inherits its queue instead of inventing a second one.
   is only trusted once Gumbo reports it from a measured configuration — asserting it early is the D4
   mistake again.
 - **Dist-1. Fenced runtime writes** — the runtime appends through `append(id, event, expectedSeq)`
-  when the log supports it. `StaleWriterException` joins the engine's non-retryable gate
-  (`isRetryable`, alongside `NonDeterministicReplayException` / `InDoubtException`): a fenced-out
-  writer aborts the attempt *before* the retry policy is consulted and records nothing — it no longer
-  owns the stream, so a `RetryRequested` or `ExecutionFailed` would be fenced too. Meaningful
-  single-node, and independent of Dist-0.
+  when the log supports it. **Precondition: Gumbo A6 resolved as primary-tag fencing.** Deploy-1 and
+  Deploy-6 make Catalyst's lifecycle appends multi-tag (execution tag + queue tag), so the fenced
+  appends *are* multi-tag appends, and A6 still leaves open what `expectedVersion` means across N
+  tags. Catalyst needs it to condition on the execution tag only (the queue tag is not fenced), stated
+  and tested in Gumbo before this lands. A `StaleWriterException` is handled in **its own branch in
+  `runAttempt`, before the retry decision** — like the `CancellationSignal` branch: complete the
+  future exceptionally with it, remove from `inFlight`, append nothing. It must **not** route through
+  `isRetryable` → `recordFailed`, which appends `ExecutionFailed` — a write the fence would reject,
+  on a stream this writer no longer owns. Meaningful single-node.
 - **Dist-2. Distribution guard** — distributed mode refuses to start unless the log reports **both**
   `supportsConditionalAppend()` and `supportsMultiWriter()`.
 - **Dist-3. Leases** — lease row per execution via the tag KV's CAS (gumbo 0.4.0+): claim, heartbeat,
   expiry. Resolve the open question first: whether `expectedSeq` makes a separate fencing token
   redundant. Lease duration and heartbeat interval get defaults plus a knob. A `WAITING` execution
-  releases its lease; its signal re-enqueues it (Deploy-3).
+  releases its lease; its signal re-enqueues it (Deploy-6).
 - **Dist-4. Claim loop + cross-node control** — each node subscribes to the Deploy-1 queue, claims via
   Dist-3, runs `resume(id)`, and reclaims expired leases. **Control ships in the same item**: today
   `cancel(id)`/`pause(id)` append `ExecutionCancelled`/`ExecutionPaused` directly when the execution
@@ -293,9 +315,11 @@ Dist inherits its queue instead of inventing a second one.
   subscription-plus-claim with assignment. An optimisation only; correctness stays in Dist-1/Dist-3.
 
 ### Order
-**Deploy-1 → Deploy-2 → Deploy-3 → Dist-1 → Deploy-4 → Deploy-5/Deploy-6 → (Dist-0 lands, mostly in
-Gumbo) → Dist-2 → Dist-3 → Dist-4**, then the remaining v1 platform items below. Eval harness and the
-timeline polish (latency bars, `TrajectoryDiff` view) are independent and can slot in anywhere.
+**Deploy-1 → Deploy-6** in label order — the track is *deployable* after Deploy-5, and signals
+(Deploy-6) follow rather than gate it. Then **Dist-1** (once Gumbo A6 is settled) → **Dist-0** (lands
+mostly in Gumbo) → **Dist-2 → Dist-3 → Dist-4**, then the remaining v1 platform items below. Eval
+harness and the timeline polish (latency bars, `TrajectoryDiff` view) are independent and can slot in
+anywhere.
 
 ---
 
@@ -309,12 +333,13 @@ The substrate becomes a platform. This is where the other CajunSystems component
 - **MCP** integration and richer tool ecosystems.
 
 ### Signals & human-in-the-loop — Boudin integration (spec §5 lifecycle, §12)
-*Pulled forward as Deploy-3 above; Boudin workflow invocation stays here.*
+*Pulled forward as Deploy-6 above; Boudin workflow invocation stays here.*
 - Activate the reserved **`WAITING`** state: a task pauses, awaits an external signal, schedules
   future work, or invokes a long-running Boudin workflow. Human-in-the-loop lands here.
 - `await`/signal APIs on `Context` — no schema change needed (the slot is reserved).
 
 ### Distributed execution (spec §12)
+*Sequenced as `Dist-0`…`Dist-5` above; the bullets below are design and status, not order.*
 - Execution across many nodes over a shared **Gumbo cluster** — same `EventLog` SPI, history and
   replay preserved across nodes. Design recorded in [`docs/distribution.md`](docs/distribution.md):
   **the log is the arbiter, not a coordination service.** Single-writer-per-execution is enforced by
