@@ -369,6 +369,12 @@ Being clear about the limits, since the comparison to BEAM invites them:
 
 ## Phasing
 
+> **Sequencing of record now lives in [`ROADMAP.md`](../ROADMAP.md)** (*Next — deployable, then
+> distributed*, items `Dist-0`…`Dist-5`). The phases below are the original rationale for the order
+> and are kept for that reason; where the two differ — fenced writes (`Dist-1`) ahead of the
+> multi-writer log, a distribution guard, cross-node control shipping with the claim loop — the
+> roadmap wins.
+
 0. **Gumbo multi-writer safety** — cross-process `localId` assignment and a non-clobbering index.
    Measured above; this is a hard prerequisite and it is Gumbo-side work, not Catalyst work. Until it
    lands, two Catalyst nodes on one log corrupt each other's executions, and no amount of care above
