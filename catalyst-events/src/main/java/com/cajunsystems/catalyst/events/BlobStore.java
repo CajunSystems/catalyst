@@ -8,8 +8,13 @@ package com.cajunsystems.catalyst.events;
  *
  * <p>The reference is an opaque, stable string (the built-in stores use {@code "sha256:<hex>"}). A blob
  * is immutable once written; a reference is valid for the lifetime of the log that produced it.
+ *
+ * <p>A store is {@link AutoCloseable} so a remote one (S3, GCS) can release its client. The log a
+ * store is bound into owns it and closes it when the log closes; the built-in stores hold nothing
+ * that needs releasing, so the default is a no-op. Do not share one store instance between logs
+ * unless its {@code close} tolerates being called more than once.
  */
-public interface BlobStore {
+public interface BlobStore extends AutoCloseable {
 
     /** Stores {@code content} and returns its content-addressed reference. Idempotent. */
     String put(byte[] content);
@@ -23,6 +28,12 @@ public interface BlobStore {
 
     /** Whether a blob exists for {@code ref}. */
     boolean has(String ref);
+
+    /** Releases any resources the store holds. Default: nothing to release. */
+    @Override
+    default void close() {
+        // no-op: the built-in stores hold no resources
+    }
 
     /** An in-memory, content-addressed store — for tests and the in-memory runtime. */
     static BlobStore inMemory() {

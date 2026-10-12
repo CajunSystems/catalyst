@@ -61,6 +61,8 @@ public final class GumboEventLog implements EventLog {
     static final LogTag QUEUE_TAG = LogTag.of("catalyst-tasks", ExecutionIndex.DEFAULT_QUEUE);
     /** Key in the queue tag's KV holding the folded open set and the queue version it covers. */
     static final String OPEN_SET_KEY = "open-set";
+    /** Layout version of the {@link #OPEN_SET_KEY} checkpoint. */
+    static final byte OPEN_SET_FORMAT = 1;
 
     private final SharedLogService service;
     private final EventLogSerializer serializer;
@@ -70,9 +72,18 @@ public final class GumboEventLog implements EventLog {
     private final LogView indexView;
     private final LogView snapshotView;
     private final LogView queueView;
+    /** The codec's blob store, owned by this log and closed with it; null if payloads stay inline. */
+    private final BlobStore blobStore;
+    /**
+     * Whether an execution is in the index, for executions this process has opened or branched and
+     * not yet closed — so a terminal append knows whether to dual-tag without reading the stream.
+     * Entries leave at the terminal event, so this holds open work, not history.
+     */
+    private final Map<ExecutionId, Boolean> indexed = new ConcurrentHashMap<>();
 
     private GumboEventLog(SharedLogService service, EventCodec codec) {
         this.service = service;
+        this.blobStore = codec.blobStore().orElse(null);
         this.serializer = new EventLogSerializer(codec);
         this.indexView = service.getView(INDEX_TAG);
         this.snapshotView = service.getView(SNAPSHOT_TAG);
@@ -185,11 +196,52 @@ public final class GumboEventLog implements EventLog {
 
     @Override
     public long append(ExecutionId executionId, CatalystEvent event) {
-        long seq = ExecutionIndex.isIndexed(event)
-                ? appendFenced(executionId, event, PersistenceAdapter.ANY_VERSION)
+        long seq = writesIndex(executionId, event)
+                ? appendFenced(executionId, event, true, PersistenceAdapter.ANY_VERSION)
                 : viewFor(executionId).append(event).join().streamVersion();
-        lastSeq.merge(executionId, seq, Math::max);
+        afterAppend(executionId, event, seq);
         return seq;
+    }
+
+    /**
+     * Whether {@code event} must also go to the queue tag. An opening event always does; a closing
+     * event only if its execution was opened — a branch child begins with {@code ExecutionBranched},
+     * was never listed, and its terminal event would otherwise be a queue entry (and checkpoint
+     * churn) that removes nothing.
+     */
+    private boolean writesIndex(ExecutionId executionId, CatalystEvent event) {
+        return switch (ExecutionIndex.changeFor(event)) {
+            case OPENS -> true;
+            case CLOSES -> wasOpened(executionId);
+            case NONE -> false;
+        };
+    }
+
+    /**
+     * Known in-process for an execution this log created or branched; otherwise (a resume after a
+     * restart) the stream's first event says. The cold read is the whole stream — Gumbo has no
+     * cheaper first-entry read — but it happens once per execution, at its terminal event, right
+     * after a resume that has just read the same stream.
+     */
+    private boolean wasOpened(ExecutionId executionId) {
+        Boolean known = indexed.get(executionId);
+        if (known != null) return known;
+        List<LogEntry> stream = viewFor(executionId).rawView().readAll().join();
+        return !stream.isEmpty()
+                && serializer.deserialize(stream.get(0).dataUnsafe()) instanceof CatalystEvent.ExecutionCreated;
+    }
+
+    private void afterAppend(ExecutionId executionId, CatalystEvent event, long seq) {
+        lastSeq.merge(executionId, seq, Math::max);
+        switch (ExecutionIndex.changeFor(event)) {
+            case OPENS -> indexed.put(executionId, true);
+            case CLOSES -> indexed.remove(executionId);
+            case NONE -> {
+                // Only a stream that *starts* with the marker is a branch child; a divergence in
+                // BRANCH replay mode records the same event mid-stream of an indexed execution.
+                if (seq == 0 && event instanceof CatalystEvent.ExecutionBranched) indexed.put(executionId, false);
+            }
+        }
     }
 
     /**
@@ -203,10 +255,10 @@ public final class GumboEventLog implements EventLog {
      * than the execution's seq. The queue tag itself is never fenced: it is a fan-out index that
      * every execution writes to, and conditioning on it would make unrelated executions conflict.
      */
-    private long appendFenced(ExecutionId executionId, CatalystEvent event, long expectedSeq) {
+    private long appendFenced(ExecutionId executionId, CatalystEvent event, boolean toQueue, long expectedSeq) {
         LogTag execTag = tagFor(executionId);
         byte[] data = serializer.serialize(event);
-        AppendRequest request = ExecutionIndex.isIndexed(event)
+        AppendRequest request = toQueue
                 ? AppendRequest.to(new LinkedHashSet<>(List.of(execTag, QUEUE_TAG)), data)
                 : AppendRequest.to(execTag, data);
         return service.append(request, execTag, expectedSeq).join().streamVersion();
@@ -229,13 +281,13 @@ public final class GumboEventLog implements EventLog {
     public long append(ExecutionId executionId, CatalystEvent event, long expectedSeq) {
         long seq;
         try {
-            seq = appendFenced(executionId, event, expectedSeq);
+            seq = appendFenced(executionId, event, writesIndex(executionId, event), expectedSeq);
         } catch (RuntimeException e) {
             VersionConflictException conflict = conflictIn(e);
             if (conflict == null) throw e;
             throw new StaleWriterException(executionId, expectedSeq, conflict.actualVersion());
         }
-        lastSeq.merge(executionId, seq, Math::max);
+        afterAppend(executionId, event, seq);
         return seq;
     }
 
@@ -361,6 +413,8 @@ public final class GumboEventLog implements EventLog {
         byte[] framed = queueView.getValue(OPEN_SET_KEY).join();
         if (framed == null) return -1;
         try (DataInputStream in = new DataInputStream(new ByteArrayInputStream(framed))) {
+            // A format this reader does not know is treated like a missing checkpoint: refold.
+            if (in.readByte() != OPEN_SET_FORMAT) return -1;
             long through = in.readLong();
             int n = in.readInt();
             for (int i = 0; i < n; i++) into.add(ExecutionId.of(in.readUTF()));
@@ -372,10 +426,15 @@ public final class GumboEventLog implements EventLog {
         }
     }
 
-    /** Frames as {@code [8-byte through][4-byte count][count × modified-UTF-8 id]}, creation order. */
+    /**
+     * Frames as {@code [1-byte format][8-byte through][4-byte count][count × modified-UTF-8 id]},
+     * creation order. The format byte lets the layout change later without a migration: a reader
+     * that does not recognise it refolds, which is always correct.
+     */
     private void writeOpenSetCheckpoint(long through, LinkedHashSet<ExecutionId> open) {
         ByteArrayOutputStream bytes = new ByteArrayOutputStream();
         try (DataOutputStream out = new DataOutputStream(bytes)) {
+            out.writeByte(OPEN_SET_FORMAT);
             out.writeLong(through);
             out.writeInt(open.size());
             for (ExecutionId id : open) out.writeUTF(id.value());
@@ -431,8 +490,13 @@ public final class GumboEventLog implements EventLog {
         snapshotView.setValue(executionId.value(), framed).join();
     }
 
+    /** Closes the log, then the blob store bound into its codec — even if the log's close throws. */
     @Override
     public void close() {
-        service.close();
+        try {
+            service.close();
+        } finally {
+            if (blobStore != null) blobStore.close();
+        }
     }
 }

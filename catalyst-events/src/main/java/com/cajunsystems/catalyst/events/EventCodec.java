@@ -156,6 +156,11 @@ public final class EventCodec {
         return mapper;
     }
 
+    /** The store large payloads are offloaded to, if any — so the log that owns it can close it. */
+    public java.util.Optional<BlobStore> blobStore() {
+        return java.util.Optional.ofNullable(blobStore);
+    }
+
     /** Assembles an {@link EventCodec} with optional blob offloading and schema-evolution upcasters. */
     public static final class Builder {
         private ObjectMapper mapper = EventJson.shared();

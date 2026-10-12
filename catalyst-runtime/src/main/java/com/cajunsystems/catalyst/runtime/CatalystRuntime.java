@@ -28,7 +28,9 @@ import com.cajunsystems.catalyst.engine.ReplayingContext;
 import com.cajunsystems.catalyst.engine.RetryPolicy;
 import com.cajunsystems.catalyst.engine.TimelineStep;
 import com.cajunsystems.catalyst.engine.Trajectory;
+import com.cajunsystems.catalyst.events.BlobStore;
 import com.cajunsystems.catalyst.events.CatalystEvent;
+import com.cajunsystems.catalyst.events.EventCodec;
 import com.cajunsystems.catalyst.events.EventJson;
 import com.cajunsystems.catalyst.events.SequencedEvent;
 import com.cajunsystems.catalyst.log.EventLog;
@@ -130,8 +132,8 @@ public final class CatalystRuntime implements AutoCloseable {
 
     private enum Mode { FRESH, RESUME, REPLAY_TERMINAL }
 
-    private CatalystRuntime(Builder b) {
-        this.log = b.log;
+    private CatalystRuntime(Builder b, EventLog log) {
+        this.log = log;
         this.defaultModel = b.model;
         this.clock = b.clock;
         this.replayMode = b.replayMode;
@@ -844,9 +846,45 @@ public final class CatalystRuntime implements AutoCloseable {
         private long snapshotInterval = 100;
         private TaskRegistry registry = new TaskRegistry();
         private boolean recoverOnStart;
+        private EventLogFactory logFactory;
+        private BlobStore blobStore;
+        private int blobThresholdBytes = EventCodec.DEFAULT_BLOB_THRESHOLD_BYTES;
 
+        /** Uses a log the caller already built. Exclusive with {@link #logFactory}. */
         public Builder log(EventLog log) {
             this.log = log;
+            return this;
+        }
+
+        /**
+         * Has {@code build()} construct the log, applying options that must be bound in at
+         * construction (see {@link #blobStore(BlobStore)}). Exclusive with {@link #log(EventLog)}.
+         */
+        public Builder logFactory(EventLogFactory logFactory) {
+            this.logFactory = logFactory;
+            return this;
+        }
+
+        /**
+         * Offloads payloads of {@link EventCodec#DEFAULT_BLOB_THRESHOLD_BYTES} or more to
+         * {@code blobStore} — e.g. a remote S3/GCS store — instead of the backend's default. The log
+         * owns the store and closes it when the runtime closes.
+         *
+         * <p>The store is bound into the log's codec when the log is constructed, so this applies only
+         * when the builder constructs the log ({@link #logFactory}, as {@code Catalyst.builder(Path)}
+         * does). Combined with {@link #log(EventLog)} it is <strong>rejected</strong> at
+         * {@code build()} rather than silently ignored — pass the store to the log's own factory
+         * instead (e.g. {@code GumboEventLog.at(path, store, threshold)}).
+         */
+        public Builder blobStore(BlobStore blobStore) {
+            return blobStore(blobStore, EventCodec.DEFAULT_BLOB_THRESHOLD_BYTES);
+        }
+
+        /** As {@link #blobStore(BlobStore)}, offloading payloads at or over {@code thresholdBytes}. */
+        public Builder blobStore(BlobStore blobStore, int thresholdBytes) {
+            if (thresholdBytes <= 0) throw new IllegalArgumentException("thresholdBytes must be positive");
+            this.blobStore = java.util.Objects.requireNonNull(blobStore, "blobStore");
+            this.blobThresholdBytes = thresholdBytes;
             return this;
         }
 
@@ -949,14 +987,26 @@ public final class CatalystRuntime implements AutoCloseable {
         }
 
         public CatalystRuntime build() {
-            if (log == null) {
+            if (log != null && logFactory != null) {
+                throw new IllegalStateException("Set either log(...) or logFactory(...), not both");
+            }
+            if (log != null && blobStore != null) {
+                throw new IllegalStateException("blobStore(...) cannot apply to a log passed to log(...): the store"
+                        + " is bound into the codec when the log is constructed. Pass it to the log's own factory"
+                        + " (e.g. GumboEventLog.at(path, store, threshold)), or let the builder construct the log"
+                        + " (Catalyst.builder(path)).");
+            }
+            if (log == null && logFactory == null) {
                 throw new IllegalStateException("An EventLog is required (e.g. EventLogs.inMemory() or GumboEventLog.at(path))");
             }
-            if (recoverOnStart && !log.supportsExecutionIndex()) {
-                throw new IllegalStateException("recoverOnStart needs a log with an execution index; "
-                        + log.getClass().getSimpleName() + " cannot list its open executions");
+            EventLog resolved = log != null ? log : logFactory.open(blobStore, blobThresholdBytes);
+            if (recoverOnStart && !resolved.supportsExecutionIndex()) {
+                IllegalStateException refused = new IllegalStateException("recoverOnStart needs a log with an"
+                        + " execution index; " + resolved.getClass().getSimpleName() + " cannot list its open executions");
+                if (log == null) resolved.close(); // the builder opened it, so the builder releases it
+                throw refused;
             }
-            CatalystRuntime runtime = new CatalystRuntime(this);
+            CatalystRuntime runtime = new CatalystRuntime(this, resolved);
             if (recoverOnStart) {
                 try {
                     runtime.startupRecovery = runtime.recoverAll();
