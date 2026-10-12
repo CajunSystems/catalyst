@@ -12,9 +12,18 @@ on:
   pull_request:
     types: [opened, synchronize, ready_for_review, reopened]
 
+# A newer push supersedes an in-flight review: without this, two overlapping runs review at once, the
+# older one reading a diff that no longer matches its checkout, and both post a verdict.
+concurrency:
+  group: claude-review-${{ github.event.pull_request.number }}
+  cancel-in-progress: true
+
 jobs:
   claude-review:
-    if: github.event.pull_request.draft == false
+    # Fork PRs get no secrets or OIDC token, so the action would fail; skip them explicitly instead.
+    if: >-
+      github.event.pull_request.draft == false &&
+      github.event.pull_request.head.repo.full_name == github.repository
     runs-on: ubuntu-latest
     permissions:
       contents: read
@@ -36,6 +45,7 @@ jobs:
           prompt: |
             REPO: ${{ github.repository }}
             PR NUMBER: ${{ github.event.pull_request.number }}
+            HEAD COMMIT: ${{ github.event.pull_request.head.sha }}
 
             Review this pull request for correctness. Do not skip the review for any reason.
 
@@ -44,7 +54,9 @@ jobs:
                schema, and the reasoning recorded for each milestone.
             2. Get the change with `gh pr view <PR>` and `gh pr diff <PR>`. Read the surrounding code in the
                checkout for anything the diff alone does not settle — callers, the code paths a change
-               interacts with, lock and ordering assumptions.
+               interacts with, lock and ordering assumptions. You are reviewing HEAD COMMIT: if
+               `gh pr view <PR> --json headRefOid` reports a different commit, a newer push has landed —
+               post a one-line comment saying this review was superseded, and stop.
             3. Look for real defects: incorrect logic, races, a path that leaves the event log in a state
                resume/replay/recovery mishandles, a broken CLAUDE.md invariant, missing handling for a case
                the change itself introduces, a test that does not test what it claims. Skip style nits and
