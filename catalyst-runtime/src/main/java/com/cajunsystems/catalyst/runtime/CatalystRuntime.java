@@ -661,17 +661,23 @@ public final class CatalystRuntime implements AutoCloseable {
                         leftAlone.put(id, Status.RUNNING);
                         return;
                     }
-                    ExecutionState state = foldState(id);
-                    if (!isCrashInterrupted(state.status())) {
-                        leftAlone.put(id, state.status());
-                        return;
-                    }
-                    if (registry.lookup(state.taskType()).isEmpty()) {
-                        notRecovered.put(id, "no task registered for type '" + state.taskType() + "'");
-                        return;
-                    }
+                    // Distributed: claim, then decide. The whole decision is made holding the lease, so
+                    // the fold it rests on cannot be overtaken by another node pausing, parking or
+                    // finishing the execution and releasing in between. Recovery must never undo a
+                    // deliberate PAUSED or WAITING (Deploy-2). A live lease held elsewhere means it is
+                    // running there.
                     try {
-                        resumed.put(id, resume(id)); // the lock is reentrant
+                        underLease(id, () -> {
+                            ExecutionState state = foldState(id);
+                            if (!isCrashInterrupted(state.status())) {
+                                leftAlone.put(id, state.status());
+                            } else if (registry.lookup(state.taskType()).isEmpty()) {
+                                notRecovered.put(id, "no task registered for type '" + state.taskType() + "'");
+                            } else {
+                                resumed.put(id, resume(id)); // reentrant on the id lock and the lease
+                            }
+                            return null;
+                        });
                     } catch (LeaseHeldException held) {
                         leftAlone.put(id, Status.RUNNING); // running on held.lease().holder()
                     }

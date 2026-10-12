@@ -355,7 +355,10 @@ The original phasing rationale is in `docs/distribution.md`; **this list is the 
   - **Release:** when the attempt ends, whatever the outcome, `WAITING` included. `close()` releases
     the rest after the drain.
   - **Recovery:** `recoverAll()` / `recoverOnStart` are allowed again on a distributed runtime: a live
-    lease held elsewhere → `leftAlone` RUNNING, while a lapsed one is taken over. A lease whose
+    lease held elsewhere → `leftAlone` RUNNING, while a lapsed one is taken over. The scan decides
+    each execution while holding its lease, and a resume re-folds after claiming (claim, then
+    decide), so a node that finished, paused or parked the execution just before the claim can't be
+    overridden. A lease whose
     holder is this node's own id counts as this node's, so a node restarted under its id needn't wait
     out its predecessor (node ids must be unique among live nodes).
   - **Clocks:** expiry is wall-clock from the writer's runtime `Clock`. Skew moves takeovers early or

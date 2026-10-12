@@ -396,7 +396,10 @@ checkout's pom to `com.github.CajunSystems` before installing.
     - `RunningAttempt.leaseLost` is read by the token as an abandon, so the existing abandon path
       (append nothing) handles a lost lease. `abandon()` completes with `LeaseLostException` instead
       of the shutdown signal.
-    - `recoverAll` maps a `LeaseHeldException` to `leftAlone` RUNNING.
+    - `recoverAll` makes each whole decision **under the lease** (`underLease` around fold → decide
+      → resume), so another node pausing or parking an execution and releasing just before the
+      claim can't get it resumed: recovery never undoes a deliberate `PAUSED`/`WAITING`. A
+      `LeaseHeldException` maps to `leftAlone` RUNNING.
     - `close()` releases the leftovers after the drain.
   - **Mutation-checked:** removing the claim, the release, the lost callback, recovery's skip,
     close's release or the liveness check each fails a `LeaseTest` case.

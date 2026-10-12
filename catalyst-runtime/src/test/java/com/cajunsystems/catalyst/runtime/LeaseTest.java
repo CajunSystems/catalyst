@@ -254,6 +254,29 @@ class LeaseTest {
         }
     }
 
+    /**
+     * The recovery scan's version of the window: another node pauses the execution and releases
+     * before the scan's claim lands. Recovery must leave a deliberate pause alone (Deploy-2), so it
+     * has to decide from a fold read after claiming.
+     */
+    @Test
+    void anExecutionPausedElsewhereDuringTheScansClaimIsLeftAlone() {
+        ExecutionId id = crashInterrupted();
+        MockModel modelB = MockModel.alwaysReturn("B");
+        try (CatalystRuntime nodeB = node("node-b", modelB)) {
+            log.beforeReadLease = leased -> {
+                log.beforeReadLease = x -> { };
+                log.append(leased, new CatalystEvent.ExecutionPaused(T, "operator"), 2);
+            };
+            RecoveryReport report = nodeB.recoverAll();
+            assertThat(report.resumed()).isEmpty();
+            assertThat(report.leftAlone()).containsEntry(id, Status.PAUSED);
+            assertThat(log.read(id)).hasSize(3);
+            assertThat(modelB.callCount()).isZero();
+            assertThat(log.readLease(id)).isEmpty();
+        }
+    }
+
     /** The same window, landing on a wait: the execution must stay WAITING, not be folded back to RUNNING. */
     @Test
     void anExecutionThatStartedWaitingDuringTheClaimIsNotResumed() {
