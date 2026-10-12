@@ -39,6 +39,10 @@
             <groupId>com.cajunsystems</groupId>
             <artifactId>catalyst-timeline</artifactId>
         </dependency>
+        <dependency>
+            <groupId>com.cajunsystems</groupId>
+            <artifactId>catalyst-eval</artifactId>
+        </dependency>
         <!--
           The auto-capture exit demo attaches the agent in-process. Optional for the same reason as the
           OTel SDK below: an app that never wants bytecode instrumentation should not inherit Byte Buddy

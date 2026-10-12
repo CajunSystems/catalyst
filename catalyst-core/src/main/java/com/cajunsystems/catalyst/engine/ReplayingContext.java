@@ -475,7 +475,34 @@ public final class ReplayingContext implements Context {
         if (danglingTool != null) {
             return handleInDoubt(tool, input);
         }
+        if (branchSpec != null && branchSpec.toolReplay() != BranchSpec.ToolReplay.LIVE && !isDeterministic(tool)) {
+            return answerFromRecording(tool, input);
+        }
         return runToolLive(tool, input);
+    }
+
+    /**
+     * A forked branch that must not re-run side effects: answer from the parent's recording when it
+     * made the identical call, recording the boundary as usual so the branch's trajectory shows the
+     * step. Otherwise run it live, or refuse under {@link BranchSpec.ToolReplay#RECORDED_ONLY}.
+     * Deterministic tools never get here: re-running them is safe and is what they are for.
+     */
+    @SuppressWarnings("unchecked")
+    private <I, O> O answerFromRecording(Tool<I, O> tool, I input) {
+        com.fasterxml.jackson.databind.JsonNode inputTree = eventMapper.valueToTree(input);
+        String inputHash = Hashing.canonicalJsonHash(inputTree);
+        com.fasterxml.jackson.databind.JsonNode recordedOutput =
+                branchSpec.recordedToolResults().get(BranchSpec.toolKey(tool.name(), inputHash));
+        if (recordedOutput == null) {
+            if (branchSpec.toolReplay() == BranchSpec.ToolReplay.RECORDED_ONLY) {
+                throw new UnrecordedToolCallException(tool.name(), inputHash);
+            }
+            return runToolLive(tool, input);
+        }
+        requireAppendable("tool " + tool.name());
+        append(new ToolRequested(now(), tool.name(), inputTree));
+        append(new ToolCompleted(now(), recordedOutput, null, 0));
+        return (O) payloads.fromTree(recordedOutput);
     }
 
     private <I, O> O runToolLive(Tool<I, O> tool, I input) {

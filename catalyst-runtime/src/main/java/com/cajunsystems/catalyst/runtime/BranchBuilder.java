@@ -2,6 +2,7 @@ package com.cajunsystems.catalyst.runtime;
 
 import com.cajunsystems.catalyst.ExecutionId;
 import com.cajunsystems.catalyst.Task;
+import com.cajunsystems.catalyst.engine.BranchSpec;
 import com.cajunsystems.catalyst.engine.Trajectory;
 import com.cajunsystems.catalyst.model.Model;
 
@@ -32,6 +33,7 @@ public final class BranchBuilder {
     private final Map<String, Object> toolOverrides = new LinkedHashMap<>();
     private final Map<String, Object> vars = new LinkedHashMap<>();
     private final List<String> changed = new ArrayList<>();
+    private BranchSpec.ToolReplay toolReplay = BranchSpec.ToolReplay.LIVE;
 
     BranchBuilder(CatalystRuntime runtime, ExecutionId parentId, long atSeq) {
         this.runtime = runtime;
@@ -59,9 +61,19 @@ public final class BranchBuilder {
         return this;
     }
 
+    /**
+     * How tool calls are answered once the branch has forked (default {@link BranchSpec.ToolReplay#LIVE}).
+     * The recorded modes answer from the parent's log, so a counterfactual run does not repeat
+     * the parent's side effects. That is what an evaluation needs.
+     */
+    public BranchBuilder toolReplay(BranchSpec.ToolReplay toolReplay) {
+        this.toolReplay = java.util.Objects.requireNonNull(toolReplay, "toolReplay");
+        return this;
+    }
+
     /** Runs {@code task} forward from the branch point and returns the fork's trajectory. */
     public <R> Trajectory run(Task<R> task) {
         return runtime.runBranch(parentId, atSeq, overrideModel, toolOverrides, vars,
-                String.join(",", changed), task);
+                String.join(",", changed), toolReplay, task);
     }
 }

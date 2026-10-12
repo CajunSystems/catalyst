@@ -49,6 +49,9 @@ checkout's pom to `com.github.CajunSystems` before installing.
 - `catalyst-timeline` — `TimelineReport`: renders a folded `ExecutionState` as a self-contained HTML
   page (header + roll-ups + step table). Read-only, post-hoc, pure function of the log; depends on
   `catalyst-core` only — no templating engine, no web server. All interpolated log content is escaped.
+- `catalyst-eval` — `Eval`: the eval harness. It batches branch (M2) over recorded executions
+  with candidate models/tasks, and scores with pure `Scorer`s into an `EvalReport`. It depends on
+  core + runtime only; no new events.
 - `catalyst-otel` — `CatalystTracer`: folds an execution's event log into an OpenTelemetry trace
   (root span + per-boundary child spans + lifecycle annotations). Read-only, post-hoc, no runtime hook.
   Depends on the OpenTelemetry **API** only; the app supplies the SDK + exporter. Tested offline with
@@ -431,6 +434,23 @@ checkout's pom to `com.github.CajunSystems` before installing.
   - **Mutation-checked:** removing the loop, forwarding, absorbing, carrying, the key CAS, the pre-check,
     orphan handling, release keeping or dropping the request, or the create-for-claimed-key each fails a
     test.
+
+- **Eval harness** — `EvalTest` (catalyst-eval, 10) + `BranchTest` tool-replay cases +
+  `EvalAcceptanceTest` + `Demo eval` (CI gate).
+  - **Branch point** = just before the first `PromptBuilt`/`CompletionRequested`. **Not** before
+    `CompletionRequested` alone: the model boundary starts at `PromptBuilt`, and branching between
+    them duplicated the PROMPT step and broke every diff.
+  - **Recorded tool replay:** `BranchSpec.ToolReplay` + `recordedToolResults` (the parent's
+    successful `ToolRequested`→`ToolCompleted` pairs keyed `name#canonicalJsonHash(input)`).
+    `ReplayingContext.answerFromRecording` handles a forked, non-deterministic tool call: it records
+    the boundary with the recorded output, runs live (`RECORDED_OR_LIVE`), or throws
+    `UnrecordedToolCallException` (`RECORDED_ONLY`). The default `LIVE` keeps M2 unchanged.
+  - **Gotchas:**
+    - A tool *before* the first model call sits in the substituted prefix and never reaches this
+      path. Test with a tool *after* the model call (the agent shape) or the mutation passes
+      unnoticed.
+    - Vars aren't persisted, so case inputs must come through boundaries.
+    - A `Candidate.task` without a model runs on the runtime's default (production) model.
 
 - **In-doubt model completions** — `ReplayingContextInDoubtCompletionTest`: a `CompletionRequested`
   with no `CompletionReceived` is a provider call that may have been accepted and *billed*, so it

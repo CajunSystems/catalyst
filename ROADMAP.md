@@ -498,9 +498,20 @@ The substrate becomes a platform. This is where the other CajunSystems component
   failure rather than only under graceful resume; distribution merely makes the window far more
   frequent.
 
-### Eval harness (spec §12)
+### Eval harness (spec §12) ✅
 - Recorded production executions replayed against **candidate models/prompts** as a regression suite
   — the log *is* the dataset. Branch + diff (M2) is the primitive; the harness batches and scores it.
+  *As shipped:* `catalyst-eval` (`Eval.on(runtime).cases(ids).task(t).candidate(...).scorer(...).run()`
+  → `EvalReport`). Each case is a branch just before the recorded run's first model call
+  (`PromptBuilt`), so the prefix is substituted exactly. **Tools are never re-run:** a new engine mode,
+  `BranchSpec.ToolReplay` (`LIVE` default / `RECORDED_OR_LIVE` / `RECORDED_ONLY`), answers post-fork
+  tool calls from the parent's recording by tool name and input hash. The harness uses
+  `RECORDED_ONLY`, and an unanswerable call is reported as `UNRECORDED_TOOL`, not run. Scorers are
+  pure functions of a `Sample` (`sameResult`, `sameSteps`, `costAtMost`, `tokensAtMost`,
+  `Scorer.check`). Exit demo `Demo eval` + `EvalAcceptanceTest`: three recorded runs, three
+  candidates, zero tool executions, zero calls to the recorded model. Not yet: parallel cases, an
+  HTML report, LLM-as-judge scorers (a scorer can call a model itself today, but that call isn't
+  recorded), and case selection from the log by task type.
 
 ### Memory & retrieval
 - **Memory types** (episodic/semantic) behind a common interface; **embeddings / vector stores /

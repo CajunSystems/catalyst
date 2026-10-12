@@ -145,6 +145,20 @@ jobs:
       # substituted — bounded by the policy, and the retried log still replays exactly. The pair
       # "tool invocations: 3" + "model calls across retries: 1" is the whole semantics: substitute-
       # everything would show 1 invocation + FAILED, re-run-everything would show 3 model calls.
+      # The eval harness exit criterion: recorded runs replayed against candidate models and a prompt
+      # rewrite and scored, without re-running a single tool or calling the recorded model.
+      - name: Eval harness exit demo (candidates scored against recorded runs; no tool re-run)
+        run: |
+          set -uo pipefail
+          CP="catalyst-api/target/classes:$(cat catalyst-api/target/cp.txt)"
+          OUT="$(java -cp "$CP" com.cajunsystems.catalyst.api.Demo eval)" || { echo "$OUT"; exit 1; }
+          echo "$OUT"
+          echo "$OUT" | grep -q "candidate same-model: 3/3 passed all scorers" || { echo "FAIL: identical candidate did not pass"; exit 1; }
+          echo "$OUT" | grep -q "candidate concise-model: 0/3 passed all scorers" || { echo "FAIL: a differing candidate was not caught"; exit 1; }
+          echo "$OUT" | grep -q "\[eval\] tool executions during the evaluation: 0" || { echo "FAIL: the evaluation re-ran a tool"; exit 1; }
+          echo "$OUT" | grep -q "\[eval\] calls to the recorded production model during the evaluation: 0" || exit 1
+          echo "$OUT" | grep -q "Eval harness exit criterion holds" || exit 1
+
       - name: v0.2 Retry exit demo (bounded retry-as-attempt, prefix substituted, replay exact)
         run: |
           set -uo pipefail

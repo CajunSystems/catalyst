@@ -199,4 +199,63 @@ class BranchTest {
                     .isInstanceOf(CatalystEvent.ExecutionPaused.class);
         }
     }
+
+    /** A side-effecting tool that counts its real invocations. */
+    static final class SendTool implements Tool<String, String> {
+        final java.util.concurrent.atomic.AtomicInteger sent = new java.util.concurrent.atomic.AtomicInteger();
+        @Override public String name() { return "send"; }
+        @Override public Class<String> inputType() { return String.class; }
+        @Override public String apply(String to) { sent.incrementAndGet(); return "sent to " + to; }
+    }
+
+    /** Model call first, then a tool whose input depends on the model's answer: a branch forks before the tool. */
+    private static Task<String> notify(SendTool send) {
+        return ctx -> {
+            String who = ctx.model().complete(STEP1).message();
+            return ctx.call(send, who);
+        };
+    }
+
+    @Test
+    void pastTheForkALiveBranchRunsToolsForRealByDefault() {
+        SendTool send = new SendTool();
+        try (CatalystRuntime runtime = CatalystRuntime.builder().log(EventLogs.inMemory())
+                .model(MockModel.alwaysReturn("ops")).build()) {
+            var parent = runtime.execute(notify(send), com.cajunsystems.catalyst.ExecutionOptions.none());
+            assertThat(parent.result()).isEqualTo("sent to ops");
+            runtime.branch(parent.id(), 1).withModel(MockModel.alwaysReturn("ops")).run(notify(send));
+            assertThat(send.sent).as("unchanged M2 behaviour: the fork is live").hasValue(2);
+        }
+    }
+
+    @Test
+    void aRecordedOnlyBranchAnswersRepeatedToolCallsFromTheParentAndRefusesNewOnes() {
+        SendTool send = new SendTool();
+        try (CatalystRuntime runtime = CatalystRuntime.builder().log(EventLogs.inMemory())
+                .model(MockModel.alwaysReturn("ops")).build()) {
+            var parent = runtime.execute(notify(send), com.cajunsystems.catalyst.ExecutionOptions.none());
+            parent.result();
+
+            // Same model answer → the identical tool call → the parent's recorded output, nothing sent.
+            var same = runtime.branch(parent.id(), 1).withModel(MockModel.alwaysReturn("ops"))
+                    .toolReplay(com.cajunsystems.catalyst.engine.BranchSpec.ToolReplay.RECORDED_ONLY).run(notify(send));
+            assertThat(same.status()).isEqualTo(com.cajunsystems.catalyst.Status.COMPLETED);
+            assertThat(send.sent).hasValue(1);
+            assertThat(runtime.inspect(same.id()).trajectory()).extracting(s -> s.kind())
+                    .as("the substituted call is still a recorded step of the branch")
+                    .contains(com.cajunsystems.catalyst.engine.TimelineStep.Kind.TOOL);
+
+            // A different answer → a call the parent never made → refused, nothing sent.
+            assertThatThrownBy(() -> runtime.branch(parent.id(), 1).withModel(MockModel.alwaysReturn("everyone"))
+                    .toolReplay(com.cajunsystems.catalyst.engine.BranchSpec.ToolReplay.RECORDED_ONLY).run(notify(send)))
+                    .isInstanceOf(com.cajunsystems.catalyst.engine.UnrecordedToolCallException.class)
+                    .hasMessageContaining("send");
+            assertThat(send.sent).hasValue(1);
+
+            // RECORDED_OR_LIVE runs the new call for real.
+            runtime.branch(parent.id(), 1).withModel(MockModel.alwaysReturn("everyone"))
+                    .toolReplay(com.cajunsystems.catalyst.engine.BranchSpec.ToolReplay.RECORDED_OR_LIVE).run(notify(send));
+            assertThat(send.sent).hasValue(2);
+        }
+    }
 }
