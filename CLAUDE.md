@@ -298,3 +298,9 @@ checkout's pom to `com.github.CajunSystems` before installing.
   every retried model failure becomes an `InDoubtException` under the default `FAIL`.
 
 CI (`.github/workflows/ci.yml`) runs all exit demos as gates — it is the source of truth per phase.
+
+**Docs for developers:** `README.md` is the getting-started page (quickstart, concepts, recipe table);
+`docs/guide.md` holds the depth; `docs/deployment.md` the ops. **`QuickstartTest` (catalyst-api) runs
+the README's Quickstart code verbatim** — change one, change the other. `scripts/demo.sh <name>` runs
+any exit demo with the same classpath CI builds. Keep both docs to what the code does: check
+signatures (e.g. the payload allowlist refuses plain classes) before documenting them.
