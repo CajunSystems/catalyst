@@ -79,6 +79,9 @@ class FoundationDBAcceptanceTest {
         }
     }
 
+    /** This test drives the scan itself (recoverAll); keep the claim loop from racing it. Demo distributed covers the loop. */
+    private static final Duration QUIET = Duration.ofMinutes(10);
+
     @TempDir Path blobs;
     private String root;
 
@@ -111,11 +114,11 @@ class FoundationDBAcceptanceTest {
         GumboEventLog logSkewed = nodeLog();
 
         // Every node declares distributed(), so each build() checks the log (Dist-2) and takes leases (Dist-3).
-        CatalystRuntime nodeA = Catalyst.builder().log(logA).model(modelA).nodeId("node-a").distributed().build();
-        CatalystRuntime nodeB = Catalyst.builder().log(logB).model(modelB).nodeId("node-b").distributed()
+        CatalystRuntime nodeA = Catalyst.builder().log(logA).model(modelA).nodeId("node-a").distributed().claimInterval(QUIET).build();
+        CatalystRuntime nodeB = Catalyst.builder().log(logB).model(modelB).nodeId("node-b").distributed().claimInterval(QUIET)
                 .task(GatedTask.class, GatedTask::new).build();
         CatalystRuntime nodeSkewed = Catalyst.builder().log(logSkewed).model(modelB).nodeId("node-b-skewed")
-                .clock(Clock.offset(Clock.systemUTC(), Duration.ofMinutes(1))).distributed()
+                .clock(Clock.offset(Clock.systemUTC(), Duration.ofMinutes(1))).distributed().claimInterval(QUIET)
                 .task(GatedTask.class, GatedTask::new).build();
         try {
             ExecutionHandle<String> stalled = nodeA.execute(new GatedTask(reachedGate, openGate),

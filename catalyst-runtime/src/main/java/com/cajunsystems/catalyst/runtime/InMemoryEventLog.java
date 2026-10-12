@@ -129,6 +129,11 @@ public final class InMemoryEventLog implements EventLog {
         keyIndex.put(idempotencyKey, executionId);
     }
 
+    @Override
+    public Optional<ExecutionId> claimKey(String idempotencyKey, ExecutionId executionId) {
+        return Optional.ofNullable(keyIndex.putIfAbsent(idempotencyKey, executionId));
+    }
+
     /** Leases live as long as this log; runtimes sharing one instance in a JVM see each other's. */
     @Override
     public boolean supportsLeases() {

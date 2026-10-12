@@ -203,6 +203,22 @@ public interface EventLog extends AutoCloseable {
      */
     void putKey(String idempotencyKey, ExecutionId executionId);
 
+    /**
+     * Registers {@code executionId} under {@code idempotencyKey} only if the key is unregistered.
+     * Returns empty if this call registered it, or the execution it was already registered to.
+     *
+     * <p>On a multi-writer log this must be atomic in storage: two nodes taking the same new key at
+     * once otherwise both create an execution, and both run it. The default is a lookup then a
+     * {@link #putKey}, which is enough for a single-writer log, where the runtime's own key lock
+     * already serializes the two steps.
+     */
+    default Optional<ExecutionId> claimKey(String idempotencyKey, ExecutionId executionId) {
+        Optional<ExecutionId> existing = findByKey(idempotencyKey);
+        if (existing.isPresent()) return existing;
+        putKey(idempotencyKey, executionId);
+        return Optional.empty();
+    }
+
     @Override
     void close();
 }

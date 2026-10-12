@@ -216,4 +216,35 @@ class FoundationDBEventLogTest {
         }
         return log.compareAndSetLease(id, null, new com.cajunsystems.catalyst.log.Lease(node, Long.MAX_VALUE));
     }
+
+    /** The keyed-submission claim across connections: two nodes race for each new key, 20 rounds, one wins. */
+    @Test
+    void exactlyOneOfTwoNodesClaimsAnIdempotencyKey() throws Exception {
+        try (GumboEventLog a = node(); GumboEventLog b = node()) {
+            for (int round = 0; round < 20; round++) {
+                String key = "order-" + round;
+                ExecutionId idA = ExecutionId.random();
+                ExecutionId idB = ExecutionId.random();
+                CountDownLatch start = new CountDownLatch(1);
+                CompletableFuture<java.util.Optional<ExecutionId>> fromA = CompletableFuture.supplyAsync(() -> claimKey(a, key, idA, start));
+                CompletableFuture<java.util.Optional<ExecutionId>> fromB = CompletableFuture.supplyAsync(() -> claimKey(b, key, idB, start));
+                start.countDown();
+                java.util.Optional<ExecutionId> lostA = fromA.get();
+                java.util.Optional<ExecutionId> lostB = fromB.get();
+                assertThat(lostA.isEmpty() ^ lostB.isEmpty()).as("round %d: exactly one winner", round).isTrue();
+                ExecutionId winner = lostA.isEmpty() ? idA : idB;
+                assertThat(lostA.isEmpty() ? lostB : lostA).as("the loser resolves to the winner").contains(winner);
+                assertThat(b.findByKey(key)).contains(winner);
+            }
+        }
+    }
+
+    private static java.util.Optional<ExecutionId> claimKey(GumboEventLog log, String key, ExecutionId id, CountDownLatch start) {
+        try {
+            start.await();
+        } catch (InterruptedException e) {
+            throw new IllegalStateException(e);
+        }
+        return log.claimKey(key, id);
+    }
 }

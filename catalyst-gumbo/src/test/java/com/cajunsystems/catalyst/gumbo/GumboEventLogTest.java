@@ -772,4 +772,20 @@ class GumboEventLogTest {
             assertThat(reopened.readLease(other)).as("durable").contains(b);
         }
     }
+
+    /** claimKey is a compare-and-set: the first claim wins, later ones read back the winner; durable. */
+    @Test
+    void anIdempotencyKeyIsClaimedOnce(@TempDir Path dir) {
+        ExecutionId first = ExecutionId.random();
+        ExecutionId second = ExecutionId.random();
+        try (GumboEventLog log = GumboEventLog.at(dir)) {
+            log.putKey("other", ExecutionId.random());
+            assertThat(log.claimKey("order-7", first)).as("won").isEmpty();
+            assertThat(log.claimKey("order-7", second)).as("lost, to the winner").contains(first);
+            assertThat(log.findByKey("order-7")).contains(first);
+        }
+        try (GumboEventLog reopened = GumboEventLog.at(dir)) {
+            assertThat(reopened.claimKey("order-7", second)).contains(first);
+        }
+    }
 }

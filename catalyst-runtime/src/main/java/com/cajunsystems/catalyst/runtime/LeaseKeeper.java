@@ -23,6 +23,12 @@ import java.util.concurrent.TimeUnit;
  * append fence does that (see {@link Lease}). A renewal that finds the row changed means another node
  * has taken over, and the attempt is told to stop at its next boundary.
  *
+ * <p>Cancels cross nodes on the lease row (Dist-4). {@link #requestCancel} adds the request to the
+ * holder's row. The holder's next renewal finds its own row plus a request, keeps the lease, and runs
+ * the attempt's cancel callback. A node that takes a lease over carries any request on it
+ * ({@link #pendingCancel}), and a release never deletes a request this node did not honour. It
+ * leaves the row lapsed instead, for the next claimer. So a request outlives its holder.
+ *
  * <p>A lease whose holder is this node's own id is treated as this node's, even if this process did
  * not claim it. That is how a node restarted under the same id takes its executions back without
  * waiting out its predecessor's leases. It is also why node ids must be unique among live nodes.
@@ -38,6 +44,18 @@ final class LeaseKeeper implements AutoCloseable {
         Lease lease;
         boolean released;
         Runnable onLost = () -> { };
+        /**
+         * The running attempt's cancel, or null while none is registered. Returns whether the cancel took
+         * effect: false for an attempt that has already finished, so the request is not counted as
+         * honoured.
+         */
+        java.util.function.Predicate<String> onCancel;
+        /**
+         * Whether the request on {@link #lease} was handed to an attempt, so it is not handed over
+         * twice. Not whether it was honoured: an attempt can be tripped and still park or abandon
+         * without recording the cancel. Only the log says it was honoured, by a terminal execution.
+         */
+        boolean cancelFired;
 
         Held(Lease lease) {
             this.lease = lease;
@@ -50,9 +68,13 @@ final class LeaseKeeper implements AutoCloseable {
     private final Duration duration;
     private final Map<ExecutionId, Held> held = new ConcurrentHashMap<>();
     private final ScheduledExecutorService heartbeat;
+    /** Whether an execution has reached a terminal event; a cancel request on a finished one is moot. */
+    private final java.util.function.Predicate<ExecutionId> terminal;
 
-    LeaseKeeper(EventLog log, String nodeId, Clock clock, Duration duration, Duration heartbeatInterval) {
+    LeaseKeeper(EventLog log, String nodeId, Clock clock, Duration duration, Duration heartbeatInterval,
+                java.util.function.Predicate<ExecutionId> terminal) {
         this.log = log;
+        this.terminal = terminal;
         this.nodeId = nodeId;
         this.clock = clock;
         this.duration = duration;
@@ -78,7 +100,8 @@ final class LeaseKeeper implements AutoCloseable {
             if (current.isPresent() && !current.get().holder().equals(nodeId) && current.get().liveAt(clock.instant())) {
                 throw new LeaseHeldException(id, current.get());
             }
-            Lease mine = fresh();
+            // A takeover carries any cancel request on the row, so it is honoured by the new holder.
+            Lease mine = current.flatMap(Lease::cancelRequested).map(fresh()::withCancelRequest).orElseGet(this::fresh);
             if (log.compareAndSetLease(id, current.orElse(null), mine)) {
                 held.put(id, new Held(mine));
                 return true;
@@ -100,8 +123,71 @@ final class LeaseKeeper implements AutoCloseable {
         }
     }
 
+    /**
+     * Registers the running attempt's cancel for {@code id}. It runs when a renewal finds a cancel
+     * request on the lease, or now, if one was absorbed while no attempt was registered (during a
+     * pause, say, or just before the attempt registered). The request counts as honoured only if
+     * {@code onCancel} returns true. Replaces any earlier callback.
+     */
+    void onCancel(ExecutionId id, java.util.function.Predicate<String> onCancel) {
+        Held h = held.get(id);
+        if (h == null) return;
+        String pending;
+        synchronized (h) {
+            h.onCancel = onCancel;
+            pending = h.cancelFired ? null : h.lease.cancelRequest();
+        }
+        if (pending != null) fireCancel(h, pending);
+    }
+
+    /** Runs the registered cancel outside the lock, and marks the request honoured only if it took effect. */
+    private void fireCancel(Held h, String reason) {
+        java.util.function.Predicate<String> callback;
+        synchronized (h) {
+            if (h.cancelFired || h.onCancel == null) return;
+            callback = h.onCancel;
+        }
+        if (callback.test(reason)) {
+            synchronized (h) {
+                h.cancelFired = true;
+            }
+        }
+    }
+
+    /**
+     * The cancel request on the lease this process holds for {@code id}: one carried over from the row
+     * it took over, or one absorbed at renewal. Only a peek. Nothing is marked, because a caller that
+     * reads the request and then decides not to act on it must not cause it to be dropped. Once the
+     * cancel is recorded the execution is terminal, and that is what lets a release drop the request.
+     */
+    Optional<String> pendingCancel(ExecutionId id) {
+        Held h = held.get(id);
+        if (h == null) return Optional.empty();
+        synchronized (h) {
+            return h.lease.cancelRequested();
+        }
+    }
+
     boolean holds(ExecutionId id) {
         return held.containsKey(id);
+    }
+
+    /**
+     * Asks the node holding a live lease on {@code id} to cancel it, by adding the request to its
+     * lease row. Returns {@code true} if the request is on the row, now or already. Returns
+     * {@code false} if no other node holds a live lease, in which case the caller may claim the
+     * execution and cancel it directly.
+     */
+    boolean requestCancel(ExecutionId id, String reason) {
+        for (int i = 0; i < CLAIM_ATTEMPTS; i++) {
+            Optional<Lease> current = log.readLease(id);
+            if (current.isEmpty() || current.get().holder().equals(nodeId) || !current.get().liveAt(clock.instant())) {
+                return false;
+            }
+            if (current.get().cancelRequested().isPresent()) return true;
+            if (log.compareAndSetLease(id, current.get(), current.get().withCancelRequest(reason))) return true;
+        }
+        return true; // the row kept changing under live holders; the latest of them saw a request or will
     }
 
     /**
@@ -116,11 +202,28 @@ final class LeaseKeeper implements AutoCloseable {
         synchronized (h) {
             h.released = true;
             try {
-                log.compareAndSetLease(id, h.lease, null);
+                // From the row this process last wrote, or, if it changed since, from the row as it is
+                // now, provided it is still ours (one that passed to another node is left alone).
+                if (releaseFrom(id, h, h.lease)) return;
+                Optional<Lease> row = log.readLease(id);
+                if (row.isPresent() && row.get().holder().equals(nodeId)) releaseFrom(id, h, row.get());
             } catch (RuntimeException e) {
                 LOG.debug("lease release for {} failed; it will lapse at expiry: {}", id, e.toString());
             }
         }
+    }
+
+    /**
+     * Releases from {@code row}: deletes it, unless it carries a cancel request on an execution that is
+     * not finished. Such a request is kept on a lapsed row so the next claimer honours it, whether it
+     * came over with a takeover, was added since, or was handed to an attempt that then parked or
+     * abandoned without recording it. The log is the only reliable answer to "was it honoured": a
+     * recorded cancel makes the execution terminal. Returns whether the swap happened.
+     */
+    private boolean releaseFrom(ExecutionId id, Held h, Lease row) {
+        boolean keepRequest = row.cancelRequested().isPresent() && !terminal.test(id);
+        Lease replacement = keepRequest ? new Lease(nodeId, clock.instant().toEpochMilli(), row.cancelRequest()) : null;
+        return log.compareAndSetLease(id, row, replacement);
     }
 
     /** One heartbeat: extends every held lease, and hands back any that another node has taken. */
@@ -129,22 +232,37 @@ final class LeaseKeeper implements AutoCloseable {
             ExecutionId id = entry.getKey();
             Held h = entry.getValue();
             Runnable lost = null;
+            String cancel = null;
             synchronized (h) {
                 if (h.released) continue;
-                Lease next = fresh();
+                Lease next = h.lease.cancelRequested().map(fresh()::withCancelRequest).orElseGet(this::fresh);
                 try {
                     if (log.compareAndSetLease(id, h.lease, next)) {
                         h.lease = next;
                     } else {
-                        h.released = true;
-                        held.remove(id, h);
-                        lost = h.onLost;
+                        // Changed under us. Our own row plus a cancel request means another node asked
+                        // to cancel: absorb it, keep the lease, and cancel the attempt here.
+                        Optional<Lease> row = log.readLease(id);
+                        String reason = row.flatMap(Lease::cancelRequested).orElse(null);
+                        if (reason != null && row.get().equals(h.lease.withCancelRequest(reason))) {
+                            Lease renewed = fresh().withCancelRequest(reason);
+                            h.lease = log.compareAndSetLease(id, row.get(), renewed) ? renewed : row.get();
+                            if (!h.cancelFired) cancel = reason;
+                        } else {
+                            h.released = true;
+                            held.remove(id, h);
+                            lost = h.onLost;
+                        }
                     }
                 } catch (RuntimeException e) {
                     // A transient failure: keep the lease and try again next beat. If renewals keep
                     // failing until it lapses, another node may take over; the fence still holds.
                     LOG.warn("lease renewal for {} failed: {}", id, e.toString());
                 }
+            }
+            if (cancel != null) {
+                LOG.info("cancel of {} requested by another node; cancelling it here", id);
+                fireCancel(h, cancel); // with no attempt to take it, the request stays for a later holder
             }
             if (lost != null) {
                 LOG.warn("lost the lease on {} to another node; stopping its attempt here", id);

@@ -220,7 +220,14 @@ Most of it exists:
   lease loses the execution, and the call it had in flight is found in doubt by the node that takes
   over. Under the default `InDoubtPolicy.FAIL`, that fails the execution.
 
-What is missing is the claim loop (Dist-4). Today a dead node's work is picked up only when some
-node runs `recoverAll()` or restarts with `recoverOnStart`, and cancel/pause of an execution running
-on another node is refused rather than forwarded to it. Treat multi-node runs as a preview until
-then.
+- **Claim loop (`claimInterval`, default 10s):** every node scans the shared index and takes over
+  what no live node holds. A crashed node's work moves within about one lease duration plus one
+  interval, with no operator action.
+- **Cancel from any node:** `cancel(id)` on any node reaches the node running the execution, which
+  records it at its next heartbeat. Pausing an execution that is running elsewhere is refused, as
+  it is on one node.
+- **Keys:** two nodes taking the same new idempotency key create one execution.
+
+This is new; treat multi-node runs as a preview. `Demo distributed` (CI, and
+`scripts/fdb-tests.sh --demo` locally) kills a node mid-run and shows the rest of the cluster
+finishing its work.

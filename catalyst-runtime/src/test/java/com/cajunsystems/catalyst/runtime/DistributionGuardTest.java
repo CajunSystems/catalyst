@@ -86,6 +86,14 @@ class DistributionGuardTest {
                 .hasMessageContaining("supportsLeases()=false");
     }
 
+    /** The claim loop finds work through the index; without one it would fail every tick, quietly. */
+    @Test
+    void aLogWithoutAnExecutionIndexIsRefused() {
+        assertThatThrownBy(() -> distributedOn(SharedLog.withoutIndex()).build())
+                .isInstanceOf(IllegalStateException.class)
+                .hasMessageContaining("supportsExecutionIndex()=false");
+    }
+
     /** Dist-3 made the recovery scan lease-aware, so a distributed node may recover on start. */
     @Test
     void aDistributedRuntimeMayRecoverOnStart() {
