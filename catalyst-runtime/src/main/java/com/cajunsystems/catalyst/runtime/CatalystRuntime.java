@@ -724,8 +724,15 @@ public final class CatalystRuntime implements AutoCloseable {
                     try {
                         underLease(id, () -> {
                             ExecutionState state = leases == null ? unleased : foldState(id);
+                            Optional<String> carried = leases == null ? Optional.empty() : leases.carriedCancel(id);
                             if (!isCrashInterrupted(state.status())) {
                                 leftAlone.put(id, state.status());
+                            } else if (carried.isPresent()) {
+                                // A cancel requested of its last holder: record it here. Recording a cancel
+                                // needs no task, so even a node that cannot run this type honours it.
+                                StreamCursor.after(log, id, state.lastSeq())
+                                        .append(new CatalystEvent.ExecutionCancelled(now(), carried.get(), state.lastSeq()));
+                                leftAlone.put(id, Status.CANCELLED);
                             } else if (registry.lookup(state.taskType()).isEmpty()) {
                                 notRecovered.put(id, "no task registered for type '" + state.taskType() + "'");
                             } else {

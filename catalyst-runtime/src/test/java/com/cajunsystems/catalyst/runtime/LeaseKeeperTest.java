@@ -83,4 +83,22 @@ class LeaseKeeperTest {
             assertThat(row.cancelRequested()).contains("stop");
         }
     }
+
+    /**
+     * A takeover carries a request over. Releasing without honouring it (a node that lacks the task
+     * type, or a pause) must leave it for the next claimer, not delete it with the row this node wrote.
+     */
+    @Test
+    void aReleaseKeepsACarriedCancelItNeverHonoured() {
+        ExecutionId id = ExecutionId.random();
+        assertThat(log.compareAndSetLease(id, null, new Lease("node-dead", clock.instant().toEpochMilli() - 1, "stop"))).isTrue();
+        try (LeaseKeeper keeper = keeper(false)) {
+            keeper.acquire(id);
+            assertThat(log.readLease(id).orElseThrow().cancelRequested()).as("carried over").contains("stop");
+            keeper.release(id);
+        }
+        Lease left = log.readLease(id).orElseThrow();
+        assertThat(left.cancelRequested()).contains("stop");
+        assertThat(left.liveAt(clock.instant())).isFalse();
+    }
 }

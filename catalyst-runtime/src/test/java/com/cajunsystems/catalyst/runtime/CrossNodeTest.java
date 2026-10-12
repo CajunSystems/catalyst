@@ -222,6 +222,18 @@ class CrossNodeTest {
         }
     }
 
+    /** Recording a cancel needs no task: a node that cannot run the type still honours a carried request. */
+    @Test
+    void aNodeThatCannotRunTheTaskStillHonoursACarriedCancel() {
+        ExecutionId id = crashInterrupted();
+        assertThat(log.compareAndSetLease(id, null, new Lease("node-dead",
+                clock.instant().toEpochMilli() - 1, "cancelled by request"))).isTrue();
+        try (CatalystRuntime bare = nodeBuilder("node-bare", MockModel.alwaysReturn("B")).build()) { // no registrations
+            await(() -> bare.inspect(id).status() == Status.CANCELLED);
+            assertThat(log.readLease(id)).isEmpty();
+        }
+    }
+
     /** No node is running it: the cancel is recorded directly, under the lease, as on one node. */
     @Test
     void cancellingAnExecutionNoNodeIsRunningRecordsItDirectly() {

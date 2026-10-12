@@ -176,22 +176,27 @@ final class LeaseKeeper implements AutoCloseable {
         synchronized (h) {
             h.released = true;
             try {
-                if (log.compareAndSetLease(id, h.lease, null)) return;
-                // The row changed since this process last wrote it. If it is still ours with a cancel
-                // request added that was never honoured, keep the request but lapse the row, so the
-                // next node to claim the execution honours it. If it passed to another node, leave it.
+                // From the row this process last wrote, or, if it changed since, from the row as it is
+                // now, provided it is still ours (one that passed to another node is left alone).
+                if (releaseFrom(id, h, h.lease)) return;
                 Optional<Lease> row = log.readLease(id);
-                if (row.isEmpty() || !row.get().holder().equals(nodeId)) return;
-                if (row.get().cancelRequested().isPresent() && !h.cancelFired && !terminal.test(id)) {
-                    log.compareAndSetLease(id, row.get(),
-                            new Lease(nodeId, clock.instant().toEpochMilli(), row.get().cancelRequest()));
-                } else {
-                    log.compareAndSetLease(id, row.get(), null);
-                }
+                if (row.isPresent() && row.get().holder().equals(nodeId)) releaseFrom(id, h, row.get());
             } catch (RuntimeException e) {
                 LOG.debug("lease release for {} failed; it will lapse at expiry: {}", id, e.toString());
             }
         }
+    }
+
+    /**
+     * Releases from {@code row}: deletes it, unless it carries a cancel request this process never
+     * honoured on an execution that is not finished. Whether the request came over with a takeover or
+     * was added since, it is kept on a lapsed row so the next claimer honours it. Returns whether the
+     * swap happened.
+     */
+    private boolean releaseFrom(ExecutionId id, Held h, Lease row) {
+        boolean keepRequest = row.cancelRequested().isPresent() && !h.cancelFired && !terminal.test(id);
+        Lease replacement = keepRequest ? new Lease(nodeId, clock.instant().toEpochMilli(), row.cancelRequest()) : null;
+        return log.compareAndSetLease(id, row, replacement);
     }
 
     /** One heartbeat: extends every held lease, and hands back any that another node has taken. */
