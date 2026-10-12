@@ -15,7 +15,10 @@ if [ ! -d catalyst-api/target/classes ]; then
   echo "catalyst-api is not built yet — run: mvn install -DskipTests" >&2
   exit 1
 fi
-if [ ! -f catalyst-api/target/cp.txt ] || [ catalyst-api/pom.xml -nt catalyst-api/target/cp.txt ]; then
+# Rebuild the cached classpath when any pom changed: dependency versions live in the root pom, and a
+# stale classpath would silently run the demo against the previous jars still in ~/.m2.
+if [ ! -f catalyst-api/target/cp.txt ] \
+   || [ -n "$(find . -name pom.xml -not -path '*/target/*' -newer catalyst-api/target/cp.txt)" ]; then
   mvn -q -pl catalyst-api org.apache.maven.plugins:maven-dependency-plugin:3.6.1:build-classpath \
       -Dmdep.outputFile=target/cp.txt
 fi
