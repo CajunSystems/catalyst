@@ -862,6 +862,12 @@ public final class ReplayingContext implements Context {
         return raisedAbandon;
     }
 
+    /** Attributed to a recorded {@code ToolCompleted(error)}: live, substituted, in-doubt retry or branch-reproduced. */
+    @Override
+    public boolean isRecordedToolFailure(Throwable failure) {
+        return failure != null && failure == lastToolFailureException;
+    }
+
     public long failedBoundarySeq(Throwable propagating) {
         if (lastToolFailureException == null) return -1;
         // Bounded walk: a self- or mutually-referential cause chain would otherwise loop forever.

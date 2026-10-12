@@ -58,4 +58,18 @@ public interface Context {
 
     /** A logger scoped to this execution. */
     Logger log();
+
+    /**
+     * Whether {@code failure}, thrown by {@link #call}, is the recorded result of that call: the tool
+     * failed, and the failure is in the log as its {@code ToolCompleted}. That covers a live failure, a
+     * failure substituted on replay or resume, and one reproduced by a branch. Code that handles tool
+     * failures as data (an agent telling the model) should do so only when this is true. Anything else
+     * thrown from {@code call}, a failed log write for one, means the call's outcome is not recorded,
+     * and carrying on would record later boundaries on top of that gap.
+     *
+     * <p>The default returns {@code false}, the safe answer for a context that does not track it.
+     */
+    default boolean isRecordedToolFailure(Throwable failure) {
+        return false;
+    }
 }

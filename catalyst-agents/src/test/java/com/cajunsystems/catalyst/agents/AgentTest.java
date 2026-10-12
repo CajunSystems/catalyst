@@ -343,6 +343,37 @@ class AgentTest {
         }
     }
 
+    /**
+     * A failure that is not the call's recorded result (here the log refusing to record the tool's
+     * completion) must not reach the model as a tool error. The outcome is not in the log, and the
+     * next model turn would be recorded on top of that gap.
+     */
+    @Test
+    void aFailedLogWriteIsNotHandedToTheModel() {
+        EventLog inner = EventLogs.inMemory();
+        EventLog refusing = new EventLog() {
+            private void check(com.cajunsystems.catalyst.events.CatalystEvent e) {
+                if (e instanceof com.cajunsystems.catalyst.events.CatalystEvent.ToolCompleted) {
+                    throw new IllegalStateException("disk full");
+                }
+            }
+            @Override public long append(ExecutionId id, com.cajunsystems.catalyst.events.CatalystEvent e) { check(e); return inner.append(id, e); }
+            @Override public long append(ExecutionId id, com.cajunsystems.catalyst.events.CatalystEvent e, long expected) { check(e); return inner.append(id, e, expected); }
+            @Override public boolean supportsConditionalAppend() { return inner.supportsConditionalAppend(); }
+            @Override public List<com.cajunsystems.catalyst.events.SequencedEvent> read(ExecutionId id) { return inner.read(id); }
+            @Override public long latestSeq(ExecutionId id) { return inner.latestSeq(id); }
+            @Override public java.util.Optional<ExecutionId> findByKey(String k) { return inner.findByKey(k); }
+            @Override public void putKey(String k, ExecutionId id) { inner.putKey(k, id); }
+            @Override public void close() { }
+        };
+        PolicyModel model = new PolicyModel();
+        try (CatalystRuntime runtime = CatalystRuntime.builder().log(refusing).model(model).build()) {
+            var run = runtime.execute(ctx -> agent.run(ctx, "go").answer(), ExecutionOptions.none());
+            assertThatThrownBy(run::result).hasMessageContaining("disk full");
+            assertThat(model.calls).as("no turn after the unrecorded call").hasValue(1);
+        }
+    }
+
     /** Engine signals unwind the run; they are never handed to the model as a tool error. */
     @Test
     void engineSignalsAreNotSwallowed() {

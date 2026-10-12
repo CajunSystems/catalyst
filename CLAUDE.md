@@ -471,6 +471,10 @@ checkout's pom to `com.github.CajunSystems` before installing.
     Without it, the prompt after a failure diverged (mutation-checked).
   - **Engine signals are rethrown,** never fed to the model: cancel, abandon, waiting, paused,
     stale writer, divergence, in-doubt, unrecorded tool (mutation-checked).
+  - **Only a *recorded* tool failure reaches the model:** `Context.isRecordedToolFailure(e)` is
+    `e == lastToolFailureException`. That covers live, substituted, in-doubt RETRY and
+    branch-reproduced failures. Anything else from `ctx.call`, such as a failed log write, propagates.
+    Carrying on would record the next turn on top of a missing `ToolCompleted` (mutation-checked).
   - **Tool inputs:** a flat record of scalars and enums, or one scalar wrapped as `{"value":…}`.
     Every component is required, and a missing one is fed back as an error, never decoded to
     null/0.

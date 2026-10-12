@@ -150,7 +150,10 @@ public final class Agent {
         try {
             return tool.encode(ctx.call(tool.tool(), input));
         } catch (RuntimeException e) {
-            if (isEngineSignal(e)) throw e;
+            // Only a failure recorded as the call's result goes to the model. Anything else (an engine
+            // signal, a failed log write) means the outcome is not in the log, and carrying on would
+            // record the next turn on top of that gap.
+            if (isEngineSignal(e) || !ctx.isRecordedToolFailure(e)) throw e;
             // The same text live and on replay: a live failure was recorded as String.valueOf(e).
             String error = e instanceof RecordedToolFailureException r ? r.recordedError() : String.valueOf(e);
             return "error: " + error;
