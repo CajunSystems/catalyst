@@ -8,6 +8,7 @@ import com.cajunsystems.catalyst.events.EventUpcaster;
 import com.cajunsystems.catalyst.events.FileBlobStore;
 import com.cajunsystems.catalyst.events.SequencedEvent;
 import com.cajunsystems.catalyst.log.EventLog;
+import com.cajunsystems.catalyst.log.ExecutionIndex;
 import com.cajunsystems.catalyst.log.Snapshot;
 import com.cajunsystems.catalyst.log.StaleWriterException;
 import com.cajunsystems.gumbo.api.LogView;
@@ -23,12 +24,17 @@ import com.cajunsystems.gumbo.persistence.PersistenceAdapter;
 import com.cajunsystems.gumbo.service.SharedLogConfig;
 import com.cajunsystems.gumbo.service.SharedLogService;
 
+import java.io.ByteArrayInputStream;
+import java.io.ByteArrayOutputStream;
+import java.io.DataInputStream;
+import java.io.DataOutputStream;
 import java.io.IOException;
 import java.io.UncheckedIOException;
 import java.nio.ByteBuffer;
 import java.nio.charset.StandardCharsets;
 import java.nio.file.Path;
 import java.util.ArrayList;
+import java.util.LinkedHashSet;
 import java.util.List;
 import java.util.Map;
 import java.util.Optional;
@@ -47,6 +53,14 @@ public final class GumboEventLog implements EventLog {
     private static final String EXEC_NAMESPACE = "catalyst-exec";
     private static final LogTag INDEX_TAG = LogTag.of("catalyst-index", "keys");
     private static final LogTag SNAPSHOT_TAG = LogTag.of("catalyst-index", "snapshots");
+    /**
+     * The execution index (see {@link ExecutionIndex}): lifecycle events that open or close an
+     * execution carry this tag as well as their execution's, in the same append. Since gumbo 0.6.0 a
+     * fan-out tag numbers its own entries, so the queue is cursored by its own version.
+     */
+    static final LogTag QUEUE_TAG = LogTag.of("catalyst-tasks", ExecutionIndex.DEFAULT_QUEUE);
+    /** Key in the queue tag's KV holding the folded open set and the queue version it covers. */
+    static final String OPEN_SET_KEY = "open-set";
 
     private final SharedLogService service;
     private final EventLogSerializer serializer;
@@ -55,12 +69,14 @@ public final class GumboEventLog implements EventLog {
     private final Map<ExecutionId, Long> lastSeq = new ConcurrentHashMap<>();
     private final LogView indexView;
     private final LogView snapshotView;
+    private final LogView queueView;
 
     private GumboEventLog(SharedLogService service, EventCodec codec) {
         this.service = service;
         this.serializer = new EventLogSerializer(codec);
         this.indexView = service.getView(INDEX_TAG);
         this.snapshotView = service.getView(SNAPSHOT_TAG);
+        this.queueView = service.getView(QUEUE_TAG);
     }
 
     /**
@@ -136,10 +152,8 @@ public final class GumboEventLog implements EventLog {
     /**
      * The underlying Gumbo service, package-private for tests.
      *
-     * <p>Catalyst writes one tag per execution, so nothing in this class needs the multi-tag API.
-     * The v1 claimable-work design does — it dual-tags an execution's first event into a shared
-     * queue — and the property that design rests on (a fan-out tag counts its own entries) is worth
-     * pinning against the log Catalyst actually builds, before the claim loop exists to pin it.
+     * <p>Tests reach the queue tag and its checkpoint through it, and drive multi-tag appends
+     * directly to pin the property the index rests on: a fan-out tag counts its own entries.
      */
     SharedLogService service() {
         return service;
@@ -171,9 +185,31 @@ public final class GumboEventLog implements EventLog {
 
     @Override
     public long append(ExecutionId executionId, CatalystEvent event) {
-        long seq = viewFor(executionId).append(event).join().streamVersion();
+        long seq = ExecutionIndex.isIndexed(event)
+                ? appendFenced(executionId, event, PersistenceAdapter.ANY_VERSION)
+                : viewFor(executionId).append(event).join().streamVersion();
         lastSeq.merge(executionId, seq, Math::max);
         return seq;
+    }
+
+    /**
+     * Appends {@code event} to its execution's tag — and, if it changes the open set, to the queue
+     * tag in the same entry — fenced on the execution tag at {@code expectedSeq}
+     * ({@link PersistenceAdapter#ANY_VERSION} for none).
+     *
+     * <p>The execution tag is always <em>named</em> as the one fenced and reported. For a multi-tag
+     * request Gumbo otherwise takes {@code tags.iterator().next()}, and a {@code Set}'s iteration
+     * order is salted per JVM run — so the returned version could be the queue's position rather
+     * than the execution's seq. The queue tag itself is never fenced: it is a fan-out index that
+     * every execution writes to, and conditioning on it would make unrelated executions conflict.
+     */
+    private long appendFenced(ExecutionId executionId, CatalystEvent event, long expectedSeq) {
+        LogTag execTag = tagFor(executionId);
+        byte[] data = serializer.serialize(event);
+        AppendRequest request = ExecutionIndex.isIndexed(event)
+                ? AppendRequest.to(new LinkedHashSet<>(List.of(execTag, QUEUE_TAG)), data)
+                : AppendRequest.to(execTag, data);
+        return service.append(request, execTag, expectedSeq).join().streamVersion();
     }
 
     /**
@@ -186,18 +222,14 @@ public final class GumboEventLog implements EventLog {
      * and this seam exists precisely to stop correctness depending on a caller being right about
      * where a stream is.
      *
-     * <p>The single-tag form is deliberate. Gumbo's multi-tag fence needs the conditioned tag named
-     * explicitly, because the primary tag of a multi-tag request is {@code tags.iterator().next()}
-     * over an immutable {@code Set}, whose iteration order Java salts per JVM run. Catalyst writes
-     * one tag per execution, so the question does not arise here — but it will the moment an
-     * execution is dual-tagged into a shared work queue, and then the fenced tag must be named.
+     * <p>An event that changes the open set is dual-tagged into the queue here too, and the fence
+     * still conditions on the execution tag only — see {@link #appendFenced}.
      */
     @Override
     public long append(ExecutionId executionId, CatalystEvent event, long expectedSeq) {
-        AppendRequest request = AppendRequest.to(tagFor(executionId), serializer.serialize(event));
         long seq;
         try {
-            seq = service.append(request, expectedSeq).join().streamVersion();
+            seq = appendFenced(executionId, event, expectedSeq);
         } catch (RuntimeException e) {
             VersionConflictException conflict = conflictIn(e);
             if (conflict == null) throw e;
@@ -251,7 +283,7 @@ public final class GumboEventLog implements EventLog {
 
     @Override
     public List<SequencedEvent> read(ExecutionId executionId) {
-        return decode(viewFor(executionId).rawView().readAll().join());
+        return decode(executionId, viewFor(executionId).rawView().readAll().join());
     }
 
     @Override
@@ -261,15 +293,96 @@ public final class GumboEventLog implements EventLog {
         // stream's numbering only while the log holds a single execution — with a second execution
         // sharing it, that read silently returns events already folded into the snapshot and the
         // reducer re-applies them. readAfterVersion takes -1 as "the whole stream".
-        return decode(viewFor(executionId).rawView().readAfterVersion(afterSeqExclusive).join());
+        return decode(executionId, viewFor(executionId).rawView().readAfterVersion(afterSeqExclusive).join());
     }
 
-    private List<SequencedEvent> decode(List<LogEntry> entries) {
+    /**
+     * Seq is read as the entry's version <em>in this execution's tag</em>. The no-arg
+     * {@code streamVersion()} reports the entry's primary tag, which for a dual-tagged lifecycle
+     * event is only the execution tag because {@link #appendFenced} names it — reading by tag keeps
+     * the seq right without depending on how the entry was written.
+     */
+    private List<SequencedEvent> decode(ExecutionId executionId, List<LogEntry> entries) {
+        LogTag tag = tagFor(executionId);
         List<SequencedEvent> events = new ArrayList<>(entries.size());
         for (LogEntry entry : entries) {
-            events.add(new SequencedEvent(entry.streamVersion(), serializer.deserialize(entry.dataUnsafe())));
+            events.add(new SequencedEvent(entry.streamVersion(tag), serializer.deserialize(entry.dataUnsafe())));
         }
         return events;
+    }
+
+    /**
+     * Folds the queue tag into the open set, starting from the checkpoint in the queue's KV and
+     * reading only the entries after it, then advances the checkpoint. A scan therefore costs the
+     * open set plus the churn since the last scan, not the log's history.
+     *
+     * <p>The checkpoint is an optimization, never a source of truth: the fold is a replay of
+     * opens and closes in queue order, so resuming it from <em>any</em> earlier checkpoint yields
+     * the same set. A lost or stale checkpoint costs a longer read, not a wrong answer — which is
+     * why it is a plain overwrite rather than a compare-and-set. Synchronized so two scans in this
+     * process do not race each other's checkpoint backwards.
+     */
+    @Override
+    public synchronized List<ExecutionId> openExecutions() {
+        LinkedHashSet<ExecutionId> open = new LinkedHashSet<>();
+        long through = readOpenSetCheckpoint(open);
+        List<LogEntry> tail = queueView.readAfterVersion(through).join();
+        if (tail.isEmpty()) return List.copyOf(open);
+
+        for (LogEntry entry : tail) {
+            through = Math.max(through, entry.streamVersion(QUEUE_TAG));
+            ExecutionId id = executionOf(entry);
+            if (id == null) continue; // not a Catalyst lifecycle entry; nothing to fold
+            switch (ExecutionIndex.changeFor(serializer.deserialize(entry.dataUnsafe()))) {
+                case OPENS -> open.add(id);
+                case CLOSES -> open.remove(id);
+                case NONE -> { }
+            }
+        }
+        writeOpenSetCheckpoint(through, open);
+        return List.copyOf(open);
+    }
+
+    @Override
+    public boolean supportsExecutionIndex() {
+        return true;
+    }
+
+    /** The execution a queue entry belongs to: the one {@code catalyst-exec} tag it also carries. */
+    private static ExecutionId executionOf(LogEntry entry) {
+        for (LogTag tag : entry.tags()) {
+            if (EXEC_NAMESPACE.equals(tag.namespace()) && tag.key() != null) return ExecutionId.of(tag.key());
+        }
+        return null;
+    }
+
+    /** Fills {@code into} from the checkpoint and returns the queue version it covers, or -1. */
+    private long readOpenSetCheckpoint(LinkedHashSet<ExecutionId> into) {
+        byte[] framed = queueView.getValue(OPEN_SET_KEY).join();
+        if (framed == null) return -1;
+        try (DataInputStream in = new DataInputStream(new ByteArrayInputStream(framed))) {
+            long through = in.readLong();
+            int n = in.readInt();
+            for (int i = 0; i < n; i++) into.add(ExecutionId.of(in.readUTF()));
+            return through;
+        } catch (IOException e) {
+            // Unreadable checkpoint: discard it and refold the queue from the start — correct, slower.
+            into.clear();
+            return -1;
+        }
+    }
+
+    /** Frames as {@code [8-byte through][4-byte count][count × modified-UTF-8 id]}, creation order. */
+    private void writeOpenSetCheckpoint(long through, LinkedHashSet<ExecutionId> open) {
+        ByteArrayOutputStream bytes = new ByteArrayOutputStream();
+        try (DataOutputStream out = new DataOutputStream(bytes)) {
+            out.writeLong(through);
+            out.writeInt(open.size());
+            for (ExecutionId id : open) out.writeUTF(id.value());
+        } catch (IOException e) {
+            throw new UncheckedIOException(e); // in-memory stream; cannot happen
+        }
+        queueView.setValue(OPEN_SET_KEY, bytes.toByteArray()).join();
     }
 
     @Override

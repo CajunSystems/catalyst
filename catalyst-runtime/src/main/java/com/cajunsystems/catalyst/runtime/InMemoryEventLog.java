@@ -4,13 +4,16 @@ import com.cajunsystems.catalyst.ExecutionId;
 import com.cajunsystems.catalyst.events.CatalystEvent;
 import com.cajunsystems.catalyst.events.SequencedEvent;
 import com.cajunsystems.catalyst.log.EventLog;
+import com.cajunsystems.catalyst.log.ExecutionIndex;
 import com.cajunsystems.catalyst.log.Snapshot;
 import com.cajunsystems.catalyst.log.StaleWriterException;
 
 import java.util.ArrayList;
+import java.util.LinkedHashSet;
 import java.util.List;
 import java.util.Map;
 import java.util.Optional;
+import java.util.Set;
 import java.util.concurrent.ConcurrentHashMap;
 
 /**
@@ -23,14 +26,42 @@ public final class InMemoryEventLog implements EventLog {
     private final Map<String, ExecutionId> keyIndex = new ConcurrentHashMap<>();
     private final Map<ExecutionId, Snapshot> snapshots = new ConcurrentHashMap<>();
 
+    /** Creation-ordered open set; guarded by its own monitor. See {@link ExecutionIndex}. */
+    private final Set<ExecutionId> open = new LinkedHashSet<>();
+
     @Override
     public long append(ExecutionId executionId, CatalystEvent event) {
         List<SequencedEvent> stream = streams.computeIfAbsent(executionId, k -> new ArrayList<>());
         synchronized (stream) {
             long seq = stream.size();
             stream.add(new SequencedEvent(seq, event));
+            index(executionId, event);
             return seq;
         }
+    }
+
+    /**
+     * Updated under the stream's monitor, so an event and its index change are visible together:
+     * a reader that sees an execution's terminal event never still finds it listed as open.
+     */
+    private void index(ExecutionId executionId, CatalystEvent event) {
+        switch (ExecutionIndex.changeFor(event)) {
+            case OPENS -> { synchronized (open) { open.add(executionId); } }
+            case CLOSES -> { synchronized (open) { open.remove(executionId); } }
+            case NONE -> { }
+        }
+    }
+
+    @Override
+    public List<ExecutionId> openExecutions() {
+        synchronized (open) {
+            return List.copyOf(open);
+        }
+    }
+
+    @Override
+    public boolean supportsExecutionIndex() {
+        return true;
     }
 
     /**
@@ -46,6 +77,7 @@ public final class InMemoryEventLog implements EventLog {
             long next = stream.size();
             if (next != expectedSeq) throw new StaleWriterException(executionId, expectedSeq, next);
             stream.add(new SequencedEvent(next, event));
+            index(executionId, event);
             return next;
         }
     }

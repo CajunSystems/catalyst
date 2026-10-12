@@ -128,6 +128,38 @@ public interface EventLog extends AutoCloseable {
         // no-op: see readSnapshot
     }
 
+    /**
+     * The executions that have been created and have not reached a terminal event, in creation
+     * order — the work a restarted runtime may need to pick back up.
+     *
+     * <p>Without this a log can only be read by an id the caller already holds, so after a restart
+     * nothing can find the in-flight work. Membership is decided by {@link ExecutionIndex}: an
+     * execution opens at {@code ExecutionCreated} and closes at {@code ExecutionCompleted},
+     * {@code ExecutionFailed} or {@code ExecutionCancelled}. A paused execution is open; whether to
+     * run it is for the caller to decide from its fold, not for the index.
+     *
+     * <p>The index is written in the same atomic append as the event that changes it, so it cannot
+     * disagree with the streams it summarizes — an execution is never created without being indexed,
+     * nor closed while still listed. Executions recorded before a log maintained an index are not in
+     * it.
+     *
+     * <p><strong>The default throws</strong>, like {@link #append(ExecutionId, CatalystEvent, long)}
+     * and for the same reason: a log that cannot enumerate returning an empty list would tell a
+     * recovery scan there is nothing to recover, which is indistinguishable from success. Check
+     * {@link #supportsExecutionIndex()} first.
+     *
+     * @throws UnsupportedOperationException if this log keeps no execution index
+     */
+    default List<ExecutionId> openExecutions() {
+        throw new UnsupportedOperationException(
+                getClass().getSimpleName() + " keeps no execution index; it cannot list its executions");
+    }
+
+    /** Whether {@link #openExecutions()} is available. */
+    default boolean supportsExecutionIndex() {
+        return false;
+    }
+
     /** Looks up the execution previously registered under an idempotency key, if any. */
     Optional<ExecutionId> findByKey(String idempotencyKey);
 

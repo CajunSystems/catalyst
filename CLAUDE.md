@@ -192,9 +192,24 @@ checkout's pom to `com.github.CajunSystems` before installing.
   `catalyst-tasks/<queue>` fed by dual-tagged appends can be cursored with `readAfterVersion` like
   any other stream. Before 0.6.0 a queue entry inherited its execution's version and a worker could
   silently skip work numbered below its cursor — `docs/distribution.md` carried that caveat and no
-  longer does. Catalyst does not dual-tag yet (the claim loop would); the test exists **because**
-  nothing here depends on it yet, so a regression underneath would otherwise surface as work that
-  is never claimed. `GumboEventLog.service()` is package-private for it.
+  longer does. The execution index (below) is the first consumer; the test pins the property
+  directly so a regression underneath surfaces here rather than as work that is never found.
+  `GumboEventLog.service()` is package-private for it.
+- **Execution index (Deploy-1)** — `ExecutionIndexTest` (runtime) + five `GumboEventLogTest` cases:
+  `EventLog.openExecutions()` lists executions created and not yet terminal, in creation order — what
+  a restarted runtime needs to find in-flight work without holding ids. Paired with
+  `supportsExecutionIndex()`; the default **throws**, since an empty list would tell a recovery scan
+  "nothing to recover". Membership lives in one place, `ExecutionIndex.changeFor`: opens at
+  `ExecutionCreated`, closes at Completed/Failed/Cancelled; paused stays open. Branch children are
+  **not** indexed (they start with `ExecutionBranched`, and their overrides aren't recorded, so a
+  restart can't resume them). `GumboEventLog` dual-tags those events into `catalyst-tasks/default`
+  in the same append, always **naming the execution tag** as the fenced/reported one (Gumbo
+  otherwise picks `Set.iterator().next()`, salted per JVM — the returned seq could be the queue's),
+  and `decode` reads `entry.streamVersion(execTag)` for the same reason. The scan folds from a
+  checkpoint in the queue tag's KV (`open-set`: queue version + ids) and reads only the tail; the
+  checkpoint is a plain overwrite because resuming the fold from *any* earlier checkpoint gives the
+  same set — a lost/stale one costs a read, never a wrong answer. Executions recorded before the
+  index existed are not in it.
 
 - **In-doubt model completions** — `ReplayingContextInDoubtCompletionTest`: a `CompletionRequested`
   with no `CompletionReceived` is a provider call that may have been accepted and *billed*, so it
