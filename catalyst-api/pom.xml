@@ -66,11 +66,15 @@
             <artifactId>opentelemetry-sdk-testing</artifactId>
             <scope>test</scope>
         </dependency>
-        <!-- FoundationDBAcceptanceTest; optional in catalyst-gumbo, so it does not arrive transitively. -->
+        <!--
+          Demo distributed (main scope) and FoundationDBAcceptanceTest. Optional in catalyst-gumbo, so it
+          does not arrive transitively, and optional here for the OTel SDK's reason: it stays off the
+          classpath of catalyst-api's consumers, who add it only if they use FoundationDB.
+        -->
         <dependency>
             <groupId>org.foundationdb</groupId>
             <artifactId>fdb-java</artifactId>
-            <scope>test</scope>
+            <optional>true</optional>
         </dependency>
     </dependencies>
 </project>

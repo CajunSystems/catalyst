@@ -575,6 +575,18 @@ public final class GumboEventLog implements EventLog {
     }
 
     /**
+     * Gumbo's {@code setValueIfAbsent}: atomic in storage, and across processes on FoundationDB. A
+     * loser reads back the winner. The winner's value is never removed, so that read cannot miss it.
+     */
+    @Override
+    public Optional<ExecutionId> claimKey(String idempotencyKey, ExecutionId executionId) {
+        if (indexView.setValueIfAbsent(idempotencyKey, executionId.value().getBytes(StandardCharsets.UTF_8)).join()) {
+            return Optional.empty();
+        }
+        return findByKey(idempotencyKey);
+    }
+
+    /**
      * Delegates to Gumbo's {@code compareAndSet} capability: whether the adapter compares and writes
      * a KV value atomically. On FoundationDB that holds across processes (measured by Gumbo's
      * two-writer test). On the file adapter it holds within the one process the directory lock allows.

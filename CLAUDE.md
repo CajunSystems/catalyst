@@ -404,6 +404,27 @@ checkout's pom to `com.github.CajunSystems` before installing.
   - **Mutation-checked:** removing the claim, the release, the lost callback, recovery's skip,
     close's release or the liveness check each fails a `LeaseTest` case.
 
+- **Claim loop + cross-node control (Dist-4)** — `CrossNodeTest` (runtime) + `LeaseKeeperTest` +
+  claimKey/lease-codec cases in Gumbo/core/FDB tests + **`Demo <root> distributed-a|distributed-b`**
+  (two JVMs on a real FDB root, gated in CI's `fdb` job; `scripts/fdb-tests.sh --demo` locally).
+  - **Claim loop:** polls `scan()`, which is `recoverAll`'s body, every `claimInterval` (it can't
+    subscribe: Gumbo push subscriptions are per process). It folds without the lease and claims only
+    crash-interrupted executions, so parked ones cost no lease writes. It re-decides under the lease.
+  - **Cancel on the lease row:** `Lease.cancelRequest` uses format `lease1c`, with the reason in
+    base64.
+    - `LeaseKeeper.requestCancel` adds it by CAS.
+    - `renewAll` absorbs "my row + a request", keeps the lease and fires `onCancel` → `tripCancel`.
+    - `acquire` carries a request over on takeover. `scheduleAttempt` honours a carried request
+      before running, and `scan`'s `honourOrphanedCancel` honours one on a lapsed parked execution.
+    - `release` keeps an unhonoured request on a lapsed row unless the execution is terminal.
+  - **Keys:** `EventLog.claimKey` (CAS; the default is lookup+put). Keyed `execute` decides under the
+    lease, and an empty stream behind a claimed key is created by whoever holds it.
+  - **Test timeouts:** `@Timeout(30)` on the lease and cross-node test classes. A lease bug *hangs*
+    (a parked attempt nobody stops), and an unbounded `result()` turned one mutant into a stuck build.
+  - **Mutation-checked:** removing the loop, forwarding, absorbing, carrying, the key CAS, the pre-check,
+    orphan handling, release keeping or dropping the request, or the create-for-claimed-key each fails a
+    test.
+
 - **In-doubt model completions** — `ReplayingContextInDoubtCompletionTest`: a `CompletionRequested`
   with no `CompletionReceived` is a provider call that may have been accepted and *billed*, so it
   routes through `InDoubtPolicy` exactly as a dangling `ToolRequested` does (it previously just

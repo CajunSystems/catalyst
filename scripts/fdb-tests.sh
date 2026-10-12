@@ -5,6 +5,7 @@
 #   scripts/fdb-tests.sh                 # the FoundationDB*Test classes in catalyst-gumbo and catalyst-api
 #   scripts/fdb-tests.sh --keep          # leave the cluster running afterwards
 #   scripts/fdb-tests.sh --keep -Dtest=FoundationDBEventLogTest   # extra args go to mvn
+#   scripts/fdb-tests.sh --demo          # the Dist-4 exit demo (two processes) instead of the tests
 #
 # Adapted from Gumbo's scripts/fdb-tests.sh. Two containers: the foundationdb/foundationdb image as
 # the server, in host networking mode so it advertises 127.0.0.1:4500, and a JDK+Maven image with the
@@ -83,6 +84,17 @@ docker run --rm --platform linux/amd64 --network "container:$SERVER" \
   "$RUNNER_IMAGE" bash -c '
     echo "docker:docker@127.0.0.1:4500" > /tmp/fdb.cluster
     status=0
+    if [ "${1:-}" = "--demo" ]; then
+      # The Dist-4 exit demo, as CI runs it: node A dies (137), then the rest of the cluster.
+      mvn -B --no-transfer-progress -q -pl catalyst-api -am install -DskipTests || exit 1
+      mvn -B --no-transfer-progress -q -pl catalyst-api org.apache.maven.plugins:maven-dependency-plugin:3.6.1:build-classpath -Dmdep.outputFile=target/cp.txt || exit 1
+      CP="catalyst-api/target/classes:$(cat catalyst-api/target/cp.txt)"
+      ROOT="catalyst-demo-$(date +%s)"
+      rc=0; java -cp "$CP" com.cajunsystems.catalyst.api.Demo "$ROOT" distributed-a || rc=$?
+      [ "$rc" -eq 137 ] || { echo "FAIL: node A exited $rc, not 137"; exit 1; }
+      java -cp "$CP" com.cajunsystems.catalyst.api.Demo "$ROOT" distributed-b
+      exit $?
+    fi
     mvn -B --no-transfer-progress -pl catalyst-gumbo,catalyst-api -am -Dsurefire.failIfNoSpecifiedTests=false test "$@" || status=$?
     echo "--- surefire ---"
     grep -h "Tests run" */target/surefire-reports/*FoundationDB*.txt || true

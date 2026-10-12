@@ -31,6 +31,7 @@ import static org.assertj.core.api.Assertions.assertThatThrownBy;
  * {@link SharedLog} between runtimes, so each runtime is a node. A dead node is simulated by writing
  * its lease row directly: nothing renews it, so it lapses when the test clock passes it.
  */
+@org.junit.jupiter.api.Timeout(30) // a lease bug tends to hang (a parked attempt nobody stops), not fail
 class LeaseTest {
 
     private static final Instant T = Instant.parse("2026-01-01T00:00:00Z");
@@ -124,7 +125,7 @@ class LeaseTest {
         }
     }
 
-    /** Every way into a running execution from another node is refused, before writing anything. */
+    /** Every way into a running execution from another node except cancel is refused, before writing anything. */
     @Test
     void anotherNodeIsRefusedWhileTheLeaseIsLive() throws Exception {
         CountDownLatch reached = new CountDownLatch(1);
@@ -141,7 +142,7 @@ class LeaseTest {
                     .isInstanceOfSatisfying(LeaseHeldException.class, e -> assertThat(e.lease().holder()).isEqualTo("node-a"));
             assertThatThrownBy(() -> nodeB.execute(new GatedTask(), ExecutionOptions.withKey("job-1")))
                     .as("a re-submitted key resolves to the running execution").isInstanceOf(LeaseHeldException.class);
-            assertThatThrownBy(() -> nodeB.cancel(id)).isInstanceOf(LeaseHeldException.class);
+            // cancel(id) is forwarded to the owner instead (Dist-4): see CrossNodeTest.
             assertThatThrownBy(() -> nodeB.pause(id)).isInstanceOf(LeaseHeldException.class);
 
             assertThat(log.read(id)).as("nothing written").isEqualTo(before);

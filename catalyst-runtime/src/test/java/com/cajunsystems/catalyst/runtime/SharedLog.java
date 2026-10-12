@@ -44,7 +44,17 @@ final class SharedLog implements EventLog {
         beforeReadLease.accept(id);
         return delegate.readLease(id);
     }
+    private final java.util.Map<ExecutionId, java.util.concurrent.atomic.AtomicInteger> leaseWrites =
+            new java.util.concurrent.ConcurrentHashMap<>();
+
+    /** How many lease compare-and-sets were attempted on {@code id}, won or lost. */
+    int leaseWrites(ExecutionId id) {
+        java.util.concurrent.atomic.AtomicInteger n = leaseWrites.get(id);
+        return n == null ? 0 : n.get();
+    }
+
     @Override public boolean compareAndSetLease(ExecutionId id, Lease expected, Lease replacement) {
+        leaseWrites.computeIfAbsent(id, k -> new java.util.concurrent.atomic.AtomicInteger()).incrementAndGet();
         return delegate.compareAndSetLease(id, expected, replacement);
     }
     @Override public List<SequencedEvent> read(ExecutionId id) { return delegate.read(id); }
@@ -53,5 +63,11 @@ final class SharedLog implements EventLog {
     @Override public boolean supportsExecutionIndex() { return delegate.supportsExecutionIndex(); }
     @Override public Optional<ExecutionId> findByKey(String key) { return delegate.findByKey(key); }
     @Override public void putKey(String key, ExecutionId id) { delegate.putKey(key, id); }
+    /** Runs at the start of every {@link #claimKey}: a test's way to win a key "on another node" first. */
+    volatile java.util.function.Consumer<String> beforeClaimKey = key -> { };
+    @Override public Optional<ExecutionId> claimKey(String key, ExecutionId id) {
+        beforeClaimKey.accept(key);
+        return delegate.claimKey(key, id);
+    }
     @Override public void close() { closed.set(true); }
 }

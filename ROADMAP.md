@@ -368,7 +368,7 @@ The original phasing rationale is in `docs/distribution.md`; **this list is the 
     exactly that).
   - **Left to Dist-4:** the signal side ("re-enqueues it"). A signal on any node already resumes the
     execution, but nothing watches the queue yet.
-- **Dist-4. Claim loop + cross-node control** — each node subscribes to the Deploy-1 queue, claims via
+- ✅ **Dist-4. Claim loop + cross-node control** — each node subscribes to the Deploy-1 queue, claims via
   Dist-3, runs `resume(id)`, and reclaims expired leases. **Control ships in the same item**: today
   `cancel(id)`/`pause(id)` append `ExecutionCancelled`/`ExecutionPaused` directly when the execution
   is not in flight *in this process*, which across nodes is a second writer on a stream another node
@@ -380,6 +380,25 @@ The original phasing rationale is in `docs/distribution.md`; **this list is the 
   runtimes on the Dist-0 CI multi-writer log, one killed mid-run, the other reclaims and finishes with
   zero duplicate model calls, the zombie's late write is rejected by the fence, and a cancel issued
   from the non-owner lands via the owner.
+  *As shipped:*
+  - **Claim loop:** it *polls* the index (`claimInterval`, default 10s) rather than subscribing, since
+    Gumbo's push subscriptions only see the subscribing process's own appends. Each tick is
+    `recoverAll`'s scan. An execution is folded without the lease, and only one a crash could have
+    left is claimed and re-decided under the lease. So parked executions cost no lease writes.
+  - **Signal re-enqueue:** a signalled execution whose node can't run it folds to `RESUMING`, so the
+    loop gives it to a node that can.
+  - **Cancel:** rides **on the lease row**, not a separate KV key. The non-owner adds `cancelRequest`
+    by CAS. The owner's next renewal finds its own row plus a request, keeps the lease, and trips the
+    attempt's cancel locally, so it records `ExecutionCancelled` itself. A takeover carries the
+    request and honours it before running. A release never deletes an unhonoured request on a
+    non-terminal execution; it leaves the row lapsed. The loop records a request orphaned on a parked
+    execution.
+  - **Pause:** of an execution running elsewhere stays refused (`LeaseHeldException`), as pausing a
+    running execution is refused locally.
+  - **Keys:** `EventLog.claimKey` (CAS). A loser resolves to the winner's id. A key whose winner
+    never created the execution is created under that id by whoever holds the lease, fenced at seq 0.
+  - **Exit demo:** `Demo <root> distributed-a` / `distributed-b`, gated in CI's `fdb` job, and run
+    locally with `scripts/fdb-tests.sh --demo`.
 - **Dist-5. Push placement (optional)** — Cajun `ClusterActorSystem` behind `KeyedLock`, replacing
   subscription-plus-claim with assignment. An optimisation only; correctness stays in Dist-1/Dist-3.
 

@@ -536,6 +536,31 @@ jobs:
           mvn -B --no-transfer-progress -pl catalyst-gumbo,catalyst-api -am
           -Dtest='FoundationDB*Test' -Dsurefire.failIfNoSpecifiedTests=false test
 
+      # The Dist-4 exit criterion, across two JVMs on one FoundationDB root: node A records step 1 and
+      # is killed (exit 137); in a second process node B's claim loop takes the job over once A's lease
+      # lapses, with zero duplicate model calls; a stalled node's late write is refused after a takeover;
+      # and a cancel issued on one node lands through the node running the execution.
+      - name: Dist-4 exit demo (kill a node → another takes over; zombie fenced; cross-node cancel)
+        run: |
+          set -uo pipefail
+          mvn -B --no-transfer-progress -q -pl catalyst-api -am install -DskipTests
+          mvn -B --no-transfer-progress -q -pl catalyst-api \
+            org.apache.maven.plugins:maven-dependency-plugin:3.6.1:build-classpath \
+            -Dmdep.outputFile=target/cp.txt
+          CP="catalyst-api/target/classes:$(cat catalyst-api/target/cp.txt)"
+          ROOT="catalyst-demo-${GITHUB_RUN_ID}-${GITHUB_RUN_ATTEMPT}"
+          echo "--- process 1: node A ---"
+          rc=0
+          java -cp "$CP" com.cajunsystems.catalyst.api.Demo "$ROOT" distributed-a || rc=$?
+          if [ "$rc" -ne 137 ]; then echo "FAIL: node A did not simulate kill -9 (exit $rc)"; exit 1; fi
+          echo "--- process 2: the rest of the cluster ---"
+          OUT="$(java -cp "$CP" com.cajunsystems.catalyst.api.Demo "$ROOT" distributed-b)" || { echo "$OUT"; exit 1; }
+          echo "$OUT"
+          echo "$OUT" | grep -q "model calls on node-b: 1 " || { echo "FAIL: the takeover repeated a model call"; exit 1; }
+          echo "$OUT" | grep -q "its late write was refused" || { echo "FAIL: the zombie's write was not refused"; exit 1; }
+          echo "$OUT" | grep -q "cancel from node-b landed via node-x: CANCELLED" || { echo "FAIL: cross-node cancel"; exit 1; }
+          echo "$OUT" | grep -q "Dist-4 exit criterion holds" || exit 1
+
       - name: Confirm nothing was skipped
         run: |
           set -euo pipefail

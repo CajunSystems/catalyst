@@ -22,8 +22,9 @@ It runs embedded in your process. There's no server to operate; the durable log 
 disk. Think *Temporal meets Git, for AI execution*.
 
 > **Status:** pre-1.0, not yet published to a Maven repository; build it from source (below). The
-> single-node runtime is complete and deployable. Multi-node failover is in design. See
-> [ROADMAP.md](ROADMAP.md).
+> single-node runtime is complete and deployable. Multi-node failover on a FoundationDB-backed log
+> works end to end and is new, so treat it as a preview (see [docs/deployment.md](docs/deployment.md)).
+> See [ROADMAP.md](ROADMAP.md).
 
 ---
 

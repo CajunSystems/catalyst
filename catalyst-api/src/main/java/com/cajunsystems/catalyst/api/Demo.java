@@ -115,6 +115,11 @@ public final class Demo {
             Runtime.getRuntime().halt(137);
         } else if (args.length >= 2 && args[1].equals("recover")) {
             recoverDemo(Path.of(args[0]));
+        } else if (args.length >= 2 && args[1].equals("distributed-a")) {
+            DistributedDemo.nodeA(args[0]); // args[0] is a FoundationDB root, not a directory
+        } else if (args.length >= 2 && args[1].equals("distributed-b")) {
+            DistributedDemo.rest(args[0]);
+            System.exit(0); // FoundationDB's network thread outlives the logs
         } else if (args.length >= 1 && args[0].equals("signal")) {
             signalDemo(Files.createTempDirectory("catalyst-signal-"));
         } else if (args.length >= 1 && args[0].equals("shutdown")) {

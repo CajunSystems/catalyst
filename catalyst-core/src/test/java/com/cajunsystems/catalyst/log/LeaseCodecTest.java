@@ -38,4 +38,18 @@ class LeaseCodecTest {
                 .isInstanceOf(IllegalArgumentException.class);
         assertThatThrownBy(() -> new Lease(" ", 1)).isInstanceOf(IllegalArgumentException.class);
     }
+
+    /** Dist-4's cancel request rides on the row; the reason is base64 so it cannot collide with the separator. */
+    @Test
+    void aCancelRequestRoundTripsAndOldRowsStillRead() {
+        Lease plain = new Lease("pod|7", 42);
+        Lease asked = plain.withCancelRequest("stop | now: ünïcode");
+        assertThat(Lease.decode(asked.encode())).isEqualTo(asked);
+        assertThat(asked.cancelRequested()).contains("stop | now: ünïcode");
+        assertThat(asked.holder()).isEqualTo("pod|7");
+        assertThat(asked.expiresAtMillis()).isEqualTo(42);
+        assertThat(new String(plain.encode(), StandardCharsets.UTF_8)).as("unchanged format without a request")
+                .isEqualTo("lease1|42|pod|7");
+        assertThat(asked.encode()).isNotEqualTo(plain.encode());
+    }
 }
