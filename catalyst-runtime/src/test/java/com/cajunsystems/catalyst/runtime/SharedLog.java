@@ -20,6 +20,7 @@ final class SharedLog implements EventLog {
     private final boolean fenced;
     private final boolean multiWriter;
     private final boolean leases;
+    private boolean indexed = true;
     final AtomicBoolean closed = new AtomicBoolean();
     /** Runs at the start of every {@link #readLease}: a test's way to act "on another node" mid-claim. */
     volatile java.util.function.Consumer<ExecutionId> beforeReadLease = id -> { };
@@ -33,6 +34,13 @@ final class SharedLog implements EventLog {
     /** Fenced, multi-writer and lease-storing: what a distributed runtime requires. */
     static SharedLog distributable() {
         return new SharedLog(true, true, true);
+    }
+
+    /** Everything a distributed runtime needs except the execution index. */
+    static SharedLog withoutIndex() {
+        SharedLog log = distributable();
+        log.indexed = false;
+        return log;
     }
 
     @Override public long append(ExecutionId id, CatalystEvent event) { return delegate.append(id, event); }
@@ -60,7 +68,7 @@ final class SharedLog implements EventLog {
     @Override public List<SequencedEvent> read(ExecutionId id) { return delegate.read(id); }
     @Override public long latestSeq(ExecutionId id) { return delegate.latestSeq(id); }
     @Override public List<ExecutionId> openExecutions() { return delegate.openExecutions(); }
-    @Override public boolean supportsExecutionIndex() { return delegate.supportsExecutionIndex(); }
+    @Override public boolean supportsExecutionIndex() { return indexed && delegate.supportsExecutionIndex(); }
     @Override public Optional<ExecutionId> findByKey(String key) { return delegate.findByKey(key); }
     @Override public void putKey(String key, ExecutionId id) { delegate.putKey(key, id); }
     /** Runs at the start of every {@link #claimKey}: a test's way to win a key "on another node" first. */

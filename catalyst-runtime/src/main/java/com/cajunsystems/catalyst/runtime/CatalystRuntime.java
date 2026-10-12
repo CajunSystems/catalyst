@@ -1781,6 +1781,8 @@ public final class CatalystRuntime implements AutoCloseable {
          *       processes are safe at all. A file-backed log is fenced but not multi-writer.</li>
          *   <li>The log reports {@link EventLog#supportsLeases()}, so nodes can tell which of them
          *       is running an execution.</li>
+         *   <li>The log reports {@link EventLog#supportsExecutionIndex()}: the claim loop finds work
+         *       no node holds through it.</li>
          *   <li>A {@link #nodeId(String)} was set. Two nodes left at the default would be
          *       indistinguishable in the log.</li>
          *   <li>{@link #shard} is not set. Sharding is the alternative to sharing a log: each shard
@@ -1898,12 +1900,14 @@ public final class CatalystRuntime implements AutoCloseable {
                 throw e;
             }
             if (distributed && !(resolved.supportsConditionalAppend() && resolved.supportsMultiWriter()
-                    && resolved.supportsLeases())) {
+                    && resolved.supportsLeases() && resolved.supportsExecutionIndex())) {
                 IllegalStateException refused = new IllegalStateException("distributed() needs a log that is"
-                        + " fenced, multi-writer and stores leases; " + resolved.getClass().getSimpleName() + " reports"
+                        + " fenced, multi-writer, stores leases and keeps an execution index (the claim loop"
+                        + " finds work through it); " + resolved.getClass().getSimpleName() + " reports"
                         + " supportsConditionalAppend()=" + resolved.supportsConditionalAppend()
                         + ", supportsMultiWriter()=" + resolved.supportsMultiWriter()
                         + ", supportsLeases()=" + resolved.supportsLeases()
+                        + ", supportsExecutionIndex()=" + resolved.supportsExecutionIndex()
                         + ". Use a multi-writer log such as GumboEventLog.foundationDB(...).");
                 if (log == null) resolved.close(); // the builder opened it, so the builder releases it
                 throw refused;
