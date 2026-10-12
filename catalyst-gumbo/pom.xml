@@ -27,6 +27,12 @@
             <groupId>com.github.CajunSystems</groupId>
             <artifactId>gumbo</artifactId>
         </dependency>
+        <!-- Only GumboEventLog.foundationDB(...) touches it; see the root pom. -->
+        <dependency>
+            <groupId>org.foundationdb</groupId>
+            <artifactId>fdb-java</artifactId>
+            <optional>true</optional>
+        </dependency>
         <dependency>
             <groupId>org.slf4j</groupId>
             <artifactId>slf4j-api</artifactId>

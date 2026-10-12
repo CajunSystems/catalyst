@@ -32,7 +32,9 @@
         <catalyst.version>0.1.0-SNAPSHOT</catalyst.version>
         <jackson.version>2.17.2</jackson.version>
         <slf4j.version>2.0.12</slf4j.version>
-        <gumbo.version>0.6.0</gumbo.version>
+        <gumbo.version>0.7.0</gumbo.version>
+        <!-- Must match the fdb-java Gumbo is built against (its fdb.version), and the CI cluster image. -->
+        <fdb.version>7.3.43</fdb.version>
         <langchain4j.version>1.8.0</langchain4j.version>
         <opentelemetry.version>1.45.0</opentelemetry.version>
         <bytebuddy.version>1.15.11</bytebuddy.version>
@@ -159,6 +161,17 @@
                         <artifactId>logback-classic</artifactId>
                     </exclusion>
                 </exclusions>
+            </dependency>
+
+            <!--
+              FoundationDB client for GumboEventLog.foundationDB(...), the multi-writer log. Optional
+              in Gumbo and in catalyst-gumbo: it carries a native library (libfdb_c) that apps on the
+              file-backed log should not inherit. An app that uses FoundationDB declares it itself.
+            -->
+            <dependency>
+                <groupId>org.foundationdb</groupId>
+                <artifactId>fdb-java</artifactId>
+                <version>${fdb.version}</version>
             </dependency>
 
             <!-- Test -->

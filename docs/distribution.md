@@ -119,7 +119,15 @@ anywhere. Solving the weaker problem is what lets the operational story be this 
 > each, a suggested order, and the tests that would have caught them — is written up separately in
 > [`gumbo-requirements.md`](gumbo-requirements.md).
 
-## Prerequisite: Gumbo is not multi-writer safe today
+## Prerequisite: Gumbo was not multi-writer safe
+
+> **Resolved for FoundationDB** (Gumbo 0.7.0 + Catalyst Dist-0). Gumbo assigns per-tag versions in
+> storage since 0.4.0, measures two writer processes on one FoundationDB root in its CI since 0.7.0,
+> and states that D2 (the clobbered index) does not apply there — the index is written in the
+> entry's own transaction. Catalyst opens that configuration with `GumboEventLog.foundationDB(...)`
+> and races two logs on one root in its own CI (`FoundationDBEventLogTest`,
+> `FoundationDBAcceptanceTest`). The file-backed log stays single-writer by construction: it takes an
+> exclusive directory lock. The measurement below is kept as the record of why this was needed.
 
 This was measured, not assumed. Two JVMs were pointed at one Gumbo directory and each appended three
 events to the same execution:
@@ -379,8 +387,8 @@ Being clear about the limits, since the comparison to BEAM invites them:
 > multi-writer log, a distribution guard, cross-node control shipping with the claim loop — the
 > roadmap wins.
 
-0. **Gumbo multi-writer safety** — cross-process `localId` assignment and a non-clobbering index.
-   Measured above; this is a hard prerequisite and it is Gumbo-side work, not Catalyst work. Until it
+0. ✅ **Gumbo multi-writer safety** — cross-process `localId` assignment and a non-clobbering index.
+   Done on FoundationDB (Gumbo 0.7.0; see above). Measured above; this is a hard prerequisite and it is Gumbo-side work, not Catalyst work. Until it
    lands, two Catalyst nodes on one log corrupt each other's executions, and no amount of care above
    the log prevents it.
 1. **Conditional append**, implemented as a Gumbo primitive and exposed through the `EventLog` SPI.

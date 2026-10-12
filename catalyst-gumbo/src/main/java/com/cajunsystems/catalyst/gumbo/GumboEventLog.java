@@ -21,6 +21,7 @@ import com.cajunsystems.gumbo.persistence.FileBasedPersistenceAdapter;
 import com.cajunsystems.gumbo.persistence.InMemoryPersistenceAdapter;
 import com.cajunsystems.gumbo.persistence.LogAlreadyOpenException;
 import com.cajunsystems.gumbo.persistence.PersistenceAdapter;
+import com.cajunsystems.gumbo.sequencer.Sequencer;
 import com.cajunsystems.gumbo.service.SharedLogConfig;
 import com.cajunsystems.gumbo.service.SharedLogService;
 
@@ -37,6 +38,7 @@ import java.util.ArrayList;
 import java.util.LinkedHashSet;
 import java.util.List;
 import java.util.Map;
+import java.util.Objects;
 import java.util.Optional;
 import java.util.concurrent.ConcurrentHashMap;
 
@@ -67,8 +69,16 @@ public final class GumboEventLog implements EventLog {
     private final SharedLogService service;
     private final EventLogSerializer serializer;
     private final Map<ExecutionId, TypedLogView<CatalystEvent>> views = new ConcurrentHashMap<>();
-    /** Cache of the last seq (Gumbo streamVersion) per execution, so latestSeq is O(1) after an append. */
+    /**
+     * Cache of the last seq (Gumbo streamVersion) per execution, so latestSeq is O(1) after an append.
+     * Advanced only by this process's appends, so it is used only when no other process can write —
+     * see {@link #latestSeq}.
+     */
     private final Map<ExecutionId, Long> lastSeq = new ConcurrentHashMap<>();
+    /** {@link #supportsMultiWriter()}, read once: it is fixed by the adapter and sequencer chosen at open. */
+    private final boolean multiWriter;
+    /** What the log owns besides the service and blob store (a FoundationDB connection); closed between them. */
+    private final AutoCloseable resource;
     private final LogView indexView;
     private final LogView snapshotView;
     private final LogView queueView;
@@ -81,8 +91,10 @@ public final class GumboEventLog implements EventLog {
      */
     private final Map<ExecutionId, Boolean> indexed = new ConcurrentHashMap<>();
 
-    private GumboEventLog(SharedLogService service, EventCodec codec) {
+    private GumboEventLog(SharedLogService service, EventCodec codec, AutoCloseable resource) {
         this.service = service;
+        this.resource = resource;
+        this.multiWriter = service.capabilities().multiWriter();
         this.blobStore = codec.blobStore().orElse(null);
         this.serializer = new EventLogSerializer(codec);
         this.indexView = service.getView(INDEX_TAG);
@@ -128,6 +140,53 @@ public final class GumboEventLog implements EventLog {
                 EventCodec.builder().blobStore(BlobStore.inMemory(), EventCodec.DEFAULT_BLOB_THRESHOLD_BYTES).build());
     }
 
+    /**
+     * Opens (or creates) a <strong>multi-writer</strong> log on a FoundationDB cluster: the one
+     * configuration in which runtimes in different processes may write one log. Gumbo's FoundationDB
+     * storage adapter and its FoundationDB sequencer share one connection under {@code root}, so this
+     * log reports both {@link #supportsConditionalAppend()} and {@link #supportsMultiWriter()} — Gumbo
+     * measures that pairing with two writer processes in its CI (0.7.0+).
+     *
+     * <p>{@code sharedBlobs} is required and must be reachable from every process that opens this
+     * root: an offloaded payload is read back by whichever node resumes the execution, so a store on
+     * one node's local disk would strand it. It is required rather than optional because
+     * FoundationDB refuses a value over 100 KB, so a large completion has to go out of line; payloads
+     * over {@link EventCodec#DEFAULT_BLOB_THRESHOLD_BYTES} are offloaded. The log owns the store and
+     * closes it, as with {@link #at(Path, BlobStore, int)}.
+     *
+     * <p><strong>Fenced, not yet coordinated.</strong> Every runtime append is conditional (Dist-1),
+     * so a second runtime on the same root can never corrupt a stream — a stale writer is refused and
+     * writes nothing. What does not exist yet is the coordination that keeps two runtimes from both
+     * <em>starting</em> the same work: leases and the claim loop (Dist-3, Dist-4). Until then, run one
+     * runtime per root, or give each runtime disjoint executions.
+     *
+     * <p>Needs {@code org.foundationdb:fdb-java} on the classpath (optional in this module) and the
+     * FoundationDB client library ({@code libfdb_c}) installed.
+     *
+     * @param clusterFile path to {@code fdb.cluster}, or {@code null} for FoundationDB's default
+     * @param root        the subspace this log lives under; every process sharing the log uses the same one
+     * @param sharedBlobs a blob store every process opening {@code root} can read
+     */
+    public static GumboEventLog foundationDB(String clusterFile, String root, BlobStore sharedBlobs) {
+        Objects.requireNonNull(sharedBlobs, "sharedBlobs: a FoundationDB log needs a blob store every node can read");
+        return foundationDB(clusterFile, root,
+                EventCodec.builder().blobStore(sharedBlobs, EventCodec.DEFAULT_BLOB_THRESHOLD_BYTES).build());
+    }
+
+    /**
+     * As {@link #foundationDB(String, String, BlobStore)}, with a fully caller-configured codec (blob
+     * store, threshold, upcasters). The codec must have a blob store, for the reason given there; keep
+     * its threshold well under FoundationDB's 100 KB value limit.
+     */
+    public static GumboEventLog foundationDB(String clusterFile, String root, EventCodec codec) {
+        if (root == null || root.isBlank()) throw new IllegalArgumentException("root must be a non-blank subspace name");
+        if (codec.blobStore().isEmpty()) {
+            throw new IllegalArgumentException("A FoundationDB log needs a blob store: FoundationDB refuses values"
+                    + " over 100 KB, so large payloads must be offloaded to a store every node can read");
+        }
+        return FoundationDBLogs.open(clusterFile, root, codec);
+    }
+
     private static EventCodec defaultCodec(Path path) {
         return EventCodec.builder()
                 .blobStore(FileBlobStore.at(path.resolve("blobs")), EventCodec.DEFAULT_BLOB_THRESHOLD_BYTES)
@@ -145,11 +204,19 @@ public final class GumboEventLog implements EventLog {
      * assumes the asking happens.
      */
     static GumboEventLog open(PersistenceAdapter adapter, EventCodec codec) {
+        return open(adapter, null, codec, null);
+    }
+
+    /**
+     * As {@link #open(PersistenceAdapter, EventCodec)}, with a {@code sequencer} ({@code null} for
+     * Gumbo's per-process default) and a {@code resource} the log closes after its service
+     * ({@code null} for none). If opening fails, {@code resource} is the caller's to close.
+     */
+    static GumboEventLog open(PersistenceAdapter adapter, Sequencer sequencer, EventCodec codec, AutoCloseable resource) {
         try {
-            SharedLogConfig config = SharedLogConfig.builder()
-                    .persistenceAdapter(adapter)
-                    .build();
-            return new GumboEventLog(SharedLogService.open(config), codec);
+            SharedLogConfig.Builder config = SharedLogConfig.builder().persistenceAdapter(adapter);
+            if (sequencer != null) config.sequencer(sequencer);
+            return new GumboEventLog(SharedLogService.open(config.build()), codec, resource);
         } catch (LogAlreadyOpenException e) {
             // The file adapter is single-writer and says so precisely. Keep its message at the top
             // level rather than burying it as a cause — a directory already held by another process
@@ -226,7 +293,7 @@ public final class GumboEventLog implements EventLog {
     private boolean wasOpened(ExecutionId executionId) {
         Boolean known = indexed.get(executionId);
         if (known != null) return known;
-        List<LogEntry> stream = viewFor(executionId).rawView().readAll().join();
+        List<LogEntry> stream = viewFor(executionId).rawView().readAfterVersion(-1).join(); // version order: see read
         return !stream.isEmpty()
                 && serializer.deserialize(stream.get(0).dataUnsafe()) instanceof CatalystEvent.ExecutionCreated;
     }
@@ -322,8 +389,8 @@ public final class GumboEventLog implements EventLog {
      * FoundationDB adapter behind it reports {@code false} despite arbitrating every version
      * correctly — the seqnum would still collide, and the adapters index by it.
      *
-     * <p>In practice today: {@code true} only for a FoundationDB-backed log with a distributed
-     * sequencer. {@link #at(Path)} is file-backed and single-writer by construction — it takes an
+     * <p>In practice: {@code true} only for {@link #foundationDB}, which pairs Gumbo's FoundationDB
+     * storage with its FoundationDB sequencer. {@link #at(Path)} is file-backed and single-writer by construction — it takes an
      * exclusive directory lock and refuses a second process — so it fences (see
      * {@link #supportsConditionalAppend()}) without being multi-writer. That pair, fenced and not
      * multi-writer, is exactly what a runtime needs to read before deciding it may distribute.
@@ -333,9 +400,17 @@ public final class GumboEventLog implements EventLog {
         return service.capabilities().multiWriter();
     }
 
+    /**
+     * The whole stream, read <em>by version</em> — never with the tag's {@code readAll()}, which is
+     * keyed and ordered on the global seqnum. With one writer the two orders agree. With two they do
+     * not: a writer claims its seqnum before its transaction and is handed its version inside it, so
+     * the entry at seq 6 can carry a lower seqnum than the one at seq 5, and a seqnum-ordered read
+     * hands the fold events out of order (measured: {@code FoundationDBEventLogTest}). Version-keyed
+     * reads come back in version order on every adapter (Gumbo 0.7.0 contract).
+     */
     @Override
     public List<SequencedEvent> read(ExecutionId executionId) {
-        return decode(executionId, viewFor(executionId).rawView().readAll().join());
+        return readFrom(executionId, -1);
     }
 
     @Override
@@ -460,8 +535,18 @@ public final class GumboEventLog implements EventLog {
         queueView.setValue(OPEN_SET_KEY, bytes.toByteArray()).join();
     }
 
+    /**
+     * The tag's tip. On a single-writer log this is cached: only this process appends, so the cache is
+     * exact. On a multi-writer log it is read through every time — another process's append moves the
+     * tip without passing through this one, and a cached answer would report a stream position that
+     * history has already passed (the same per-process-cache bug Gumbo 0.7.0 removed underneath).
+     */
     @Override
     public long latestSeq(ExecutionId executionId) {
+        if (multiWriter) {
+            long seq = viewFor(executionId).rawView().getLatestVersion();
+            return seq < 0 ? -1 : seq;
+        }
         Long cached = lastSeq.get(executionId);
         if (cached != null) return cached;
         // Cold path (e.g. right after reopen, before any append): ask the tag for its own tip, which
@@ -506,13 +591,22 @@ public final class GumboEventLog implements EventLog {
         snapshotView.setValue(executionId.value(), framed).join();
     }
 
-    /** Closes the log, then the blob store bound into its codec — even if the log's close throws. */
+    /**
+     * Closes the log, then anything else it owns (a FoundationDB connection), then the blob store
+     * bound into its codec — each even if an earlier close throws.
+     */
     @Override
     public void close() {
         try {
             service.close();
         } finally {
-            if (blobStore != null) blobStore.close();
+            try {
+                if (resource != null) resource.close();
+            } catch (Exception e) {
+                throw e instanceof RuntimeException r ? r : new IllegalStateException("Failed to close the log's connection", e);
+            } finally {
+                if (blobStore != null) blobStore.close();
+            }
         }
     }
 }

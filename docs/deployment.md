@@ -209,3 +209,7 @@ Each shard is still a single node. If a shard's node is down, its executions wai
 (on Kubernetes, until its pod is rescheduled with its volume). No other shard can take them over,
 because no other node can open that shard's log. Failover between nodes needs a log that several
 nodes can write safely. That is the Dist track (`docs/distribution.md`), and it is not available yet.
+The log half exists — `GumboEventLog.foundationDB(...)` is a log several nodes can write without
+corrupting a stream — but the coordination half (leases, and a claim loop that hands a dead node's
+work to a live one) does not, so do not point several runtimes at one FoundationDB root in
+production yet.
