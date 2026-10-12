@@ -399,8 +399,12 @@ The original phasing rationale is in `docs/distribution.md`; **this list is the 
     never created the execution is created under that id by whoever holds the lease, fenced at seq 0.
   - **Exit demo:** `Demo <root> distributed-a` / `distributed-b`, gated in CI's `fdb` job, and run
     locally with `scripts/fdb-tests.sh --demo`.
-- **Dist-5. Push placement (optional)** — Cajun `ClusterActorSystem` behind `KeyedLock`, replacing
+- ⏸ **Dist-5. Push placement (optional) — deferred.** Cajun `ClusterActorSystem` behind `KeyedLock`, replacing
   subscription-plus-claim with assignment. An optimisation only; correctness stays in Dist-1/Dist-3.
+  *Deferred (2026-10-12):* Cajun's clustered actor system is still experimental, and nothing
+  depends on push placement. The Dist-4 claim loop already gives correct failover. Revisit when
+  Cajun's clustering is stable **and** there is measured lease contention or claim-latency pain to
+  justify it.
 
 ### Order
 **Deploy-1 → Deploy-6** in label order — the track is *deployable* after Deploy-5, and signals
