@@ -16,6 +16,8 @@ import com.cajunsystems.catalyst.engine.CancellationToken;
 import com.cajunsystems.catalyst.engine.CostModel;
 import com.cajunsystems.catalyst.engine.ExecutionAbandonedSignal;
 import com.cajunsystems.catalyst.engine.ExecutionWaitingSignal;
+import com.cajunsystems.catalyst.engine.StreamCursor;
+import com.cajunsystems.catalyst.log.StaleWriterException;
 import com.cajunsystems.catalyst.engine.ExecutionFailedException;
 import com.cajunsystems.catalyst.engine.ExecutionPausedSignal;
 import com.cajunsystems.catalyst.engine.ExecutionState;
@@ -690,7 +692,8 @@ public final class CatalystRuntime implements AutoCloseable {
                         + " Use a record, enum, string, number, java.time value or UUID.", e);
             }
             requirePayloadType(id, name, state.awaitingSignalType(), decoded);
-            log.append(id, new CatalystEvent.SignalReceived(now(), name, tree));
+            // Fenced on the fold the checks above were made against.
+            StreamCursor.after(log, id, state.lastSeq()).append(new CatalystEvent.SignalReceived(now(), name, tree));
             if (registry.lookup(state.taskType()).isEmpty()) {
                 return new FutureExecutionHandle<>(id, CompletableFuture.failedFuture(new IllegalStateException(
                         "Signal '" + name + "' recorded for " + id + ", but no task is registered for type '"
@@ -758,8 +761,9 @@ public final class CatalystRuntime implements AutoCloseable {
         BranchSpec spec = new BranchSpec(atSeq, parentId.value(), overrides, components);
 
         // The child log begins with the branch marker + started (the fork itself won't re-record it).
-        log.append(childId, new CatalystEvent.ExecutionBranched(now(), parentId.value(), atSeq, components));
-        log.append(childId, new CatalystEvent.ExecutionStarted(now(), 1, nodeId));
+        StreamCursor childCursor = StreamCursor.after(log, childId, -1);
+        childCursor.append(new CatalystEvent.ExecutionBranched(now(), parentId.value(), atSeq, components));
+        childCursor.append(new CatalystEvent.ExecutionStarted(now(), 1, nodeId));
 
         String taskType = parentState.taskType() != null ? parentState.taskType() : task.getClass().getName();
         ExecutionInfo info = new ExecutionInfo(childId, 1, taskType, Map.of());
@@ -768,10 +772,10 @@ public final class CatalystRuntime implements AutoCloseable {
 
         ReplayingContext ctx = new ReplayingContext(childId, log, model, info, vars,
                 eventMapper, payloads, inDoubtPolicy, costModel, ReplayMode.BRANCH, spec, clock, logger,
-                parentEvents, /* appendEnabled */ true);
+                parentEvents, /* appendEnabled */ true, null, childCursor);
         try (AutoCapture.Scope captured = AutoCapture.bind(ctx)) {
             R result = task.execute(ctx);
-            log.append(childId, new CatalystEvent.ExecutionCompleted(now(), payloads.toTree(result)));
+            childCursor.append(new CatalystEvent.ExecutionCompleted(now(), payloads.toTree(result)));
         } catch (ExecutionPausedSignal pause) {
             // ExecutionPaused already recorded by the context (e.g. an ASK in-doubt tool); the child
             // is left PAUSED — do NOT append a spurious ExecutionFailed on top of it.
@@ -780,10 +784,10 @@ public final class CatalystRuntime implements AutoCloseable {
             // Likewise SignalAwaited: the child is left WAITING, not failed.
             throw waiting;
         } catch (RuntimeException e) {
-            log.append(childId, new CatalystEvent.ExecutionFailed(now(), String.valueOf(e), log.latestSeq(childId)));
+            childCursor.append(new CatalystEvent.ExecutionFailed(now(), String.valueOf(e), childCursor.lastSeq()));
             throw e;
         } catch (Exception e) {
-            log.append(childId, new CatalystEvent.ExecutionFailed(now(), String.valueOf(e), log.latestSeq(childId)));
+            childCursor.append(new CatalystEvent.ExecutionFailed(now(), String.valueOf(e), childCursor.lastSeq()));
             throw new RuntimeException("Branch of " + parentId + " failed", e);
         }
 
@@ -815,11 +819,13 @@ public final class CatalystRuntime implements AutoCloseable {
     public void pause(ExecutionId id) {
         requireOwned(id);
         byExecution.withLock(id, () -> {
-            if (inspect(id).isTerminal()) return;  // terminal (incl. just-completed) → no-op
+            ExecutionState state = inspect(id);
+            if (state.isTerminal()) return;  // terminal (incl. just-completed) → no-op
             if (liveAttempt(id) != null) {
                 throw new IllegalStateException("Cannot pause an execution running in this process: " + id);
             }
-            log.append(id, new CatalystEvent.ExecutionPaused(now(), "paused by request"));
+            // Fenced on the fold just read: a writer elsewhere that moved the stream on makes this refuse.
+            StreamCursor.after(log, id, state.lastSeq()).append(new CatalystEvent.ExecutionPaused(now(), "paused by request"));
         });
     }
 
@@ -840,7 +846,8 @@ public final class CatalystRuntime implements AutoCloseable {
     public void cancel(ExecutionId id) {
         requireOwned(id);
         byExecution.withLock(id, () -> {
-            if (inspect(id).isTerminal()) return;  // terminal (incl. just-completed) → no-op
+            ExecutionState state = inspect(id);
+            if (state.isTerminal()) return;  // terminal (incl. just-completed) → no-op
             RunningAttempt attempt = running.get(id);
             if (attempt != null) {
                 // Cooperative: the worker thread — the only writer for a running execution — records the
@@ -850,7 +857,9 @@ public final class CatalystRuntime implements AutoCloseable {
                 if (worker != null) worker.interrupt();
                 return;
             }
-            log.append(id, new CatalystEvent.ExecutionCancelled(now(), "cancelled by request", log.latestSeq(id)));
+            // Fenced on the fold just read, like pause().
+            StreamCursor.after(log, id, state.lastSeq())
+                    .append(new CatalystEvent.ExecutionCancelled(now(), "cancelled by request", state.lastSeq()));
         });
     }
 
@@ -862,7 +871,9 @@ public final class CatalystRuntime implements AutoCloseable {
 
     private void createExecution(ExecutionId id, String taskType, String key, ExecutionOptions opts) {
         String configFingerprint = "replayMode=" + replayMode + ";inDoubt=" + inDoubtPolicy;
-        log.append(id, new CatalystEvent.ExecutionCreated(now(), taskType, argsHash(opts.vars()), configFingerprint, key));
+        // A new stream: fenced at seq 0, so it is created exactly once even if two writers mint the same id.
+        StreamCursor.after(log, id, -1)
+                .append(new CatalystEvent.ExecutionCreated(now(), taskType, argsHash(opts.vars()), configFingerprint, key));
     }
 
     /**
@@ -900,6 +911,12 @@ public final class CatalystRuntime implements AutoCloseable {
                 return;
             }
 
+            // This attempt's position in the stream: one past what it just read, advanced only by its own
+            // appends — lifecycle events here and boundary events in the context alike. Over a log that
+            // can fence, every append is conditioned on it, so another writer that has moved the stream on
+            // makes this attempt's next append fail instead of interleaving with it (Dist-1).
+            StreamCursor cursor = StreamCursor.after(log, id, recorded);
+
             boolean firstIteration = true;
             while (true) {
                 // Re-read + re-fold each iteration: a retry appends RetryRequested + ExecutionResumed,
@@ -917,10 +934,10 @@ public final class CatalystRuntime implements AutoCloseable {
                 }
                 int attempt = state.attempt() + 1;
                 if (firstIteration && mode == Mode.FRESH) {
-                    log.append(id, new CatalystEvent.ExecutionStarted(now(), attempt, nodeId));
+                    cursor.append(new CatalystEvent.ExecutionStarted(now(), attempt, nodeId));
                 } else {
                     // A retry IS a resume: it re-enters the task with the recorded prefix substituted.
-                    log.append(id, new CatalystEvent.ExecutionResumed(now(), attempt));
+                    cursor.append(new CatalystEvent.ExecutionResumed(now(), attempt));
                 }
                 firstIteration = false;
 
@@ -930,12 +947,18 @@ public final class CatalystRuntime implements AutoCloseable {
 
                 ReplayingContext ctx = new ReplayingContext(id, log, defaultModel, info, opts.vars(),
                         eventMapper, payloads, inDoubtPolicy, costModel, replayMode, null, clock, logger,
-                        recorded, /* appendEnabled */ true, runningAttempt.token);
+                        recorded, /* appendEnabled */ true, runningAttempt.token, cursor);
 
                 // The capture scope is per-attempt: a retry re-enters the task from the top, so its
                 // auto-capture counter restarts in step with the recorded prefix it replays.
                 try (AutoCapture.Scope captured = AutoCapture.bind(ctx)) {
                     R result = task.execute(ctx);
+                    // Fenced out mid-task (the task swallowed the rejection): this writer no longer owns the
+                    // stream, so nothing it decides from here may be recorded.
+                    if (cursor.fencedOut() != null) {
+                        future.completeExceptionally(cursor.fencedOut());
+                        return;
+                    }
                     // A task can swallow a stop signal (catch (RuntimeException) around a boundary) and
                     // return normally. That return is not a completion: the result came from the stop,
                     // and the boundary that raised it was never recorded. Honour the stop instead. A
@@ -945,7 +968,7 @@ public final class CatalystRuntime implements AutoCloseable {
                     // pending is a cancel, whichever signal stopped it and in whatever order they came.
                     boolean stopped = ctx.raisedAbandon() || ctx.raisedWaiting();
                     if (ctx.raisedCancellation() || (stopped && runningAttempt.token.isCancelled())) {
-                        recordCancelled(id, runningAttempt.token.reason(), future);
+                        recordCancelled(cursor, runningAttempt.token.reason(), future);
                         return;
                     }
                     if (ctx.raisedAbandon()) {
@@ -953,18 +976,27 @@ public final class CatalystRuntime implements AutoCloseable {
                         return;
                     }
                     if (ctx.raisedWaiting()) {
-                        parkUnlessCancelled(id, future, runningAttempt, ctx.waitingSignal());
+                        parkUnlessCancelled(cursor, future, runningAttempt, ctx.waitingSignal());
                         return;
                     }
-                    log.append(id, new CatalystEvent.ExecutionCompleted(now(), payloads.toTree(result)));
+                    cursor.append(new CatalystEvent.ExecutionCompleted(now(), payloads.toTree(result)));
                     future.complete(result);
                     return;
                 } catch (ExecutionPausedSignal pause) {
                     // ExecutionPaused already recorded by the context; leave the execution paused —
                     // unless a cancel landed meanwhile (see parkUnlessCancelled).
-                    parkUnlessCancelled(id, future, runningAttempt, pause);
+                    parkUnlessCancelled(cursor, future, runningAttempt, pause);
                     return;
                 } catch (Throwable t) {
+                    // Fenced out (Dist-1): another writer has taken this stream over — a resume elsewhere,
+                    // or a newer attempt — and storage refused this one's append. Its own exit, ahead of
+                    // the stop rule and the retry decision: append NOTHING, not even ExecutionFailed, which
+                    // the fence would refuse anyway on a stream this writer no longer owns, and which
+                    // recordFailed would otherwise try to write. The new owner decides what happens next.
+                    if (cursor.fencedOut() != null) {
+                        future.completeExceptionally(cursor.fencedOut());
+                        return;
+                    }
                     // The stop rule — one decision for every ordering of cancel and shutdown:
                     //   1. stopped by a signal (raised here, or unwound by one) with a cancel pending
                     //      → record CANCELLED. Cancel wins, whichever signal actually stopped the task:
@@ -987,7 +1019,7 @@ public final class CatalystRuntime implements AutoCloseable {
                     boolean stoppedByCancel = t instanceof CancellationSignal || ctx.raisedCancellation();
                     boolean stoppedByAbandon = t instanceof ExecutionAbandonedSignal || ctx.raisedAbandon();
                     if (stoppedByCancel || (stoppedByAbandon && runningAttempt.token.isCancelled())) {
-                        recordCancelled(id, runningAttempt.token.reason(), future);
+                        recordCancelled(cursor, runningAttempt.token.reason(), future);
                         return;
                     }
                     if (stoppedByAbandon) {
@@ -999,7 +1031,7 @@ public final class CatalystRuntime implements AutoCloseable {
                     // pending: cancel() saw this attempt still registered as running and only tripped
                     // the token, so parking would leave nobody to record the cancel.
                     if (t instanceof ExecutionWaitingSignal || ctx.raisedWaiting()) {
-                        parkUnlessCancelled(id, future, runningAttempt,
+                        parkUnlessCancelled(cursor, future, runningAttempt,
                                 t instanceof ExecutionWaitingSignal w ? w : ctx.waitingSignal());
                         return;
                     }
@@ -1009,7 +1041,7 @@ public final class CatalystRuntime implements AutoCloseable {
                     Optional<Duration> backoff = isRetryable(t)
                             ? policy.nextBackoff(state.retries(), t) : Optional.empty();
                     if (backoff.isEmpty() || runningAttempt.token.isCancelled()) {
-                        recordFailed(id, t, future);
+                        recordFailed(cursor, t, future);
                         return;
                     }
                     long backoffMillis = Math.max(0, backoff.get().toMillis());
@@ -1018,18 +1050,22 @@ public final class CatalystRuntime implements AutoCloseable {
                         // substituting its recorded failure; -1 when the failure is not one (see
                         // ReplayingContext.failedBoundarySeq). Appended BEFORE the sleep so a crash mid-
                         // backoff preserves the budget; ExecutionResumed follows atop the next iteration.
-                        log.append(id, new CatalystEvent.RetryRequested(
+                        cursor.append(new CatalystEvent.RetryRequested(
                                 now(), String.valueOf(t), backoffMillis, ctx.failedBoundarySeq(t)));
                     } catch (RuntimeException appendFailed) {
+                        if (cursor.fencedOut() != null) {
+                            future.completeExceptionally(cursor.fencedOut());
+                            return;
+                        }
                         // Cannot durably record the retry → do not retry; fail with the original cause.
-                        recordFailed(id, t, future);
+                        recordFailed(cursor, t, future);
                         return;
                     }
                     if (!sleepUnlessStopped(backoffMillis, runningAttempt.token)) {
                         // RetryRequested is already durable, so an abandoned backoff resumes — with its
                         // retry budget intact — on the next start.
                         if (runningAttempt.token.isCancelled()) {
-                            recordCancelled(id, runningAttempt.token.reason(), future);
+                            recordCancelled(cursor, runningAttempt.token.reason(), future);
                         } else {
                             abandon(id, future);
                         }
@@ -1075,9 +1111,12 @@ public final class CatalystRuntime implements AutoCloseable {
     }
 
     /** Best-effort {@code ExecutionFailed} append (terminal), then completes the future with the cause. */
-    private <R> void recordFailed(ExecutionId id, Throwable t, CompletableFuture<R> future) {
+    private <R> void recordFailed(StreamCursor cursor, Throwable t, CompletableFuture<R> future) {
         try {
-            log.append(id, new CatalystEvent.ExecutionFailed(now(), String.valueOf(t), log.latestSeq(id)));
+            cursor.append(new CatalystEvent.ExecutionFailed(now(), String.valueOf(t), cursor.lastSeq()));
+        } catch (StaleWriterException fencedOut) {
+            future.completeExceptionally(fencedOut); // not this writer's stream any more: record nothing
+            return;
         } catch (RuntimeException ignored) {
             // best-effort failure record; the future still completes exceptionally below
         }
@@ -1096,11 +1135,11 @@ public final class CatalystRuntime implements AutoCloseable {
      * nothing would ever record the cancel. Now it lands either before (seen here, recorded) or after
      * (the attempt is gone, so {@code cancel()} appends {@code ExecutionCancelled} itself).
      */
-    private <R> void parkUnlessCancelled(ExecutionId id, CompletableFuture<R> future,
+    private <R> void parkUnlessCancelled(StreamCursor cursor, CompletableFuture<R> future,
                                          RunningAttempt attempt, RuntimeException parked) {
-        byExecution.withLock(id, () -> {
+        byExecution.withLock(cursor.executionId(), () -> {
             if (attempt.token.isCancelled()) {
-                recordCancelled(id, attempt.token.reason(), future);
+                recordCancelled(cursor, attempt.token.reason(), future);
             } else {
                 future.completeExceptionally(parked);
             }
@@ -1117,9 +1156,12 @@ public final class CatalystRuntime implements AutoCloseable {
     }
 
     /** Best-effort {@code ExecutionCancelled} append (terminal), then completes with CancellationException. */
-    private <R> void recordCancelled(ExecutionId id, String reason, CompletableFuture<R> future) {
+    private <R> void recordCancelled(StreamCursor cursor, String reason, CompletableFuture<R> future) {
         try {
-            log.append(id, new CatalystEvent.ExecutionCancelled(now(), reason, log.latestSeq(id)));
+            cursor.append(new CatalystEvent.ExecutionCancelled(now(), reason, cursor.lastSeq()));
+        } catch (StaleWriterException fencedOut) {
+            future.completeExceptionally(fencedOut); // not this writer's stream any more: record nothing
+            return;
         } catch (RuntimeException ignored) {
             // best-effort cancellation record; the future still completes exceptionally below
         }

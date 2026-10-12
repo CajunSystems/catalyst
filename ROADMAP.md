@@ -290,7 +290,7 @@ The original phasing rationale is in `docs/distribution.md`; **this list is the 
   a storage-side sequencer) so Dist-4's exit demo can be gated without FDB in CI. `supportsMultiWriter()`
   is only trusted once Gumbo reports it from a measured configuration — asserting it early is the D4
   mistake again.
-- **Dist-1. Fenced runtime writes** — the runtime appends through `append(id, event, expectedSeq)`
+- ✅ **Dist-1. Fenced runtime writes** — the runtime appends through `append(id, event, expectedSeq)`
   when the log supports it. **Precondition: Gumbo A6 resolved as primary-tag fencing.** Deploy-1 and
   Deploy-6 make Catalyst's lifecycle appends multi-tag (execution tag + queue tag), so the fenced
   appends *are* multi-tag appends, and A6 still leaves open what `expectedVersion` means across N
@@ -300,6 +300,11 @@ The original phasing rationale is in `docs/distribution.md`; **this list is the 
   future exceptionally with it, remove from `inFlight`, append nothing. It must **not** route through
   `isRetryable` → `recordFailed`, which appends `ExecutionFailed` — a write the fence would reject,
   on a stream this writer no longer owns. Meaningful single-node.
+  *As shipped:* the A6 precondition was met by Gumbo 0.6.0 (a multi-tag conditional append names its
+  fenced tag; stated and tested in Gumbo's `ConditionalAppendTest`). Every runtime append goes through a
+  `StreamCursor` whose expectation is one past what that writer **read** — never the log's tip at write
+  time, which would let a writer fence on history it never saw. A rejection fences the cursor out for
+  good, and the attempt exits ahead of the stop rule and the retry decision, appending nothing.
 - **Dist-2. Distribution guard** — distributed mode refuses to start unless the log reports **both**
   `supportsConditionalAppend()` and `supportsMultiWriter()`.
 - **Dist-3. Leases** — lease row per execution via the tag KV's CAS (gumbo 0.4.0+): claim, heartbeat,

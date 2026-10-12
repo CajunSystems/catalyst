@@ -16,7 +16,8 @@ This document records them, with the evidence for each.
 > | D4 | closed on the Catalyst side by adopting `readAfterVersion` (0.3.0 only *added* it) |
 > | A3 | Gumbo 0.4.0 |
 > | A4 | Gumbo 0.5.0 |
-> | D2, A6 | open |
+> | A6 — the `expectedVersion` rule | Gumbo 0.6.0: a multi-tag conditional append must **name** the fenced tag, and the fence and reported version follow it (`ConditionalAppendTest`); adopted by Catalyst's `appendFenced` and the Dist-1 runtime writes |
+> | D2; A6's `appendAtomically` convenience | open (blocks nothing) |
 > | Multi-tag entries carry one version | Gumbo 0.6.0, adopted |
 >
 > The D4 verification is in `GumboEventLogTest` (a tail read with a second execution in the log, on

@@ -186,8 +186,9 @@ checkout's pom to `com.github.CajunSystems` before installing.
   log that ignored `expectedSeq` would look like it was fencing while fencing nothing. `GumboEventLog`
   delegates to Gumbo's storage-side fence (Catalyst's `seq` *is* the tag's `streamVersion`, so no
   translation); the conflict arrives wrapped in `LogWriteException` inside `CompletionException`, so
-  it is matched on the whole cause chain, not the top type. Not yet used by the runtime — the
-  in-process invariant is still `KeyedLock` + `inFlight`; this is the seam a claim loop writes to.
+  it is matched on the whole cause chain, not the top type. **The runtime writes through it (Dist-1)**
+  — see below; `KeyedLock` + `inFlight` remain the in-process invariant, the fence is what holds across
+  writers.
   Both capability answers **delegate** to Gumbo's `capabilities()` (0.5.0+) rather than asserting:
   `supportsConditionalAppend()` and `supportsMultiWriter()`. Read them as a **pair** — a
   file-backed log is fenced (compare and append under its own monitor) and *not* multi-writer, and
@@ -320,6 +321,22 @@ checkout's pom to `com.github.CajunSystems` before installing.
   `payloadType`; `ExecutionState.awaitingSignalType()`). A recorded signal is substituted into every
   resume, so a bad one is terminal on an append-only log. `signal(id, name, payload, opts)` for tasks
   that read vars.
+
+- **Fenced runtime writes (Dist-1)** — `FencedWritesTest` (runtime: two runtimes over one log = two
+  writers) + `FencedWritesAcceptanceTest` (the same over a real Gumbo log: storage refuses the zombie).
+  Every runtime append goes through a `StreamCursor`: conditional when the log can fence, plain
+  otherwise. **The expectation is one past what that writer *read*** (`StreamCursor.after(log, id,
+  recorded)`), advanced only by its own appends — never the log's tip at write time, which would let a
+  writer that read seq 10 fence on 11 and write on top of history it never saw. One cursor per attempt,
+  shared by `runAttempt`'s lifecycle appends and its `ReplayingContext` (new 17-arg constructor; the old
+  ones derive a cursor from `recorded`), and kept across retry iterations so a foreign write between
+  retries fails the next `ExecutionResumed`. A `StaleWriterException` **fences the cursor out for good**
+  (every later append refused without asking the log), and `runAttempt` exits on `cursor.fencedOut()`
+  **first** — on both exits, ahead of the stop rule and the retry decision — appending nothing;
+  `recordFailed`/`recordCancelled` write through the cursor so a zombie's "best-effort" record is
+  refused too. One-shot appends fence on the fold just read under the id lock: create at 0, `pause`,
+  `cancel`, `signal`; branch children get their own cursor from -1. Mutation-checked: with the cursor
+  forced unfenced, the zombie tests fail.
 
 - **In-doubt model completions** — `ReplayingContextInDoubtCompletionTest`: a `CompletionRequested`
   with no `CompletionReceived` is a provider call that may have been accepted and *billed*, so it
