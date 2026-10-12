@@ -435,6 +435,39 @@ class ShutdownTest {
         assertThat(log.openExecutions()).doesNotContain(handle.id());
     }
 
+    /**
+     * close() from one task must not close the log under another task that is mid-call. Uses a log
+     * that refuses writes once closed — an in-memory log's no-op close() would hide exactly this.
+     * Task B is inside step 1's model call when task A closes the runtime; B's result must still be
+     * recorded (no dangling request to be in doubt about on restart), and A's own completion too.
+     */
+    @Test
+    void closeFromATaskThreadStillDrainsEveryAttempt() throws Exception {
+        CloseableLog log = new CloseableLog();
+        AtomicReference<CatalystRuntime> current = new AtomicReference<>();
+        CountDownLatch bInCall = new CountDownLatch(1);
+        MockModel model = model(() -> {
+            bInCall.countDown();
+            while (!current.get().isShuttingDown()) Thread.onSpinWait();
+        });
+        CatalystRuntime runtime = CatalystRuntime.builder()
+                .log(log).model(model).drainTimeout(Duration.ofSeconds(10)).build();
+        current.set(runtime);
+        ExecutionHandle<String> b = runtime.execute(new TwoStepTask());
+        assertThat(bInCall.await(5, TimeUnit.SECONDS)).isTrue();
+        ExecutionHandle<String> a = runtime.execute(ctx -> { current.get().close(); return "closed it"; });
+
+        assertThat(a.result(Duration.ofSeconds(10))).isEqualTo("closed it");
+        assertThatThrownBy(b::result).isInstanceOf(ExecutionAbandonedSignal.class);
+        waitFor(() -> log.closed);
+
+        assertThat(fold(log.delegate, a.id()).status()).as("A's completion was recorded").isEqualTo(Status.COMPLETED);
+        assertThat(log.delegate.read(b.id()).getLast().event())
+                .as("B's in-flight call finished and recorded before the log closed")
+                .isInstanceOf(CatalystEvent.CompletionReceived.class);
+        assertThat(fold(log.delegate, b.id()).status()).isEqualTo(Status.RUNNING);
+    }
+
     /** Fails its effect on the first attempt only. */
     static final class FlakyTask implements Task<String> {
         private final AtomicInteger attempts;

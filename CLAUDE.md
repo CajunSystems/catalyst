@@ -262,7 +262,10 @@ checkout's pom to `com.github.CajunSystems` before installing.
   interrupt. `close()` refuses new work (`requireOpen`, plus `RejectedExecutionException` handling for
   the race), waits `drainTimeout` (default 10s), then closes the log (releasing the Gumbo dir lock);
   idempotent **and a barrier** (a concurrent second `close()` waits on a latch until the log is closed).
-  From a task thread of the same runtime it skips the drain wait (it would wait on itself). If
+  From a task thread of the same runtime it can't wait (the drain includes the caller), so it hands
+  the drain + `log.close()` to another thread and returns — every attempt still gets the full drain.
+  Test such paths with a log that refuses writes after close; `InMemoryEventLog.close()` is a no-op
+  and hides log-closed-too-early bugs. If
   `close()` lands after `execute` recorded `ExecutionCreated`, `scheduleAttempt` returns a *failed
   handle* (never throws) — the same result as the `RejectedExecutionException` race.
   `isShuttingDown()` for readiness probes. **Swallowed stop signals:** both signals are

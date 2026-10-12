@@ -981,9 +981,10 @@ public final class CatalystRuntime implements AutoCloseable {
      * in-doubt request.
      *
      * <p>Idempotent, and a barrier: a concurrent second call returns only once the first has closed
-     * the log. Called from one of this runtime's own task threads, it does not wait for the drain
-     * (the caller would be waiting on itself); the calling task is abandoned at its next boundary
-     * like the rest.
+     * the log. Called from one of this runtime's own task threads, it cannot wait — the drain includes
+     * the caller, which would be waiting on itself — so it hands the drain and the log close to
+     * another thread and returns. Every attempt, the caller included, still gets the full drain: the
+     * log is not closed under a task that is mid-call, which would leave its request in doubt.
      */
     @Override
     public void close() {
@@ -991,12 +992,19 @@ public final class CatalystRuntime implements AutoCloseable {
             awaitFirstClose();
             return;
         }
+        closing = true;
+        executor.shutdown();
+        if (calledFromTaskThread()) {
+            Thread.ofVirtual().name("catalyst-close").start(this::drainAndCloseLog);
+            return;
+        }
+        drainAndCloseLog();
+    }
+
+    /** Waits up to the drain timeout for running attempts, then closes the log and releases waiters. */
+    private void drainAndCloseLog() {
         try {
-            closing = true;
-            executor.shutdown();
-            if (calledFromTaskThread()) {
-                LOG.warn("close() called from a task thread of this runtime; not waiting for the drain");
-            } else if (!awaitDrain()) {
+            if (!awaitDrain()) {
                 List<String> sample = running.keySet().stream()
                         .limit(DRAIN_WARNING_SAMPLE).map(ExecutionId::value).toList();
                 LOG.warn("Shutdown drain timed out after {} with {} attempt(s) still running (e.g. {}); closing"
