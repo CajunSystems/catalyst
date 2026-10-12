@@ -266,7 +266,7 @@ Labels follow the build order (see *Order* below).
   other routing lets a same-key re-submission land on a second shard and duplicate model calls.
   Sharded deployments therefore require a key on submit, and the owning node stamps its shard into
   the `ExecutionId` so later id-addressed calls (`inspect`/`resume`/`cancel`) route without a lookup.
-- **Deploy-6. Signals / `WAITING`** (from v1, pulled forward) — `await`/signal on `Context`, activating
+- ✅ **Deploy-6. Signals / `WAITING`** (from v1, pulled forward) — `await`/signal on `Context`, activating
   the reserved slot. Human-in-the-loop is what single-node users want most, and it does not need
   leases: re-enqueue on signal is a dual-tagged signal event into the Deploy-1 queue. The signal
   event **folds `WAITING` → `RESUMING`** — it is a state change, not just a wake-up — so a crash
@@ -274,6 +274,11 @@ Labels follow the build order (see *Order* below).
   than a `WAITING` one with an unconsumed signal that nothing would ever re-enqueue. `Demo recover`
   gains that case: a waiting execution is signalled, the process crashes, and it finishes after
   restart. The lease interaction (a waiting execution releases its lease) is specified with Dist-3.
+  *As shipped:* `ctx.awaitSignal(name, type)` / `runtime.signal(id, name, payload)`, events
+  `SignalAwaited` / `SignalReceived`. Deliberate limits: a signal is accepted only while the execution
+  is `WAITING` for it (no buffering, so nothing appends to a running stream from outside); waits have
+  no timeout yet; the signal is **not** yet dual-tagged into the queue — nothing consumes the queue as
+  a work feed until the Dist-4 claim loop, which adds it then.
 
 ### Dist — distributed execution
 The original phasing rationale is in `docs/distribution.md`; **this list is the sequencing of record.**

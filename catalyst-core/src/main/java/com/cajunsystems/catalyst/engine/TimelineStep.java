@@ -21,6 +21,8 @@ public record TimelineStep(long seq, Kind kind, String label, Instant at, long l
         STARTED,
         RESUMED,
         PAUSED,
+        WAITING,
+        SIGNALLED,
         PROMPT,
         MODEL,
         TOOL,

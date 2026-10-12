@@ -89,6 +89,19 @@ public final class Demo {
         }
     }
 
+    /** A reviewer's decision, delivered to a waiting execution as a signal. */
+    record Approval(String reviewer, boolean approved) {}
+
+    /** Drafts with the model, waits for a human reviewer (a signal), then finishes — or stops if rejected. */
+    static final class ReviewedTask implements Task<String> {
+        @Override public String execute(Context ctx) {
+            String draft = ctx.model().complete(STEP1).message();
+            Approval approval = ctx.awaitSignal("approval", Approval.class);
+            if (!approval.approved()) return "REJECTED by " + approval.reviewer();
+            return draft + "|" + ctx.model().complete(STEP2).message() + " (approved by " + approval.reviewer() + ")";
+        }
+    }
+
     public static void main(String[] args) throws Exception {
         if (args.length >= 2 && args[1].equals("record")) {
             record(Path.of(args[0]));
@@ -102,6 +115,8 @@ public final class Demo {
             Runtime.getRuntime().halt(137);
         } else if (args.length >= 2 && args[1].equals("recover")) {
             recoverDemo(Path.of(args[0]));
+        } else if (args.length >= 1 && args[0].equals("signal")) {
+            signalDemo(Files.createTempDirectory("catalyst-signal-"));
         } else if (args.length >= 1 && args[0].equals("shutdown")) {
             shutdownDemo(Files.createTempDirectory("catalyst-shutdown-"));
         } else if (args.length >= 1 && args[0].equals("recover")) {
@@ -642,8 +657,34 @@ public final class Demo {
             log.append(retired, new CatalystEvent.ExecutionCreated(Instant.now(), "com.example.RetiredTask", "h", "cfg", ""));
             log.append(retired, new CatalystEvent.ExecutionStarted(Instant.now(), 1, "node-0"));
 
-            System.out.println("[crash] recorded 3 in-flight + 1 paused + 1 completed + 1 retired-type executions"
-                    + " (model calls this run: " + model.callCount() + ")");
+            // Deploy-6: one execution parked waiting for its reviewer, and one whose signal was recorded
+            // just before the crash — signal() appends SignalReceived, then resumes; the process died
+            // between the two.
+            recordWaitingForApproval(log, model);
+            ExecutionId signalled = recordWaitingForApproval(log, model);
+            log.append(signalled, new CatalystEvent.SignalReceived(Instant.now(), "approval",
+                    new PayloadCodec().toTree(new Approval("dana", true))));
+
+            System.out.println("[crash] recorded 3 in-flight + 1 paused + 1 completed + 1 retired-type + 1 waiting"
+                    + " + 1 signalled executions (model calls this run: " + model.callCount() + ")");
+        }
+    }
+
+    /** Records {@link ReviewedTask} up to its wait for approval, as a live attempt would. */
+    private static ExecutionId recordWaitingForApproval(GumboEventLog log, MockModel model) {
+        ExecutionId id = ExecutionId.random();
+        String taskType = ReviewedTask.class.getName();
+        log.append(id, new CatalystEvent.ExecutionCreated(Instant.now(), taskType, "h", "cfg", ""));
+        log.append(id, new CatalystEvent.ExecutionStarted(Instant.now(), 1, "node-0"));
+        ReplayingContext ctx = new ReplayingContext(id, log, model, new ExecutionInfo(id, 1, taskType, Map.of()),
+                Map.of(), EventJson.shared(), new PayloadCodec(), InDoubtPolicy.FAIL, CostModel.free(),
+                com.cajunsystems.catalyst.ReplayMode.STRICT, null,
+                Clock.systemUTC(), LoggerFactory.getLogger("demo.recover"), log.read(id), true);
+        try {
+            new ReviewedTask().execute(ctx);
+            throw new AssertionError("expected the task to park on its signal");
+        } catch (com.cajunsystems.catalyst.engine.ExecutionWaitingSignal parked) {
+            return id; // SignalAwaited recorded; the execution is WAITING
         }
     }
 
@@ -678,6 +719,7 @@ public final class Demo {
                 .log(GumboEventLog.at(dir))
                 .model(model)
                 .task(new TwoStepTask())
+                .task(new ReviewedTask())
                 .recoverOnStart(true)
                 .build()) {
 
@@ -686,7 +728,9 @@ public final class Demo {
                 Object result = entry.getValue().result();
                 System.out.println("[recover] resumed " + entry.getKey().value() + " -> "
                         + runtime.inspect(entry.getKey()).status() + " result: " + result);
-                if (!"SUMMARY|FINAL".equals(result)) throw new AssertionError("unexpected result " + result);
+                if (!"SUMMARY|FINAL".equals(result) && !"SUMMARY|FINAL (approved by dana)".equals(result)) {
+                    throw new AssertionError("unexpected result " + result);
+                }
             }
             report.leftAlone().forEach((id, status) -> System.out.println("[recover] left alone "
                     + id.value() + " (" + status + ") -> still " + runtime.inspect(id).status()));
@@ -699,17 +743,59 @@ public final class Demo {
             System.out.println("[recover] model calls THIS run: " + model.callCount()
                     + " (every step 1 was substituted from the log; only the step 2s ran live)");
 
-            if (report.resumed().size() != 3) throw new AssertionError("expected 3 resumed, got " + report);
-            if (model.callCount() != 3) throw new AssertionError("expected 3 model calls, got " + model.callCount());
-            if (!java.util.List.copyOf(report.leftAlone().values()).equals(java.util.List.of(Status.PAUSED))) {
-                throw new AssertionError("expected exactly one PAUSED left alone, got " + report.leftAlone());
+            // 3 in-flight two-step tasks + the signalled review; the paused and the waiting one stay put.
+            if (report.resumed().size() != 4) throw new AssertionError("expected 4 resumed, got " + report);
+            if (model.callCount() != 4) throw new AssertionError("expected 4 model calls, got " + model.callCount());
+            if (!new java.util.HashSet<>(report.leftAlone().values()).equals(java.util.Set.of(Status.PAUSED, Status.WAITING))
+                    || report.leftAlone().size() != 2) {
+                throw new AssertionError("expected one PAUSED and one WAITING left alone, got " + report.leftAlone());
             }
-            for (ExecutionId id : report.leftAlone().keySet()) {
-                if (runtime.inspect(id).status() != Status.PAUSED) throw new AssertionError("recovery un-paused " + id);
+            for (var entry : report.leftAlone().entrySet()) {
+                if (runtime.inspect(entry.getKey()).status() != entry.getValue()) {
+                    throw new AssertionError("recovery changed " + entry.getKey() + " from " + entry.getValue());
+                }
             }
             if (report.notRecovered().size() != 1) throw new AssertionError("expected 1 not recovered, got " + report);
             System.out.println("[recover] startup-recovery criterion holds: in-flight work finished with zero"
-                    + " duplicate model calls; the paused execution stayed paused.");
+                    + " duplicate model calls; the paused execution stayed paused; the waiting one is still"
+                    + " waiting; the one signalled just before the crash finished.");
+        }
+    }
+
+    /**
+     * Deploy-6: human-in-the-loop. A task drafts with the model and then waits for a reviewer's
+     * approval — {@code ctx.awaitSignal} — parking in {@code WAITING} with no thread held. The process
+     * then exits. A second runtime on the same log delivers the approval with {@code runtime.signal},
+     * which resumes the task: the draft is substituted, and only the final step calls the model.
+     */
+    private static void signalDemo(Path dir) {
+        ExecutionId id;
+        MockModel firstModel = summarizerModel();
+        try (CatalystRuntime runtime = Catalyst.builder(dir).model(firstModel).task(new ReviewedTask()).build()) {
+            ExecutionHandle<String> handle = runtime.execute(new ReviewedTask(), ExecutionOptions.withKey("incident-7"));
+            id = handle.id();
+            try {
+                handle.result();
+                throw new AssertionError("expected the task to wait for approval");
+            } catch (com.cajunsystems.catalyst.engine.ExecutionWaitingSignal waiting) {
+                System.out.println("[signal] " + id.value() + " is " + runtime.inspect(id).status()
+                        + ", waiting for '" + waiting.signalName() + "' (model calls so far: " + firstModel.callCount() + ")");
+            }
+        }
+        System.out.println("[signal] the process exits while the execution waits; no thread is held");
+
+        MockModel model = summarizerModel();
+        try (CatalystRuntime runtime = Catalyst.builder(dir).model(model).task(new ReviewedTask()).build()) {
+            System.out.println("[signal] after restart: " + runtime.inspect(id).status()
+                    + ", awaiting " + runtime.inspect(id).awaitingSignal().orElse("?"));
+            Object result = runtime.signal(id, "approval", new Approval("dana", true)).result();
+            System.out.println("[signal] approved by dana -> " + runtime.inspect(id).status() + " result: " + result);
+            System.out.println("[signal] model calls THIS run: " + model.callCount()
+                    + " (the draft was substituted from the log; only the final step ran live)");
+            if (!"SUMMARY|FINAL (approved by dana)".equals(result)) throw new AssertionError("unexpected result " + result);
+            if (model.callCount() != 1) throw new AssertionError("expected 1 model call, got " + model.callCount());
+            System.out.println("[signal] human-in-the-loop criterion holds: waited with no thread, resumed by a"
+                    + " signal after a restart, zero duplicate model calls.");
         }
     }
 

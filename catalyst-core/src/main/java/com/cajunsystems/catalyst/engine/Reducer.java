@@ -72,6 +72,14 @@ public final class Reducer {
                     status = Status.PAUSED;
                     timeline.add(new TimelineStep(se.seq(), TimelineStep.Kind.PAUSED, p.reason(), p.at(), 0, null));
                 }
+                case SignalAwaited sa -> {
+                    status = Status.WAITING;
+                    timeline.add(new TimelineStep(se.seq(), TimelineStep.Kind.WAITING, sa.name(), sa.at(), 0, null));
+                }
+                case SignalReceived sr -> {
+                    status = Status.RESUMING;
+                    timeline.add(new TimelineStep(se.seq(), TimelineStep.Kind.SIGNALLED, sr.name(), sr.at(), 0, sr.payload()));
+                }
                 case PromptBuilt p ->
                         timeline.add(new TimelineStep(se.seq(), TimelineStep.Kind.PROMPT, p.promptHash(), p.at(), 0, p.prompt()));
                 case CompletionRequested cr -> { /* marker; folded together with CompletionReceived */ }

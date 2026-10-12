@@ -15,6 +15,7 @@ import com.cajunsystems.catalyst.engine.CancellationSignal;
 import com.cajunsystems.catalyst.engine.CancellationToken;
 import com.cajunsystems.catalyst.engine.CostModel;
 import com.cajunsystems.catalyst.engine.ExecutionAbandonedSignal;
+import com.cajunsystems.catalyst.engine.ExecutionWaitingSignal;
 import com.cajunsystems.catalyst.engine.ExecutionFailedException;
 import com.cajunsystems.catalyst.engine.ExecutionPausedSignal;
 import com.cajunsystems.catalyst.engine.ExecutionState;
@@ -225,7 +226,9 @@ public final class CatalystRuntime implements AutoCloseable {
                 if (live != null) {
                     return new FutureExecutionHandle<>(id, CatalystRuntime.<R>cast(live));
                 }
-                Mode mode = foldState(id).isTerminal() ? Mode.REPLAY_TERMINAL : Mode.RESUME;
+                ExecutionState state = foldState(id);
+                if (state.status() == Status.WAITING) return waitingHandle(id, state);
+                Mode mode = state.isTerminal() ? Mode.REPLAY_TERMINAL : Mode.RESUME;
                 return scheduleAttempt(task, id, taskType, opts, mode);
             });
         });
@@ -452,6 +455,8 @@ public final class CatalystRuntime implements AutoCloseable {
                 eventMapper, payloads, inDoubtPolicy, costModel, replayMode, null, clock, logger, recorded, /* appendEnabled */ false);
         try (AutoCapture.Scope captured = AutoCapture.bind(ctx)) {
             task.execute(ctx);
+        } catch (ExecutionWaitingSignal stillWaiting) {
+            // The recording ends at a wait with no signal yet: the replay reached the end of the log.
         } catch (RuntimeException e) {
             throw e; // includes NonDeterministicReplayException
         } catch (Exception e) {
@@ -509,6 +514,9 @@ public final class CatalystRuntime implements AutoCloseable {
             if (state.isTerminal()) {
                 return scheduleAttempt(TERMINAL_REPLAY_TASK, id, taskType, opts, Mode.REPLAY_TERMINAL);
             }
+            // Still waiting for a signal: an attempt would only replay to the wait and park again, and
+            // its ExecutionResumed would fold the status to RUNNING while it is really waiting.
+            if (state.status() == Status.WAITING) return waitingHandle(id, state);
 
             TaskFactory factory = registry.lookup(taskType).orElseThrow(() -> new IllegalStateException(
                     "No task registered for type '" + taskType + "' to resume " + id
@@ -607,6 +615,57 @@ public final class CatalystRuntime implements AutoCloseable {
     };
 
     /**
+     * Delivers signal {@code name} to an execution waiting for it ({@code ctx.awaitSignal}) and
+     * resumes it. The payload is recorded as the result of the await boundary, so it is substituted on
+     * every later resume or replay.
+     *
+     * <p>Accepted only while the execution is {@code WAITING} for exactly this signal. Delivery to a
+     * running execution is refused rather than buffered: nothing may append to a running stream except
+     * its own worker. A task that has not reached its wait yet is not waiting; retry once it is
+     * ({@code inspect(id).awaitingSignal()}).
+     *
+     * <p>Recording the signal folds the execution to {@code RESUMING}. It is then resumed here if its
+     * task type is registered; if the process dies first, startup recovery resumes it. If the type is
+     * not registered, the signal is still recorded and the returned handle fails — resume it by
+     * re-submitting the task with its idempotency key.
+     *
+     * @return the resumed execution's handle
+     * @throws IllegalStateException if the execution is not waiting for {@code name}
+     */
+    public ExecutionHandle<?> signal(ExecutionId id, String name, Object payload) {
+        requireOpen();
+        requireOwned(id);
+        java.util.Objects.requireNonNull(name, "name");
+        return byExecution.withLock(id, () -> {
+            if (inFlight.containsKey(id)) {
+                throw new IllegalStateException("Execution " + id + " is running, not waiting for signal '" + name + "'");
+            }
+            ExecutionState state = foldState(id);
+            Optional<String> waitingFor = state.awaitingSignal();
+            if (waitingFor.isEmpty() || !waitingFor.get().equals(name)) {
+                throw new IllegalStateException("Execution " + id + " is " + state.status()
+                        + (waitingFor.map(w -> " waiting for signal '" + w + "'").orElse(""))
+                        + ", not waiting for signal '" + name + "'");
+            }
+            log.append(id, new CatalystEvent.SignalReceived(now(), name, payloads.toTree(payload)));
+            if (registry.lookup(state.taskType()).isEmpty()) {
+                return new FutureExecutionHandle<>(id, CompletableFuture.failedFuture(new IllegalStateException(
+                        "Signal '" + name + "' recorded for " + id + ", but no task is registered for type '"
+                                + state.taskType() + "' to resume it here; re-submit the task with its"
+                                + " idempotency key, or register it with Catalyst.builder().task(...)")));
+            }
+            return resume(id); // reentrant on the id lock
+        });
+    }
+
+    /** A handle for an execution parked on a signal: no attempt runs; it completes with the wait. */
+    private static <R> ExecutionHandle<R> waitingHandle(ExecutionId id, ExecutionState state) {
+        String name = state.awaitingSignal().orElse(null);
+        return new FutureExecutionHandle<>(id, CompletableFuture.<R>failedFuture(new ExecutionWaitingSignal(name,
+                "Execution " + id + " is waiting for signal '" + name + "'")));
+    }
+
+    /**
      * Forks a recorded execution at {@code atSeq} to explore an alternative (spec §7): the returned
      * {@link BranchBuilder} lets you swap the model, substitute counterfactual tool results, or
      * supply vars, then {@code run(task)} it forward into a new child execution and get its
@@ -659,6 +718,9 @@ public final class CatalystRuntime implements AutoCloseable {
             // ExecutionPaused already recorded by the context (e.g. an ASK in-doubt tool); the child
             // is left PAUSED — do NOT append a spurious ExecutionFailed on top of it.
             throw pause;
+        } catch (ExecutionWaitingSignal waiting) {
+            // Likewise SignalAwaited: the child is left WAITING, not failed.
+            throw waiting;
         } catch (RuntimeException e) {
             log.append(childId, new CatalystEvent.ExecutionFailed(now(), String.valueOf(e), log.latestSeq(childId)));
             throw e;
@@ -823,12 +885,17 @@ public final class CatalystRuntime implements AutoCloseable {
                     // and still records its completion.
                     // The same stop rule as the failure path below: a stopped attempt with a cancel
                     // pending is a cancel, whichever signal stopped it and in whatever order they came.
-                    if (ctx.raisedCancellation() || (ctx.raisedAbandon() && runningAttempt.token.isCancelled())) {
+                    boolean stopped = ctx.raisedAbandon() || ctx.raisedWaiting();
+                    if (ctx.raisedCancellation() || (stopped && runningAttempt.token.isCancelled())) {
                         recordCancelled(id, runningAttempt.token.reason(), future);
                         return;
                     }
                     if (ctx.raisedAbandon()) {
                         abandon(id, future);
+                        return;
+                    }
+                    if (ctx.raisedWaiting()) {
+                        future.completeExceptionally(ctx.waitingSignal());
                         return;
                     }
                     log.append(id, new CatalystEvent.ExecutionCompleted(now(), payloads.toTree(result)));
@@ -866,6 +933,18 @@ public final class CatalystRuntime implements AutoCloseable {
                     }
                     if (stoppedByAbandon) {
                         abandon(id, future);
+                        return;
+                    }
+                    // Parked on a signal: SignalAwaited is recorded, so append nothing more — the execution
+                    // stays WAITING with no thread held until signal() delivers it. Unless a cancel is
+                    // pending: cancel() saw this attempt still registered as running and only tripped
+                    // the token, so parking would leave nobody to record the cancel.
+                    if (t instanceof ExecutionWaitingSignal || ctx.raisedWaiting()) {
+                        if (runningAttempt.token.isCancelled()) {
+                            recordCancelled(id, runningAttempt.token.reason(), future);
+                        } else {
+                            future.completeExceptionally(t instanceof ExecutionWaitingSignal w ? w : ctx.waitingSignal());
+                        }
                         return;
                     }
                     // Decide retry vs. terminal failure. isRetryable gates out failures a retry can never

@@ -11,6 +11,7 @@ inspecting executions, and how the log underneath works. For running Catalyst as
 - [Effects, memory and vars](#effects-memory-and-vars)
 - [Idempotency keys and resuming](#idempotency-keys-and-resuming)
 - [Failures: retries and in-doubt calls](#failures-retries-and-in-doubt-calls)
+- [Signals: waiting for a human](#signals-waiting-for-a-human)
 - [Cancel, pause, resume](#cancel-pause-resume)
 - [Inspect, replay, branch](#inspect-replay-branch)
 - [Streaming completions](#streaming-completions)
@@ -218,6 +219,55 @@ Set it with `Catalyst.builder(dir).inDoubtPolicy(InDoubtPolicy.RETRY)`. A gracef
 nothing in doubt as long as every in-flight call finishes within `drainTimeout`. A call still running
 when the drain times out is left exactly as a crash would leave it, and this policy decides what
 happens to it. Size `drainTimeout` above your slowest call (see [deployment.md](deployment.md#shutdown-drain-dont-kill)).
+
+## Signals: waiting for a human
+
+A task can stop and wait for input from outside, such as a reviewer's approval, a user's choice or a
+webhook, without holding a thread while it waits:
+
+```java
+record Approval(String reviewer, boolean approved) {}
+
+public final class ReviewedReport implements Task<String> {
+    @Override public String execute(Context ctx) {
+        String draft = ctx.model().complete(draftRequest).message();
+        Approval approval = ctx.awaitSignal("approval", Approval.class);   // parks here
+        if (!approval.approved()) return "rejected by " + approval.reviewer();
+        return ctx.model().complete(finalRequest(draft)).message();
+    }
+}
+```
+
+The first time the task reaches `awaitSignal`, Catalyst records the wait and the execution parks in
+`WAITING`. The attempt ends and no thread is held, and the handle's `result()` throws
+`ExecutionWaitingSignal`. It can wait for minutes or months, across restarts. Startup recovery leaves
+it alone.
+
+Deliver the signal, from a request handler, a UI, anywhere with the runtime:
+
+```java
+runtime.inspect(id).awaitingSignal();                                // Optional[approval]
+runtime.signal(id, "approval", new Approval("dana", true)).result(); // resumes; returns the result
+```
+
+`signal` records the payload as the result of the wait and resumes the task. Like any resume, the task
+re-runs from the top: the draft is substituted from the log, `awaitSignal` returns the recorded
+payload, and only the work after it runs live. Replays substitute the payload too.
+
+Worth knowing:
+
+- **Only a waiting execution accepts its signal.** `signal` refuses an execution that is running,
+  waiting for a different signal, or finished. Signals sent before the task reaches its wait are not
+  buffered; check `inspect(id).awaitingSignal()` and retry.
+- **A crash right after `signal` is safe.** Recording the signal moves the execution out of `WAITING`
+  (to `RESUMING`), so if the process dies before it resumes, startup recovery finishes it.
+- **The task type must be registered** (`Catalyst.builder().task(...)`) for `signal` to resume it. If
+  it isn't, the signal is still recorded and you resume by re-submitting the task with its key.
+- **Re-submitting the key, or calling `resume(id)`, while it is still waiting runs nothing.** The
+  handle fails with `ExecutionWaitingSignal`.
+- **Waits have no timeout yet**, and a waiting execution can be cancelled like any other.
+- The payload must be a recordable type: a record, an enum, a string, number, `java.time` value or
+  `UUID`, or collections of those.
 
 ## Cancel, pause, resume
 

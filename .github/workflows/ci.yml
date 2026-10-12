@@ -226,10 +226,12 @@ jobs:
           echo "--- process 2: restart with recoverOnStart ---"
           OUT="$(java -cp "$CP" com.cajunsystems.catalyst.api.Demo "$DIR" recover)"
           echo "$OUT"
-          echo "$OUT" | grep -q "resumed: 3, left alone: 1, not recovered: 1" \
+          echo "$OUT" | grep -q "resumed: 4, left alone: 2, not recovered: 1" \
             || { echo "FAIL: recovery did not resume exactly the crash-interrupted executions"; exit 1; }
-          echo "$OUT" | grep -q "model calls THIS run: 3" \
+          echo "$OUT" | grep -q "model calls THIS run: 4" \
             || { echo "FAIL: recovery made duplicate model calls"; exit 1; }
+          echo "$OUT" | grep -q "(WAITING) -> still WAITING" \
+            || { echo "FAIL: recovery resumed an execution that is waiting for a signal"; exit 1; }
           echo "$OUT" | grep -q "(PAUSED) -> still PAUSED" \
             || { echo "FAIL: recovery un-paused a paused execution"; exit 1; }
           echo "Deploy-2 exit criterion holds: in-flight work recovered, paused work left alone."
@@ -249,6 +251,22 @@ jobs:
           echo "$OUT" | grep -q "model calls THIS run: 1" \
             || { echo "FAIL: the restart made duplicate model calls"; exit 1; }
           echo "Deploy-4 exit criterion holds: abandoned on shutdown, resumed on restart."
+
+      # The Deploy-6 exit criterion: a task waits for a human's signal with no thread held, survives a
+      # restart while waiting, and a signal resumes it with zero duplicate model calls.
+      - name: Deploy-6 signals exit demo (await → restart → signal → resume)
+        run: |
+          set -uo pipefail
+          CP="catalyst-api/target/classes:$(cat catalyst-api/target/cp.txt)"
+          OUT="$(java -cp "$CP" com.cajunsystems.catalyst.api.Demo signal)"
+          echo "$OUT"
+          echo "$OUT" | grep -q "after restart: WAITING, awaiting approval" \
+            || { echo "FAIL: the execution was not waiting for its signal across a restart"; exit 1; }
+          echo "$OUT" | grep -q "COMPLETED result: SUMMARY|FINAL (approved by dana)" \
+            || { echo "FAIL: the signal did not resume the execution with its payload"; exit 1; }
+          echo "$OUT" | grep -q "model calls THIS run: 1" \
+            || { echo "FAIL: resuming after the signal made duplicate model calls"; exit 1; }
+          echo "Deploy-6 exit criterion holds: waited, survived a restart, resumed by a signal."
 
       # The v0.2 built-in-tools exit criterion (roadmap increment ③): a task's HTTP + Filesystem calls
       # are recorded boundaries — a strict replay substitutes them, re-issuing no request and

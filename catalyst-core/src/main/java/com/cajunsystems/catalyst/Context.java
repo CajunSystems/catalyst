@@ -33,6 +33,23 @@ public interface Context {
      */
     <T> T effect(String label, Supplier<T> supplier);
 
+    /**
+     * Waits for the named signal and returns its payload — the human-in-the-loop boundary. If the
+     * signal has already been delivered (this is a resume or replay), its recorded payload is returned
+     * at once. Otherwise the wait is recorded, the execution parks in {@code WAITING} with no thread
+     * held, and the call does not return: the task resumes from the top, with everything before this
+     * point substituted, once {@code runtime.signal(id, name, payload)} delivers it.
+     *
+     * <p>Like any boundary, the payload must be a recordable type (a record, enum, string, number,
+     * {@code java.time} value, {@code UUID}, or collections of those).
+     *
+     * @param type the payload's expected type; a delivered payload of another type fails here
+     * @throws UnsupportedOperationException if this context cannot wait (e.g. a test double)
+     */
+    default <T> T awaitSignal(String name, Class<T> type) {
+        throw new UnsupportedOperationException(getClass().getSimpleName() + " does not support signals");
+    }
+
     /** A task input variable supplied via {@link ExecutionOptions}. */
     <T> T var(String name);
 

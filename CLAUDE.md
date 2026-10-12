@@ -287,6 +287,22 @@ checkout's pom to `com.github.CajunSystems` before installing.
   (pre-sharding) ids pass. The shard set is fixed for the life of the data. Not failover: a shard's
   work waits for that node — node takeover is the Dist track.
 
+- **Signals / WAITING (Deploy-6)** — `SignalTest` (runtime) + `SignalAcceptanceTest` + `Demo signal`,
+  and `Demo crashmany`/`recover` gained a waiting (left alone) and a signalled-then-crashed (finished)
+  execution. `ctx.awaitSignal(name, type)`: substituted if `SignalReceived` is recorded; else records
+  `SignalAwaited` (→ `WAITING`) and throws `ExecutionWaitingSignal` — the attempt ends, **no thread
+  held**, runtime appends nothing more. `SignalAwaited` is not a boundary; `SignalReceived` is (the
+  wait's result, identity = name). `runtime.signal(id, name, payload)` accepts only `WAITING` *for that
+  name* and not in flight — **no buffering**, so nothing ever appends to a running stream from
+  outside — appends `SignalReceived` (→ `RESUMING`, a state change so a crash before the resume is
+  recovered) then `resume(id)` (reentrant). `resume`/keyed `execute` of a still-`WAITING` execution run
+  **no attempt** (its `ExecutionResumed` would fold to `RUNNING` and recovery would treat a waiter as
+  crashed) — `waitingHandle`. The stop rule extends to waiting (swallowed `ExecutionWaitingSignal` →
+  still parked; a pending cancel wins, since `cancel()` only tripped the token while the attempt was
+  registered). `replay` of a waiting execution ends cleanly at the wait. `ExecutionState.awaitingSignal()`
+  is **derived from the timeline**, so the state records and snapshot format are unchanged.
+  `Context.awaitSignal` is a default method (throws) so other `Context` implementations still compile.
+
 - **In-doubt model completions** — `ReplayingContextInDoubtCompletionTest`: a `CompletionRequested`
   with no `CompletionReceived` is a provider call that may have been accepted and *billed*, so it
   routes through `InDoubtPolicy` exactly as a dangling `ToolRequested` does (it previously just
