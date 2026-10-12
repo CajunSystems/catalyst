@@ -740,4 +740,36 @@ class GumboEventLogTest {
                 .isInstanceOf(IllegalArgumentException.class)
                 .hasMessageContaining("root");
     }
+
+    /**
+     * Lease rows: claim, refuse a stale claim, replace, release. A second execution's lease sits
+     * alongside, since a single-row fixture hides keying mistakes.
+     */
+    @Test
+    void leaseRowsAreChangedOnlyByCompareAndSet(@TempDir Path dir) {
+        ExecutionId id = ExecutionId.random();
+        ExecutionId other = ExecutionId.random();
+        com.cajunsystems.catalyst.log.Lease a = new com.cajunsystems.catalyst.log.Lease("node-a", 1_000);
+        com.cajunsystems.catalyst.log.Lease a2 = new com.cajunsystems.catalyst.log.Lease("node-a", 2_000);
+        com.cajunsystems.catalyst.log.Lease b = new com.cajunsystems.catalyst.log.Lease("node-b", 1_500);
+        try (GumboEventLog log = GumboEventLog.at(dir)) {
+            assertThat(log.supportsLeases()).isTrue();
+            assertThat(log.readLease(id)).isEmpty();
+            assertThat(log.compareAndSetLease(other, null, b)).isTrue();
+
+            assertThat(log.compareAndSetLease(id, null, a)).as("claim").isTrue();
+            assertThat(log.compareAndSetLease(id, null, b)).as("a second claim loses").isFalse();
+            assertThat(log.compareAndSetLease(id, b, a2)).as("a stale expectation loses").isFalse();
+            assertThat(log.compareAndSetLease(id, a, a2)).as("renewal").isTrue();
+            assertThat(log.readLease(id)).contains(a2);
+
+            assertThat(log.compareAndSetLease(id, a, null)).as("releasing a lease since renewed loses").isFalse();
+            assertThat(log.compareAndSetLease(id, a2, null)).as("release").isTrue();
+            assertThat(log.readLease(id)).isEmpty();
+            assertThat(log.readLease(other)).contains(b);
+        }
+        try (GumboEventLog reopened = GumboEventLog.at(dir)) {
+            assertThat(reopened.readLease(other)).as("durable").contains(b);
+        }
+    }
 }

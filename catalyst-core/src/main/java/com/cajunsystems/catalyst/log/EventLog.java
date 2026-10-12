@@ -90,6 +90,40 @@ public interface EventLog extends AutoCloseable {
         return false;
     }
 
+    /**
+     * Whether this log stores {@linkplain Lease leases}: {@link #readLease} and
+     * {@link #compareAndSetLease}. A distributed runtime needs it to tell which node is running an
+     * execution. Defaults to {@code false}, and the lease methods throw, since a log that pretended to
+     * store leases would let two nodes run the same execution while each believed it was the only one.
+     */
+    default boolean supportsLeases() {
+        return false;
+    }
+
+    /**
+     * The lease row for {@code executionId}, or empty if none. Expiry is not checked here: an expired
+     * lease is still returned. Whether it still binds is for the caller to decide
+     * ({@link Lease#liveAt}).
+     *
+     * @throws UnsupportedOperationException if this log stores no leases
+     */
+    default Optional<Lease> readLease(ExecutionId executionId) {
+        throw new UnsupportedOperationException(getClass().getSimpleName() + " does not store leases");
+    }
+
+    /**
+     * Replaces the lease row for {@code executionId} with {@code replacement}, only if it currently
+     * equals {@code expected}. Atomic in storage, and across processes on a multi-writer log.
+     *
+     * @param expected    the row the caller read, or {@code null} to require that there is none
+     * @param replacement the new row, or {@code null} to remove it
+     * @return whether the swap happened
+     * @throws UnsupportedOperationException if this log stores no leases
+     */
+    default boolean compareAndSetLease(ExecutionId executionId, Lease expected, Lease replacement) {
+        throw new UnsupportedOperationException(getClass().getSimpleName() + " does not store leases");
+    }
+
     /** Reads all events for {@code executionId} in sequence order. Empty if none. */
     List<SequencedEvent> read(ExecutionId executionId);
 

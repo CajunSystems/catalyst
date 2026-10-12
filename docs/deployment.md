@@ -209,9 +209,16 @@ Each shard is still a single node. If a shard's node is down, its executions wai
 (on Kubernetes, until its pod is rescheduled with its volume). No other shard can take them over,
 because no other node can open that shard's log. Failover between nodes needs a log that several
 nodes can write safely. That is the Dist track (`docs/distribution.md`), and it is not available yet.
-The log half exists — `GumboEventLog.foundationDB(...)` is a log several nodes can write without
-corrupting a stream — but the coordination half (leases, and a claim loop that hands a dead node's
-work to a live one) does not, so do not point several runtimes at one FoundationDB root in
-production yet. A runtime meant to share a log is built with `.nodeId("node-a").distributed()`.
-`build()` then refuses a log that is not both fenced and multi-writer, and refuses `recoverOnStart`,
-until leases make cross-node recovery safe.
+Most of it exists:
+- **The log:** `GumboEventLog.foundationDB(...)` is a log several nodes can write without
+  corrupting a stream.
+- **Leases:** a runtime built with `.nodeId("node-a").distributed()` claims a lease before writing to
+  an execution and renews it while running. It refuses executions another node is running
+  (`LeaseHeldException`), and its startup recovery takes over only what dead nodes left.
+- **Lease timing:** `lease(duration, heartbeat)`, defaults 30s and 10s. A dead node's work waits
+  out the lease duration.
+
+What is missing is the claim loop (Dist-4). Today a dead node's work is picked up only when some
+node runs `recoverAll()` or restarts with `recoverOnStart`, and cancel/pause of an execution running
+on another node is refused rather than forwarded to it. Treat multi-node runs as a preview until
+then.

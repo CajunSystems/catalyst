@@ -9,6 +9,7 @@ import com.cajunsystems.catalyst.events.FileBlobStore;
 import com.cajunsystems.catalyst.events.SequencedEvent;
 import com.cajunsystems.catalyst.log.EventLog;
 import com.cajunsystems.catalyst.log.ExecutionIndex;
+import com.cajunsystems.catalyst.log.Lease;
 import com.cajunsystems.catalyst.log.Snapshot;
 import com.cajunsystems.catalyst.log.StaleWriterException;
 import com.cajunsystems.gumbo.api.LogView;
@@ -55,6 +56,8 @@ public final class GumboEventLog implements EventLog {
     private static final String EXEC_NAMESPACE = "catalyst-exec";
     private static final LogTag INDEX_TAG = LogTag.of("catalyst-index", "keys");
     private static final LogTag SNAPSHOT_TAG = LogTag.of("catalyst-index", "snapshots");
+    /** KV-only tag: one lease row per execution, keyed by id, changed only by compare-and-set. */
+    private static final LogTag LEASE_TAG = LogTag.of("catalyst-index", "leases");
     /**
      * The execution index (see {@link ExecutionIndex}): lifecycle events that open or close an
      * execution carry this tag as well as their execution's, in the same append. Since gumbo 0.6.0 a
@@ -81,6 +84,7 @@ public final class GumboEventLog implements EventLog {
     private final AutoCloseable resource;
     private final LogView indexView;
     private final LogView snapshotView;
+    private final LogView leaseView;
     private final LogView queueView;
     /** The codec's blob store, owned by this log and closed with it; null if payloads stay inline. */
     private final BlobStore blobStore;
@@ -99,6 +103,7 @@ public final class GumboEventLog implements EventLog {
         this.serializer = new EventLogSerializer(codec);
         this.indexView = service.getView(INDEX_TAG);
         this.snapshotView = service.getView(SNAPSHOT_TAG);
+        this.leaseView = service.getView(LEASE_TAG);
         this.queueView = service.getView(QUEUE_TAG);
     }
 
@@ -567,6 +572,34 @@ public final class GumboEventLog implements EventLog {
     @Override
     public void putKey(String idempotencyKey, ExecutionId executionId) {
         indexView.setValue(idempotencyKey, executionId.value().getBytes(StandardCharsets.UTF_8)).join();
+    }
+
+    /**
+     * Delegates to Gumbo's {@code compareAndSet} capability: whether the adapter compares and writes
+     * a KV value atomically. On FoundationDB that holds across processes (measured by Gumbo's
+     * two-writer test). On the file adapter it holds within the one process the directory lock allows.
+     */
+    @Override
+    public boolean supportsLeases() {
+        return service.capabilities().compareAndSet();
+    }
+
+    @Override
+    public Optional<Lease> readLease(ExecutionId executionId) {
+        byte[] value = leaseView.getValue(executionId.value()).join();
+        return value == null ? Optional.empty() : Optional.of(Lease.decode(value));
+    }
+
+    /**
+     * Gumbo compares stored bytes, which is exact because {@link Lease#encode()} is canonical. A
+     * stored row that is not a valid lease can therefore never match an expected one, so it cannot be
+     * replaced by a claim. {@link #readLease} reports it instead of hiding it.
+     */
+    @Override
+    public boolean compareAndSetLease(ExecutionId executionId, Lease expected, Lease replacement) {
+        return leaseView.compareAndSetValue(executionId.value(),
+                expected == null ? null : expected.encode(),
+                replacement == null ? null : replacement.encode()).join();
     }
 
     @Override

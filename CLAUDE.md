@@ -365,14 +365,37 @@ checkout's pom to `com.github.CajunSystems` before installing.
   `Builder.distributed()` makes `build()` refuse a log that does not **report** both
   `supportsConditionalAppend()` and `supportsMultiWriter()`. The message gives both answers, and a log
   the builder opened is closed, so a file-backed log's directory lock is released. Refused before
-  any log is opened: no explicit `nodeId(...)`, `shard(...)` (alternatives: own log vs shared log),
-  and `recoverOnStart`. **`recoverAll()` refuses on a distributed runtime** until leases (Dist-3/4).
-  On a shared index, "open and not in flight *here*" includes work running on another node. Resuming
-  it mid-call fences that node out and leaves its `CompletionRequested` in doubt, which is terminal
-  under `FAIL`. The by-id paths (keyed `execute`, `resume(id)`) carry the same hazard and are *not*
-  refused, since `liveAttempt` only sees this process. That is the operator's call until Dist-3/4.
-  Mutation-checked: dropping either capability check or the `recoverAll` refusal fails
-  a test. `isDistributed()` reports the mode.
+  any log is opened: no explicit `nodeId(...)` and `shard(...)` (alternatives: own log vs shared log).
+  Dist-3 added `supportsLeases()` to the required answers, and lifted Dist-2's `recoverAll` /
+  `recoverOnStart` refusal now that the scan respects leases (below). Mutation-checked: dropping
+  either capability check fails a test. `isDistributed()` reports the mode.
+
+- **Leases (Dist-3)** — `LeaseTest` (runtime: runtimes sharing one `SharedLog` test helper are nodes;
+  a dead node is a lease row written directly and lapsed with a `TestClock`) + `LeaseCodecTest`
+  (core) + `GumboEventLogTest.leaseRowsAreChangedOnlyByCompareAndSet` +
+  `FoundationDBEventLogTest.exactlyOneOfTwoNodesClaimsALease` + `FoundationDBAcceptanceTest`.
+  - **No fencing token:** the lease decides *who should run*, and the append fence keeps streams
+    correct. A takeover appends `ExecutionResumed` before any work, so a holder that paused past its
+    lease is refused at its next append. `Lease.encode()` is canonical, because CAS compares bytes.
+  - **`LeaseKeeper`:**
+    - `acquire` is reentrant per process: it returns whether this call claimed. A lease held by this
+      node's *own id* counts as ours (restart under the same id).
+    - `renewAll` runs on a daemon heartbeat thread. A failed CAS removes the lease and runs the
+      attempt's `onLost`.
+    - `release` is a CAS from the row this process last wrote.
+    - Renewal and release synchronize per lease, so a release can't lose to a renewal it raced.
+  - **Runtime integration:**
+    - `scheduleAttempt` claims (except `REPLAY_TERMINAL`) before registering anything, and releases
+      in the deregistering `whenComplete`, *before* `visible` completes.
+    - `underLease` covers the writes outside an attempt: create, signal, pause and cancel when not in
+      flight here. It releases only if no attempt took ownership.
+    - `RunningAttempt.leaseLost` is read by the token as an abandon, so the existing abandon path
+      (append nothing) handles a lost lease. `abandon()` completes with `LeaseLostException` instead
+      of the shutdown signal.
+    - `recoverAll` maps a `LeaseHeldException` to `leftAlone` RUNNING.
+    - `close()` releases the leftovers after the drain.
+  - **Mutation-checked:** removing the claim, the release, the lost callback, recovery's skip,
+    close's release or the liveness check each fails a `LeaseTest` case.
 
 - **In-doubt model completions** — `ReplayingContextInDoubtCompletionTest`: a `CompletionRequested`
   with no `CompletionReceived` is a provider call that may have been accepted and *billed*, so it
