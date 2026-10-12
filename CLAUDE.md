@@ -136,6 +136,9 @@ checkout's pom to `com.github.CajunSystems` before installing.
   replaced an older rule that routed a tail failure through `InDoubtPolicy`, which was a workaround
   for unattributed substituted failures (`RetryRequested(-1)` burning the budget). It made an agent
   that crashed right after a tool failure end FAILED under the default policy.
+  Likewise **a failed in-doubt `RETRY` is recorded** (`handleInDoubt` appends `ToolCompleted(error)`,
+  attributed). Unrecorded, a task that handled it left a request that never completes behind later
+  boundaries: replay diverged and every resume found it in doubt again.
 - **v0.2 Auto-capture** — `AutoCaptureAcceptanceTest` + `Demo autocapture`: a task containing plain
   `Instant.now()` / `UUID.randomUUID()` / `Random` calls and **no** `ctx.effect` is recorded and
   replayed exactly, because `catalyst-agent` rewrote those call sites into `AutoCapture` calls that

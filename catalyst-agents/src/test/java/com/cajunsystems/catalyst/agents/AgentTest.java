@@ -237,6 +237,49 @@ class AgentTest {
     }
 
     /**
+     * A node dies while a lookup is in flight (its request recorded, no completion), and the survivor
+     * runs under InDoubtPolicy.RETRY. The retried lookup fails again. That failure must be recorded,
+     * completing the request, so the agent can hand it to the model and the run still replays
+     * exactly. Unrecorded, the next model turn landed after a request that never completed: replay
+     * diverged, and every resume found the lookup in doubt again.
+     */
+    @Test
+    void aFailedInDoubtRetryIsRecordedSoTheAgentCarriesOnAndReplays() {
+        // A real run gives the exact recorded prefix; a crash mid-lookup keeps it only up to the request.
+        PolicyModel model = new PolicyModel();
+        model.ticket = "DOWN";
+        CURRENT.set(agent);
+        EventLog full = EventLogs.inMemory();
+        ExecutionId id;
+        try (CatalystRuntime runtime = CatalystRuntime.builder().log(full).model(model).build()) {
+            var run = runtime.execute(new SwappableTask(), ExecutionOptions.none());
+            run.result();
+            id = run.id();
+        }
+        EventLog crashed = EventLogs.inMemory();
+        for (var se : full.read(id)) {
+            crashed.append(id, se.event());
+            if (se.event() instanceof com.cajunsystems.catalyst.events.CatalystEvent.ToolRequested) break;
+        }
+        int lookupsBefore = lookup.calls.get();
+
+        PolicyModel survivorModel = new PolicyModel();
+        survivorModel.ticket = "DOWN";
+        try (CatalystRuntime survivor = CatalystRuntime.builder().log(crashed).model(survivorModel)
+                .inDoubtPolicy(com.cajunsystems.catalyst.engine.InDoubtPolicy.RETRY)
+                .task(SwappableTask.class, SwappableTask::new).build()) {
+            assertThat(survivor.resume(id).result())
+                    .isEqualTo("done: error: java.lang.IllegalStateException: ticketing system unavailable");
+            assertThat(lookup.calls).as("the in-doubt lookup was retried once").hasValue(lookupsBefore + 1);
+            assertThat(crashed.read(id)).as("the retried failure completes the request")
+                    .anySatisfy(se -> assertThat(se.event()).isInstanceOfSatisfying(
+                            com.cajunsystems.catalyst.events.CatalystEvent.ToolCompleted.class,
+                            tc -> assertThat(tc.error()).contains("ticketing system unavailable")));
+            assertThat(survivor.replay(id, new SwappableTask()).status()).as("and the run replays exactly").isEqualTo(Status.COMPLETED);
+        }
+    }
+
+    /**
      * A failing tool goes back to the model as an error it can act on, and the conversation replays
      * exactly: the replayed failure carries the recorded text, so the next prompt is byte-identical.
      */

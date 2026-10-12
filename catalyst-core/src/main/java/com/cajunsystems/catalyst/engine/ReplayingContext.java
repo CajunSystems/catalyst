@@ -559,7 +559,20 @@ public final class ReplayingContext implements Context {
             case RETRY -> {
                 requireAppendable("in-doubt retry of tool " + tool.name());
                 long t0 = System.nanoTime();
-                O output = applyUnchecked(tool, input);
+                O output;
+                try {
+                    output = applyUnchecked(tool, input);
+                } catch (RuntimeException ex) {
+                    // The retried call failed: that is its verdict, recorded exactly as runToolLive
+                    // records one, completing the dangling request. Left unrecorded, a task that handles
+                    // the failure (an agent telling the model) would record later boundaries after a
+                    // request that never completes: replay diverges there, and every resume would find
+                    // it in doubt again.
+                    long latencyMillis = (System.nanoTime() - t0) / 1_000_000;
+                    lastToolFailureSeq = append(new ToolCompleted(now(), null, String.valueOf(ex), latencyMillis));
+                    lastToolFailureException = ex;
+                    throw ex;
+                }
                 long latencyMillis = (System.nanoTime() - t0) / 1_000_000;
                 append(new ToolCompleted(now(), payloads.toTree(output), null, latencyMillis)); // completes the dangling request
                 yield output;
