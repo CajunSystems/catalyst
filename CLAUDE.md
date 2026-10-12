@@ -49,6 +49,8 @@ checkout's pom to `com.github.CajunSystems` before installing.
 - `catalyst-timeline` — `TimelineReport`: renders a folded `ExecutionState` as a self-contained HTML
   page (header + roll-ups + step table). Read-only, post-hoc, pure function of the log; depends on
   `catalyst-core` only — no templating engine, no web server. All interpolated log content is escaped.
+- `catalyst-agents` — `Agent`: a tool-calling loop built on `Task`. Not to be confused with
+  `catalyst-agent`, the Byte Buddy javaagent. It depends on core only.
 - `catalyst-eval` — `Eval`: the eval harness. It batches branch (M2) over recorded executions
   with candidate models/tasks, and scores with pure `Scorer`s into an `EvalReport`. It depends on
   core + runtime only; no new events.
@@ -442,6 +444,30 @@ checkout's pom to `com.github.CajunSystems` before installing.
   - **Mutation-checked:** removing the loop, forwarding, absorbing, carrying, the key CAS, the pre-check,
     orphan handling, release keeping or dropping the request, or the create-for-claimed-key each fails a
     test.
+
+- **Agents** — `AgentTest` (catalyst-agents, 9) + `MessageToolCallTest` (core) +
+  `AgentAcceptanceTest` + `Demo agent` (CI gate).
+  - **Loop:** model turn → `ctx.call` per tool call, in listed order → results back → until no tool
+    calls or `maxSteps`. The conversation is rebuilt from boundary results only, so it is
+    deterministic. Missing call ids are filled with `call-<turn>-<i>`.
+  - **`Message` tool-call fields are additive:** `@JsonInclude` NON_EMPTY/NON_NULL keeps the
+    recorded JSON identical, and `Hashing.toolCallFields` adds to the request hash only when
+    present, with markers starting `~`. **Breaking either changes every recorded prompt hash, and
+    every old log diverges on replay.** `MessageToolCallTest` recomputes the legacy hash
+    independently.
+  - **Tool failures** are fed to the model as `error: <String.valueOf(e)>`. On replay the engine
+    throws `RecordedToolFailureException(recordedError)`, which must produce the same text.
+    Without it, the prompt after a failure diverged (mutation-checked).
+  - **Engine signals are rethrown,** never fed to the model: cancel, abandon, waiting, paused,
+    stale writer, divergence, in-doubt, unrecorded tool (mutation-checked).
+  - **Tool inputs:** a flat record of scalars and enums, or one scalar wrapped as `{"value":…}`.
+    The schema is derived, and anything else is refused at `tool(...)`.
+  - **Tests and the demo:**
+    - The crash-mid-loop test uses a tool that `close()`s its own runtime. The next boundary
+      abandons before recording, which leaves the execution RUNNING with no dangling request,
+      unlike a model/tool stall, which would leave it in doubt.
+    - Resume needs a *named* task type registered on the survivor. A lambda's class differs per
+      call site.
 
 - **Eval harness** — `EvalTest` (catalyst-eval, 10) + `BranchTest` tool-replay cases +
   `EvalAcceptanceTest` + `Demo eval` (CI gate).

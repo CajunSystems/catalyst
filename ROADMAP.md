@@ -423,9 +423,20 @@ anywhere.
 The substrate becomes a platform. This is where the other CajunSystems components integrate.
 
 ### Agent abstraction (spec §12)
-- An **`Agent`** built *on* `Task` (reasoning loops, tool selection) — a consumer of the runtime, not
-  part of its core. Possibly delegate planning to Embabel rather than competing.
-- **MCP** integration and richer tool ecosystems.
+- ✅ An **`Agent`** built *on* `Task` (reasoning loops, tool selection) — a consumer of the runtime, not
+  part of its core. *As shipped (native loop, chosen over delegating to Embabel):*
+  - **Module:** `catalyst-agents` (core only). `Agent.run(ctx, input)` loops model turn → tool calls
+    → results until an answer or `maxSteps`, returning an `AgentResult`.
+  - **Core change, additive:** `Message` gains `toolCalls` (assistant) and `toolCallId`/`toolName`
+    (tool result). They're omitted from recorded JSON and from the request hash when absent, so old
+    logs record and hash byte-identically (pinned by `MessageToolCallTest`). `LangChain4jModel` maps
+    both ways.
+  - **Replayed failures:** they throw `RecordedToolFailureException` carrying the recorded error, so
+    an agent's failure text, and therefore its next prompt, is identical live and on replay.
+  - **Exit demo `Demo agent`:** a crash mid-conversation resumes without repeating a turn or a tool
+    call, a strict replay makes zero calls, and an eval re-runs no tool.
+- **MCP** integration and richer tool ecosystems. *Next:* an MCP module that turns an MCP server's
+  tools into Catalyst `Tool`s (recorded boundaries like any other), so an `Agent` can use them.
 
 ### Signals & human-in-the-loop — Boudin integration (spec §5 lifecycle, §12)
 *Pulled forward as Deploy-6 above; Boudin workflow invocation stays here.*

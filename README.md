@@ -144,7 +144,7 @@ scripts/demo.sh /tmp/catalyst-demo resume   # a new process resumes it
 [resume] model calls THIS run: 1 (step 1 was substituted from the log; only step 2 ran live)
 ```
 
-Other demos: `scripts/demo.sh replay`, `branch`, `eval`, `signal`, `retry`, `cancel`, `shutdown`, `streaming`,
+Other demos: `scripts/demo.sh replay`, `branch`, `agent`, `eval`, `signal`, `retry`, `cancel`, `shutdown`, `streaming`,
 `timeline`, `otel`, `autocapture`, and more. The full list is at the top of `scripts/demo.sh`, and CI
 runs every one of them as a gate.
 
@@ -177,6 +177,7 @@ runs every one of them as a gate.
 | cancel or pause an execution | `runtime.cancel(id)`, `pause(id)`, `resume(id)` | [Control](docs/guide.md#cancel-pause-resume) |
 | check that my task code is deterministic | `runtime.replay(id, task)` | [Replay](docs/guide.md#inspect-replay-branch) |
 | try a different model on a past run | `runtime.branch(id, seq).withModel(m).run(task)` | [Branch](docs/guide.md#inspect-replay-branch) |
+| build a tool-calling agent that survives crashes and replays | `Agent.builder().tool(...).build().run(ctx, input)` | [Agents](docs/guide.md#agents) |
 | check a model or prompt change against real traffic | `Eval.on(runtime).cases(ids).candidate(...).run()` | [Evaluating](docs/guide.md#evaluating-models-and-prompts) |
 | stream tokens to a UI | `ctx.model().stream(request, sink)` | [Streaming](docs/guide.md#streaming-completions) |
 | see what an execution did, and what it cost | `TimelineReport.writeTo(...)`, `CatalystTracer` (OTel) | [Observability](docs/guide.md#timeline-reports-and-opentelemetry) |
@@ -205,6 +206,7 @@ Most applications need only `catalyst-api`, plus `catalyst-langchain4j` for real
 | `catalyst-timeline` | Renders an execution as a self-contained HTML report |
 | `catalyst-otel` | Exports an execution as an OpenTelemetry trace (API only; you bring the SDK) |
 | `catalyst-eval` | Eval harness: replays recorded runs against candidate models and prompts, and scores them |
+| `catalyst-agents` | A tool-calling agent loop built on `Task` (not to be confused with `catalyst-agent`, the auto-capture javaagent) |
 | `catalyst-agent` | Optional Java agent that records clock, random and UUID calls automatically |
 
 Java package root: `com.cajunsystems.catalyst`.

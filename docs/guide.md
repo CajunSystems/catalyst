@@ -332,6 +332,52 @@ tool calls from the recording instead:
 `.toolReplay(BranchSpec.ToolReplay.RECORDED_ONLY)` (or `RECORDED_OR_LIVE` to run only calls the
 recording can't answer).
 
+## Agents
+
+`catalyst-agents` (included in `catalyst-api`) is a tool-calling agent loop: the model decides
+which tools to call, the agent runs them and sends back the results, until the model answers or a
+step budget runs out.
+
+```java
+Agent triage = Agent.builder()
+        .instructions("You triage support tickets. Look the ticket up before deciding.")
+        .tool(ticketLookup, "Look up a ticket by its id")
+        .tool(pager, "Page a team's on-call engineer")
+        .maxSteps(8)
+        .build();
+
+final class TriageTask implements Task<String> {
+    private final String ticket;
+    TriageTask(String ticket) { this.ticket = ticket; }
+    TriageTask() { this(null); }                     // for the registry: resume substitutes the input
+    @Override public String execute(Context ctx) {
+        String input = ctx.effect("ticket", () -> ticket);
+        return triage.run(ctx, input).answer();      // AgentResult: answer, stop reason, turns, tool calls
+    }
+}
+```
+
+**An agent is ordinary task code.** Every model turn is a recorded model call and every tool call a
+recorded tool boundary, so an agent run gets everything an execution gets:
+- **Resume:** a crash mid-conversation resumes at the turn it reached, repeating no model or tool
+  call.
+- **Replay:** a strict replay re-runs the whole conversation with zero calls.
+- **Branch, eval and the timeline report** work on it unchanged. An eval re-runs the conversation
+  with the candidate model and answers its tool calls from the recording.
+
+Some specifics:
+- **Tool inputs:** a record of strings, numbers, booleans and enums (a flat object, which
+  tool-calling models handle reliably), or a single such value, offered as `{"value": ...}`. The
+  JSON schema is derived from the type, and anything richer is refused when the agent is built.
+- **Tool failures go back to the model as data,** so it can recover: an unknown tool, arguments that
+  don't fit, or a tool that throws. Failure text is identical live and on replay.
+- **Engine signals are never swallowed:** cancel, shutdown, waits, pauses, a stale writer, a
+  divergence, an in-doubt call.
+- **Inputs:** pass the task's input through a recorded boundary, as above, not vars (they aren't
+  persisted).
+- **Real models:** `LangChain4jModel` carries tool calls and tool results (linked by call id) both
+  ways.
+
 ## Evaluating models and prompts
 
 The log is a dataset. `catalyst-eval` (included in `catalyst-api`) replays recorded executions

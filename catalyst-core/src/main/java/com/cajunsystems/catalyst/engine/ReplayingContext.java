@@ -445,7 +445,10 @@ public final class ReplayingContext implements Context {
 
     private String canonicalPrompt(CompletionRequest request) {
         StringBuilder sb = new StringBuilder();
-        request.prompt().messages().forEach(m -> sb.append(m.role()).append(':').append(m.content()).append('\n'));
+        request.prompt().messages().forEach(m -> {
+            sb.append(m.role()).append(':').append(m.content()).append('\n');
+            Hashing.toolCallFields(sb, m); // nothing for a message without tool-call fields
+        });
         return sb.toString();
     }
 
@@ -467,7 +470,7 @@ public final class ReplayingContext implements Context {
                 }
                 ToolCompleted tc = (ToolCompleted) b.event();
                 if (tc.error() != null) {
-                    throw new RuntimeException("Recorded tool '" + tool.name() + "' failed: " + tc.error());
+                    throw new RecordedToolFailureException(tool.name(), tc.error());
                 }
                 if (isDeterministic(tool)) {
                     return applyUnchecked(tool, input); // re-execute rather than deserialize (spec §4)

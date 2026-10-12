@@ -23,6 +23,7 @@
         <module>catalyst-otel</module>
         <module>catalyst-timeline</module>
         <module>catalyst-eval</module>
+        <module>catalyst-agents</module>
         <module>catalyst-api</module>
     </modules>
 
@@ -112,6 +113,11 @@
             <dependency>
                 <groupId>com.cajunsystems</groupId>
                 <artifactId>catalyst-eval</artifactId>
+                <version>${catalyst.version}</version>
+            </dependency>
+            <dependency>
+                <groupId>com.cajunsystems</groupId>
+                <artifactId>catalyst-agents</artifactId>
                 <version>${catalyst.version}</version>
             </dependency>
 

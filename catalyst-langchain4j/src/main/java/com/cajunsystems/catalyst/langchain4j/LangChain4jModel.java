@@ -168,12 +168,30 @@ public final class LangChain4jModel implements Model {
         for (Message m : request.prompt().messages()) {
             messages.add(switch (m.role()) {
                 case SYSTEM -> SystemMessage.from(m.content());
-                case ASSISTANT -> AiMessage.from(m.content());
-                // Catalyst has no id/name for TOOL results in v0; surface the content as user text.
-                case USER, TOOL -> UserMessage.from(m.content());
+                case ASSISTANT -> m.toolCalls().isEmpty()
+                        ? AiMessage.from(m.content())
+                        : (m.content().isEmpty()
+                                ? AiMessage.from(toExecutionRequests(m))
+                                : AiMessage.from(m.content(), toExecutionRequests(m)));
+                // A tool result that names its call goes back as a real tool result; one that does
+                // not (logs recorded before calls carried ids) stays user text, as it always was.
+                case TOOL -> m.toolCallId() != null
+                        ? dev.langchain4j.data.message.ToolExecutionResultMessage.from(m.toolCallId(),
+                                m.toolName() == null ? "" : m.toolName(), m.content())
+                        : UserMessage.from(m.content());
+                case USER -> UserMessage.from(m.content());
             });
         }
         return messages;
+    }
+
+    private static List<dev.langchain4j.agent.tool.ToolExecutionRequest> toExecutionRequests(Message m) {
+        List<dev.langchain4j.agent.tool.ToolExecutionRequest> out = new ArrayList<>(m.toolCalls().size());
+        for (ToolCall c : m.toolCalls()) {
+            out.add(dev.langchain4j.agent.tool.ToolExecutionRequest.builder()
+                    .id(c.id()).name(c.name()).arguments(c.argumentsJson()).build());
+        }
+        return out;
     }
 
     // ── Tool specs (Catalyst → LangChain4j) ──────────────────────────────────

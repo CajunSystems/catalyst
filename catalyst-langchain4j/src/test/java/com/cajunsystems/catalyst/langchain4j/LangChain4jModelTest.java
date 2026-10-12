@@ -275,4 +275,37 @@ class LangChain4jModelTest {
         assertThat(delivered).hasSize(2);
         assertThat(fake.finished.await(5, TimeUnit.SECONDS)).isTrue();
     }
+
+    /**
+     * An agent's conversation reaches the provider as real tool calling: the assistant turn carries
+     * its tool execution requests, and the result is a tool result linked by call id. A TOOL message
+     * without an id (recorded before ids existed) still goes as user text, as it always did.
+     */
+    @Test
+    void toolCallsAndToolResultsMapToLangChain4jMessages() {
+        FakeChatModel fake = new FakeChatModel(ChatResponse.builder().aiMessage(AiMessage.from("ok")).build());
+        com.cajunsystems.catalyst.model.ToolCall call =
+                new com.cajunsystems.catalyst.model.ToolCall("call-1", "lookup", "{\"id\":\"T-1\"}");
+        Prompt prompt = new Prompt(List.of(
+                new com.cajunsystems.catalyst.model.Message(com.cajunsystems.catalyst.model.Role.USER, "go"),
+                com.cajunsystems.catalyst.model.Message.assistantToolCalls("", List.of(call)),
+                com.cajunsystems.catalyst.model.Message.toolResult(call, "found"),
+                new com.cajunsystems.catalyst.model.Message(com.cajunsystems.catalyst.model.Role.TOOL, "legacy")));
+
+        LangChain4jModel.of(fake).complete(CompletionRequest.of(prompt));
+
+        var messages = fake.received.messages();
+        assertThat(messages.get(1)).isInstanceOfSatisfying(AiMessage.class, ai -> {
+            assertThat(ai.hasToolExecutionRequests()).isTrue();
+            assertThat(ai.toolExecutionRequests().get(0).id()).isEqualTo("call-1");
+            assertThat(ai.toolExecutionRequests().get(0).name()).isEqualTo("lookup");
+            assertThat(ai.toolExecutionRequests().get(0).arguments()).isEqualTo("{\"id\":\"T-1\"}");
+        });
+        assertThat(messages.get(2)).isInstanceOfSatisfying(dev.langchain4j.data.message.ToolExecutionResultMessage.class, r -> {
+            assertThat(r.id()).isEqualTo("call-1");
+            assertThat(r.toolName()).isEqualTo("lookup");
+            assertThat(r.text()).isEqualTo("found");
+        });
+        assertThat(messages.get(3)).isInstanceOf(UserMessage.class);
+    }
 }
