@@ -709,6 +709,13 @@ public final class ReplayingContext implements Context {
     }
 
     private void requireAppendable(String what) {
+        // A swallowed wait stays a wait, as the stop signals do: nothing may be recorded after
+        // SignalAwaited. A fallback that made a model/tool/effect call would put its events between the
+        // wait and the signal delivered later, and the resume — which looks for SignalReceived where the
+        // task waits — could never get past them. Checked FIRST, so a pure replay that reaches a recorded
+        // wait unwinds as a wait (and replay() ends there) rather than as "ran past the log". Cancel
+        // still wins: the runtime's park path records a pending cancel whichever signal unwound.
+        if (raisedWaiting != null) throw raisedWaiting;
         if (!appendEnabled) {
             throw new NonDeterministicReplayException(-1,
                     "recorded boundary", "live execution at " + what
@@ -727,11 +734,6 @@ public final class ReplayingContext implements Context {
             throw new ExecutionAbandonedSignal("runtime shutting down before " + what + "; execution " + id
                     + " is left RUNNING for the next start to resume");
         }
-        // A swallowed wait stays a wait, as the stop signals do: nothing may be recorded after
-        // SignalAwaited. A fallback that made a model/tool/effect call would put its events between the
-        // wait and the signal delivered later, and the resume — which looks for SignalReceived where the
-        // task waits — could never get past them.
-        if (raisedWaiting != null) throw raisedWaiting;
     }
 
     private long append(CatalystEvent event) {

@@ -286,6 +286,10 @@ class SignalTest {
             assertThat(log.read(handle.id()).getLast().event()).isInstanceOf(CatalystEvent.SignalAwaited.class);
             assertThat(model.callCount()).as("the fallback's model call never ran").isZero();
 
+            // A strict replay of the still-waiting execution ends at the wait too — the fallback's call
+            // re-raises the wait instead of reading as "ran past the recorded log".
+            assertThat(runtime.replay(handle.id(), new SwallowingFallback()).status()).isEqualTo(Status.WAITING);
+
             assertThat(runtime.signal(handle.id(), "approval", new Approval("dana", true)).result())
                     .isEqualTo("approved by dana");
         }
