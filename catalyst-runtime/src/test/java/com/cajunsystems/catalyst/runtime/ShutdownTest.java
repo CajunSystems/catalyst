@@ -133,8 +133,9 @@ class ShutdownTest {
         assertThat(log.closed).isTrue();
 
         release.countDown();
-        assertThatThrownBy(handle::result).isInstanceOf(ExecutionAbandonedSignal.class);
-        assertThat(fold(log.delegate, handle.id()).status()).isEqualTo(Status.RUNNING);
+        assertThatThrownBy(handle::result).isNotNull(); // its completion could not be written
+        assertThat(fold(log.delegate, handle.id()).status())
+                .as("the late worker's failed writes left nothing terminal").isEqualTo(Status.RUNNING);
     }
 
     /**
@@ -311,6 +312,74 @@ class ShutdownTest {
         assertThatThrownBy(handle::result).isNotInstanceOf(ExecutionAbandonedSignal.class);
         assertThat(fold(log, handle.id()).isTerminal()).as("recorded terminal, not left for recovery").isTrue();
         assertThat(log.openExecutions()).doesNotContain(handle.id());
+    }
+
+    /**
+     * A provider call that fails during the drain is a genuine, known failure — not something to
+     * abandon. The model boundary records CompletionRequested before calling the provider; abandoning
+     * the failure would leave that request dangling, and the restart would treat it as in doubt and
+     * fail the execution terminally under InDoubtPolicy.FAIL. With retry budget, the failure is
+     * recorded as RetryRequested and the retry runs on the next start.
+     */
+    @Test
+    void aModelFailureDuringTheDrainIsRecordedNotLeftInDoubt() throws Exception {
+        InMemoryEventLog log = new InMemoryEventLog();
+        AtomicReference<CatalystRuntime> current = new AtomicReference<>();
+        CountDownLatch inStep2 = new CountDownLatch(1);
+        AtomicInteger step2Calls = new AtomicInteger();
+        MockModel model = MockModel.builder().respond(req -> {
+            String last = req.prompt().messages().stream().filter(m -> m.role() == Role.USER)
+                    .reduce((a, b) -> b).map(Message::content).orElse("");
+            if (last.contains("summarize")) return new Completion("SUMMARY", List.of(), new Usage(1, 1), "stop");
+            if (step2Calls.getAndIncrement() == 0) {
+                inStep2.countDown();
+                while (!current.get().isShuttingDown()) Thread.onSpinWait();
+                throw new IllegalStateException("provider 503");   // fails during the drain
+            }
+            return new Completion("FINAL", List.of(), new Usage(1, 1), "stop");
+        }).build();
+
+        CatalystRuntime first = CatalystRuntime.builder().log(log).model(model)
+                .retryPolicy(RetryPolicy.maxRetries(3, Duration.ofSeconds(30))).build();
+        current.set(first);
+        ExecutionHandle<String> handle = first.execute(new TwoStepTask());
+        assertThat(inStep2.await(5, TimeUnit.SECONDS)).isTrue();
+        first.close();
+
+        ExecutionId id = handle.id();
+        assertThat(log.read(id).getLast().event())
+                .as("the failed request is closed by a verdict, not left dangling")
+                .isInstanceOf(CatalystEvent.RetryRequested.class);
+        assertThat(fold(log, id).status()).isEqualTo(Status.RUNNING);
+
+        try (CatalystRuntime restarted = CatalystRuntime.builder()
+                .log(log).model(model).task(new TwoStepTask()).recoverOnStart(true).build()) {
+            current.set(restarted);
+            assertThat(restarted.startupRecovery().orElseThrow().resumed().get(id).result())
+                    .as("no InDoubtException, no pause: the retry runs").isEqualTo("SUMMARY|FINAL");
+        }
+    }
+
+    /** Without retry budget the same failure is a plain ExecutionFailed with its real cause — not in doubt. */
+    @Test
+    void aModelFailureDuringTheDrainWithoutRetryBudgetFailsWithItsRealCause() throws Exception {
+        InMemoryEventLog log = new InMemoryEventLog();
+        AtomicReference<CatalystRuntime> current = new AtomicReference<>();
+        CountDownLatch inCall = new CountDownLatch(1);
+        MockModel model = MockModel.builder().respond(req -> {
+            inCall.countDown();
+            while (!current.get().isShuttingDown()) Thread.onSpinWait();
+            throw new IllegalStateException("provider 503");
+        }).build();
+        CatalystRuntime runtime = CatalystRuntime.builder().log(log).model(model).build();
+        current.set(runtime);
+        ExecutionHandle<String> handle = runtime.execute(new TwoStepTask());
+        assertThat(inCall.await(5, TimeUnit.SECONDS)).isTrue();
+        runtime.close();
+
+        ExecutionState state = fold(log, handle.id());
+        assertThat(state.status()).isEqualTo(Status.FAILED);
+        assertThat(state.error()).contains("provider 503").doesNotContain("InDoubt");
     }
 
     /** Fails its effect on the first attempt only. */

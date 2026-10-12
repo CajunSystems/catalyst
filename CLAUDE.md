@@ -247,8 +247,13 @@ checkout's pom to `com.github.CajunSystems` before installing.
   attempts scheduled concurrently with shutdown. `ReplayingContext.requireAppendable` raises
   `ExecutionAbandonedSignal` (after the cancel check — cancel wins) **before** a boundary records
   anything; `runAttempt` handles it in its own branch before the retry decision and appends
-  **nothing**, so the execution stays `RUNNING` and Deploy-2 recovery resumes it. Any throwable while
-  abandoned is treated as abandon (a log closed under a late worker must not become `ExecutionFailed`).
+  **nothing**, so the execution stays `RUNNING` and Deploy-2 recovery resumes it. **Only what the
+  abandon signal unwound is abandoned** (`t instanceof ExecutionAbandonedSignal || ctx.raisedAbandon()`,
+  and no cancel pending). A *genuine* failure during the drain goes through the normal retry/fail
+  decision — essential for model calls: `CompletionRequested` is appended before the provider call,
+  so an abandoned provider failure would leave it dangling → in-doubt on restart → terminal under
+  `InDoubtPolicy.FAIL`. A retryable one writes `RetryRequested`, then abandons instead of sleeping. A
+  late worker whose appends fail on a closed log still writes nothing (`recordFailed` is best-effort).
   **Abandon never interrupts**: interrupting mid-provider-call leaves a dangling `CompletionRequested`
   → in-doubt on resume. The in-flight call finishes and records; the unwind happens at the next
   boundary. So the retry backoff sleep polls the token in 50ms slices rather than relying on an

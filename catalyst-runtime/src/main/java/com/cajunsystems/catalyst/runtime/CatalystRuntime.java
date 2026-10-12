@@ -792,19 +792,27 @@ public final class CatalystRuntime implements AutoCloseable {
                         recordCancelled(id, runningAttempt.token.reason(), future);
                         return;
                     }
-                    // Shutdown, in its own branch BEFORE the retry decision: whatever unwound the task
-                    // — the abandon signal at a boundary, or a failure caused by the log closing under
-                    // a worker that outlived the drain — append nothing. recordFailed would write a
-                    // terminal ExecutionFailed, and recovery never resumes a terminal execution. This
-                    // costs nothing even if the failure was genuine: nothing past the last recorded
-                    // boundary was kept, so the next start re-runs it and meets the failure again.
+                    // Shutdown, in its own branch BEFORE the retry decision — but only for what the
+                    // abandon signal itself unwound (directly, or swallowed and then failed another way).
+                    // That signal is raised before a boundary records anything, so abandoning it
+                    // appends nothing and leaves no request in doubt.
+                    //
+                    // A GENUINE failure during the drain is not abandoned: it falls through to the normal
+                    // retry/fail decision below. Abandoning it would be wrong for a model call in
+                    // particular — the boundary records CompletionRequested before calling the provider,
+                    // and a provider failure records nothing after it, so only the RetryRequested (or
+                    // ExecutionFailed) written below closes that request as a verdict. Left dangling, the
+                    // restart would see an in-doubt completion and, under InDoubtPolicy.FAIL, fail the
+                    // execution terminally over a failure that was known and not billed. A retryable
+                    // failure still writes its RetryRequested and is then abandoned instead of sleeping
+                    // (the backoff wakes on shutdown), so the next start runs the retry. A worker whose
+                    // writes fail because the log closed under it records nothing either way.
                     //
                     // Not if a cancel is pending, though: cancel() interrupts, and an interrupt that
-                    // surfaces as an ordinary exception inside a boundary matches neither check above.
-                    // Abandoning it would leave the execution RUNNING for the next start to resume and
-                    // complete — undoing the cancel. Falling through gives it exactly the handling it
-                    // gets outside a shutdown (a terminal record), so cancel still wins.
-                    if (runningAttempt.token.isAbandoned() && !runningAttempt.token.isCancelled()) {
+                    // surfaces as an ordinary exception inside a boundary matches neither cancel check.
+                    // Falling through gives it exactly the handling it gets outside a shutdown.
+                    boolean unwoundByAbandon = t instanceof ExecutionAbandonedSignal || ctx.raisedAbandon();
+                    if (unwoundByAbandon && runningAttempt.token.isAbandoned() && !runningAttempt.token.isCancelled()) {
                         abandon(id, future);
                         return;
                     }
@@ -968,9 +976,11 @@ public final class CatalystRuntime implements AutoCloseable {
      *
      * <p>Two consequences worth knowing. "The next start resumes it" assumes the task type is
      * registered there (as for any {@link #resume(ExecutionId)}); an unregistered one is reported in
-     * {@link RecoveryReport#notRecovered()}. And a task that fails for a genuine reason while the
-     * runtime is closing is abandoned, not recorded as {@code ExecutionFailed} — so the next start
-     * re-runs it from its last recorded boundary and meets the failure again, recording it then.
+     * {@link RecoveryReport#notRecovered()}. And only what the shutdown itself unwound is abandoned:
+     * a call that fails for a genuine reason during the drain is recorded exactly as it would be
+     * outside a shutdown — a {@code RetryRequested} if the retry policy allows (the retry then runs on
+     * the next start), otherwise {@code ExecutionFailed} — so a failed model call is never left as an
+     * in-doubt request.
      *
      * <p>Idempotent, and a barrier: a concurrent second call returns only once the first has closed
      * the log. Called from one of this runtime's own task threads, it does not wait for the drain
