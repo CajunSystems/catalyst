@@ -658,6 +658,13 @@ public final class CatalystRuntime implements AutoCloseable {
                         + (waitingFor.map(w -> " waiting for signal '" + w + "'").orElse(""))
                         + ", not waiting for signal '" + name + "'");
             }
+            // A branch child records no task type (its stream starts with ExecutionBranched) and cannot be
+            // resumed — its overrides are not recorded. Refuse before writing: a recorded signal nothing
+            // can consume would strand it in RESUMING.
+            if (state.taskType() == null) {
+                throw new IllegalStateException("Execution " + id + " has no recorded task type (a branch child)"
+                        + " and cannot be resumed, so it cannot accept signal '" + name + "'");
+            }
             log.append(id, new CatalystEvent.SignalReceived(now(), name, payloads.toTree(payload)));
             if (registry.lookup(state.taskType()).isEmpty()) {
                 return new FutureExecutionHandle<>(id, CompletableFuture.failedFuture(new IllegalStateException(

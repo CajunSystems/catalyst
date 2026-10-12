@@ -302,6 +302,29 @@ class SignalTest {
         }
     }
 
+    /**
+     * A branch child that parked on a wait has no recorded task type and cannot be resumed (its
+     * overrides aren't recorded). signal() must refuse it before writing — not record a signal nothing
+     * can consume, stranding it in RESUMING.
+     */
+    @Test
+    void aBranchChildWaitingForASignalRefusesItBeforeWriting() {
+        InMemoryEventLog log = new InMemoryEventLog();
+        ExecutionId child = ExecutionId.random();
+        log.append(child, new CatalystEvent.ExecutionBranched(Instant.now(), "parent", 3, "branch@3"));
+        log.append(child, new CatalystEvent.ExecutionStarted(Instant.now(), 1, "node-0"));
+        log.append(child, new CatalystEvent.SignalAwaited(Instant.now(), "approval"));
+        try (CatalystRuntime runtime = runtime(log, model())) {
+            assertThat(runtime.inspect(child).awaitingSignal()).contains("approval");
+            int before = log.read(child).size();
+
+            assertThatThrownBy(() -> runtime.signal(child, "approval", new Approval("dana", true)))
+                    .isInstanceOf(IllegalStateException.class).hasMessageContaining("branch child");
+            assertThat(log.read(child)).as("nothing written").hasSize(before);
+            assertThat(runtime.inspect(child).status()).isEqualTo(Status.WAITING);
+        }
+    }
+
     @Test
     void aWaitingExecutionCanBeCancelled() {
         InMemoryEventLog log = new InMemoryEventLog();
