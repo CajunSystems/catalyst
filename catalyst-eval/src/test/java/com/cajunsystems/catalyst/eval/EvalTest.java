@@ -373,4 +373,57 @@ class EvalTest {
             assertThat(runtime.inspect(r.branchId()).status()).isEqualTo(Status.FAILED);
         }
     }
+
+    /** Input, a lookup, then the model: the parent shape for the early-fork case. */
+    static final class LookupThenModel implements Task<String> {
+        final LookupTool lookup;
+        final boolean traceFirst;
+        LookupThenModel(LookupTool lookup, boolean traceFirst) { this.lookup = lookup; this.traceFirst = traceFirst; }
+        @Override public String execute(Context ctx) {
+            if (traceFirst) ctx.effect("trace", () -> "on");   // a new first step: diverges at the very start
+            String ticket = ctx.effect("ticket", () -> "t-1");
+            String details = ctx.call(lookup, ticket);
+            return ctx.model().complete(CompletionRequest.of(Prompt.builder().user(details).build())).message();
+        }
+    }
+
+    /**
+     * A candidate that diverges before the planned branch point forks there. The parent's tool calls
+     * from that point on were never used, so they must still answer: not a false UNRECORDED_TOOL, and
+     * never a re-run of the side effect.
+     */
+    @Test
+    void aCandidateThatForksEarlyIsStillAnsweredFromTheRecording() {
+        var recordedRun = runtime.execute(new LookupThenModel(lookup, false), ExecutionOptions.none());
+        recordedRun.result();
+        int lookupsBefore = lookup.calls.get();
+
+        EvalReport report = Eval.on(runtime).cases(recordedRun.id()).task(new LookupThenModel(lookup, false))
+                .candidate(Candidate.task("traced", new LookupThenModel(lookup, true)))
+                .scorer(Scorers.sameResult()).run();
+
+        assertThat(report.summary("traced").passedAllScorers()).isEqualTo(1);
+        assertThat(lookup.calls).hasValue(lookupsBefore);
+    }
+
+    /** An agent-style task that catches tool errors cannot turn an unanswerable call into a completion. */
+    @Test
+    void anUnrecordedToolCallTheTaskSwallowsIsStillReported() {
+        int lookupsBefore = lookup.calls.get();
+        Task<String> forgiving = ctx -> {
+            ctx.effect("ticket", () -> "unused");
+            ctx.effect("received-at", () -> "unused");
+            String details;
+            try {
+                details = ctx.call(lookup, "A-DIFFERENT-INPUT");
+            } catch (RuntimeException e) {
+                details = "lookup unavailable";
+            }
+            return ctx.model().complete(CompletionRequest.of(Prompt.builder().user(details).build())).message();
+        };
+        EvalReport report = eval().candidate(Candidate.task("forgiving", forgiving)).run();
+
+        assertThat(report.summary("forgiving").outcomes()).containsEntry(CaseResult.Outcome.UNRECORDED_TOOL, 3);
+        assertThat(lookup.calls).hasValue(lookupsBefore);
+    }
 }

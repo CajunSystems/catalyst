@@ -986,7 +986,7 @@ public final class CatalystRuntime implements AutoCloseable {
         String components = changedComponents == null || changedComponents.isBlank()
                 ? "branch@" + atSeq : changedComponents;
         BranchSpec spec = new BranchSpec(atSeq, parentId.value(), overrides, components,
-                toolReplay, toolReplay == BranchSpec.ToolReplay.LIVE ? Map.of() : recordedToolResults(parentEvents, atSeq));
+                toolReplay, toolReplay == BranchSpec.ToolReplay.LIVE ? Map.of() : recordedToolResults(parentEvents));
 
         // The child log begins with the branch marker + started (the fork itself won't re-record it).
         StreamCursor childCursor = StreamCursor.after(log, childId, -1);
@@ -1003,6 +1003,8 @@ public final class CatalystRuntime implements AutoCloseable {
                 parentEvents, /* appendEnabled */ true, null, childCursor);
         try (AutoCapture.Scope captured = AutoCapture.bind(ctx)) {
             R result = task.execute(ctx);
+            // The task swallowed an unanswerable tool call: still that finding, not a completion.
+            if (ctx.raisedUnrecordedTool() != null) throw ctx.raisedUnrecordedTool();
             childCursor.append(new CatalystEvent.ExecutionCompleted(now(), payloads.toTree(result)));
         } catch (ExecutionPausedSignal pause) {
             // ExecutionPaused already recorded by the context (e.g. an ASK in-doubt tool); the child
@@ -1038,24 +1040,21 @@ public final class CatalystRuntime implements AutoCloseable {
     }
 
     /**
-     * The parent's successful tool outputs past the fork ({@code seq > atSeq}), keyed by
-     * {@link BranchSpec#toolKey}, each key's outputs in recorded order: each {@code ToolRequested}
-     * paired with the {@code ToolCompleted} after it. Calls at or before the fork are left out, since
-     * replay substitutes those. A failed call is left out too, so a branch repeating it gets no
-     * recorded answer rather than a recorded failure.
+     * Every successful tool call the parent recorded, keyed by {@link BranchSpec#toolKey}, each key's
+     * outputs in recorded order with the seq of their {@code ToolCompleted}. The context uses only those
+     * after the point its replay actually reached, which can be earlier than {@code atSeq}. A failed
+     * call is left out, so a branch repeating it gets no recorded answer rather than a recorded failure.
      */
-    private static Map<String, List<JsonNode>> recordedToolResults(List<SequencedEvent> events, long atSeq) {
-        Map<String, List<JsonNode>> out = new HashMap<>();
+    private static Map<String, List<BranchSpec.RecordedOutput>> recordedToolResults(List<SequencedEvent> events) {
+        Map<String, List<BranchSpec.RecordedOutput>> out = new HashMap<>();
         CatalystEvent.ToolRequested pending = null;
-        long pendingSeq = -1;
         for (SequencedEvent se : events) {
             if (se.event() instanceof CatalystEvent.ToolRequested tr) {
                 pending = tr;
-                pendingSeq = se.seq();
             } else if (se.event() instanceof CatalystEvent.ToolCompleted tc && pending != null) {
-                if (tc.error() == null && pendingSeq > atSeq) {
+                if (tc.error() == null) {
                     out.computeIfAbsent(BranchSpec.toolKey(pending.toolName(), Hashing.canonicalJsonHash(pending.input())),
-                            k -> new ArrayList<>()).add(tc.output());
+                            k -> new ArrayList<>()).add(new BranchSpec.RecordedOutput(se.seq(), tc.output()));
                 }
                 pending = null;
             }

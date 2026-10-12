@@ -286,4 +286,24 @@ class BranchTest {
             assertThat(reads).as("nothing re-run").hasValue(3);
         }
     }
+
+    /** Each run of one builder is an independent branch, as before child ids were minted up front. */
+    @Test
+    void runningOneBuilderTwiceGivesTwoBranches() {
+        SendTool send = new SendTool();
+        try (CatalystRuntime runtime = CatalystRuntime.builder().log(EventLogs.inMemory())
+                .model(MockModel.alwaysReturn("ops")).build()) {
+            var parent = runtime.execute(notify(send), com.cajunsystems.catalyst.ExecutionOptions.none());
+            parent.result();
+            BranchBuilder builder = runtime.branch(parent.id(), 1).withModel(MockModel.alwaysReturn("ops"))
+                    .toolReplay(com.cajunsystems.catalyst.engine.BranchSpec.ToolReplay.RECORDED_ONLY);
+            var expected = builder.childId();
+            var first = builder.run(notify(send));
+            var second = builder.run(notify(send));
+            assertThat(first.id()).isEqualTo(expected);
+            assertThat(second.id()).isNotEqualTo(first.id());
+            assertThat(first.status()).isEqualTo(com.cajunsystems.catalyst.Status.COMPLETED);
+            assertThat(second.status()).isEqualTo(com.cajunsystems.catalyst.Status.COMPLETED);
+        }
+    }
 }

@@ -22,15 +22,20 @@ import java.util.Map;
  * @param toolOverrides       counterfactual outputs by tool name (already serialized to JSON)
  * @param changedComponents   human description of what was swapped, for the event/timeline
  * @param toolReplay          how tool calls past the fork are answered
- * @param recordedToolResults the parent's tool outputs <em>past the fork</em>, keyed by {@link #toolKey},
- *                            each key's outputs in recorded order. A repeated call (a second clock
- *                            read, a poll that answered "pending" then "done") is answered by the
- *                            next output in turn, not the first again. Calls before the fork are not
- *                            here, since replay has already substituted them. Used unless
+ * @param recordedToolResults every successful tool call the parent recorded, keyed by {@link #toolKey},
+ *                            each key's outputs in recorded order with the seq they completed at. The
+ *                            context answers a live call only from outputs recorded after the point
+ *                            replay actually reached. A candidate can fork earlier than
+ *                            {@code atSeq}, and the parent's calls from there on are still unused. A
+ *                            repeated call (a second clock read, a poll that answered "pending" then
+ *                            "done") gets the next output in turn, not the first again. Used unless
  *                            {@code toolReplay} is {@link ToolReplay#LIVE}
  */
 public record BranchSpec(long atSeq, String parentId, Map<String, JsonNode> toolOverrides, String changedComponents,
-                         ToolReplay toolReplay, Map<String, List<JsonNode>> recordedToolResults) {
+                         ToolReplay toolReplay, Map<String, List<RecordedOutput>> recordedToolResults) {
+
+    /** One recorded tool output and the seq of the {@code ToolCompleted} that recorded it. */
+    public record RecordedOutput(long seq, JsonNode output) {}
 
     /** How a branch answers tool calls once it has forked off the recording. */
     public enum ToolReplay {

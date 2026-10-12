@@ -440,11 +440,15 @@ checkout's pom to `com.github.CajunSystems` before installing.
   - **Branch point** = just before the first `PromptBuilt`/`CompletionRequested`. **Not** before
     `CompletionRequested` alone: the model boundary starts at `PromptBuilt`, and branching between
     them duplicated the PROMPT step and broke every diff.
-  - **Recorded tool replay:** `BranchSpec.ToolReplay` + `recordedToolResults`. These are the
-    parent's successful `ToolRequested`→`ToolCompleted` pairs **past the fork only** (replay
-    substitutes earlier ones), keyed `name#canonicalJsonHash(input)`, each key a **queue in recorded
-    order**. Answering every repeat with the first output made a poll loop forever (review finding).
-    A call beyond the recorded ones has no answer.
+  - **Recorded tool replay:** `BranchSpec.ToolReplay` + `recordedToolResults`. These are *all* the
+    parent's successful `ToolRequested`→`ToolCompleted` pairs, keyed `name#canonicalJsonHash(input)`,
+    each key a **queue in recorded order** carrying its `ToolCompleted` seq.
+    - The context answers only from outputs after **`lastReplayedSeq`**. That is the highest boundary
+      replay consumed, pulled back to `seq - 1` by `fork(seq)`. It is not `atSeq`: a candidate can
+      fork earlier, and the parent's calls from there on are unused (review finding).
+    - Repeats are consumed in order. Answering each with the first output made a poll loop forever.
+    - `raisedUnrecordedTool()` makes a swallowed refusal still fail the branch.
+    - `BranchBuilder.childId()` is the *next* run's id; each `run()` takes it and mints a fresh one.
     `ReplayingContext.answerFromRecording` handles a forked, non-deterministic tool call: it records
     the boundary with the recorded output, runs live (`RECORDED_OR_LIVE`), or throws
     `UnrecordedToolCallException` (`RECORDED_ONLY`). The default `LIVE` keeps M2 unchanged.
