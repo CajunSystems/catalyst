@@ -78,6 +78,8 @@ public final class ReplayingContext implements Context {
     private final boolean appendEnabled;
     /** Nullable: present only for a live attempt the runtime may cancel cooperatively. */
     private final CancellationToken cancellation;
+    /** This attempt's position in the stream; every boundary append goes through it (fenced if the log can). */
+    private final StreamCursor cursor;
     /**
      * Whether this context has raised a stop signal. The runtime cannot rely on the signal unwinding
      * out of the task: both signals are {@code RuntimeException}s, so a task with a
@@ -138,6 +140,22 @@ public final class ReplayingContext implements Context {
                             BranchSpec branchSpec, Clock clock, Logger logger,
                             List<SequencedEvent> recorded, boolean appendEnabled,
                             CancellationToken cancellation) {
+        this(id, log, realModel, info, vars, eventMapper, payloads, inDoubtPolicy, costModel, replayMode,
+                branchSpec, clock, logger, recorded, appendEnabled, cancellation,
+                StreamCursor.after(log, id, recorded));
+    }
+
+    /**
+     * As above, appending through {@code cursor} — the attempt's own position in the stream, shared
+     * with the runtime's lifecycle appends so the whole attempt is one fenced writer.
+     */
+    public ReplayingContext(ExecutionId id, EventLog log, Model realModel, ExecutionInfo info,
+                            Map<String, Object> vars, ObjectMapper eventMapper, PayloadCodec payloads,
+                            InDoubtPolicy inDoubtPolicy, CostModel costModel, ReplayMode replayMode,
+                            BranchSpec branchSpec, Clock clock, Logger logger,
+                            List<SequencedEvent> recorded, boolean appendEnabled,
+                            CancellationToken cancellation, StreamCursor cursor) {
+        this.cursor = java.util.Objects.requireNonNull(cursor, "cursor");
         this.cancellation = cancellation;
         this.id = id;
         this.log = log;
@@ -742,7 +760,7 @@ public final class ReplayingContext implements Context {
     }
 
     private long append(CatalystEvent event) {
-        return log.append(id, event);
+        return cursor.append(event);
     }
 
     /**
