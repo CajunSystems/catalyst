@@ -332,10 +332,42 @@ The original phasing rationale is in `docs/distribution.md`; **this list is the 
   `isDistributed()` reports the mode. Tests: `DistributionGuardTest` and
   `DistributionGuardAcceptanceTest` (the file-backed log is refused and its directory released).
   `FoundationDBAcceptanceTest`'s nodes run distributed.
-- **Dist-3. Leases** — lease row per execution via the tag KV's CAS (gumbo 0.4.0+): claim, heartbeat,
+- ✅ **Dist-3. Leases** — lease row per execution via the tag KV's CAS (gumbo 0.4.0+): claim, heartbeat,
   expiry. Resolve the open question first: whether `expectedSeq` makes a separate fencing token
   redundant. Lease duration and heartbeat interval get defaults plus a knob. A `WAITING` execution
   releases its lease; its signal re-enqueues it (Deploy-6).
+  *As shipped:* **no separate fencing token.** Every stream append is already conditional on what its
+  writer read. A takeover always appends `ExecutionResumed` before doing any work, so the old
+  holder's next append is refused. The lease row itself changes only by CAS on its exact bytes. The
+  lease decides *who should run*, and the fence keeps the stream correct.
+  - **Storage:** `Lease(holder, expiresAtMillis)` on `EventLog` (`supportsLeases` / `readLease` /
+    `compareAndSetLease`; the default throws). `GumboEventLog` keeps it in a KV-only tag through
+    Gumbo's `compareAndSetValue`, and Dist-2's guard now requires `supportsLeases()` as well.
+  - **Claiming:** a distributed runtime claims the lease before any write: in `scheduleAttempt`
+    (every attempt except terminal replay), and via `underLease` for create, signal, pause and cancel
+    of an execution not running here. A live lease held elsewhere → `LeaseHeldException`, before
+    writing. That closes Dist-2's by-id hazard: keyed `execute` and `resume(id)` of another node's
+    running execution are refused.
+  - **Renewal:** a heartbeat (`lease(duration, heartbeat)`, defaults 30s/10s) renews held leases. A
+    renewal that finds the row changed sets the attempt's `leaseLost`, which the token reads as an
+    abandon. The attempt unwinds at its next boundary, appends nothing, and its handle fails with
+    `LeaseLostException`.
+  - **Release:** when the attempt ends, whatever the outcome, `WAITING` included. `close()` releases
+    the rest after the drain.
+  - **Recovery:** `recoverAll()` / `recoverOnStart` are allowed again on a distributed runtime: a live
+    lease held elsewhere → `leftAlone` RUNNING, while a lapsed one is taken over. The scan decides
+    each execution while holding its lease, and a resume re-folds after claiming (claim, then
+    decide), so a node that finished, paused or parked the execution just before the claim can't be
+    overridden. A lease whose
+    holder is this node's own id counts as this node's, so a node restarted under its id needn't wait
+    out its predecessor (node ids must be unique among live nodes).
+  - **Clocks:** expiry is wall-clock from the writer's runtime `Clock`. Skew moves takeovers early or
+    late, never corrupts — but an early takeover leaves the old holder's in-flight call in doubt,
+    terminal under the default `InDoubtPolicy.FAIL`, so lease duration is set well above pauses
+    (`FoundationDBAcceptanceTest` uses a skewed node to show the fence catching
+    exactly that).
+  - **Left to Dist-4:** the signal side ("re-enqueues it"). A signal on any node already resumes the
+    execution, but nothing watches the queue yet.
 - **Dist-4. Claim loop + cross-node control** — each node subscribes to the Deploy-1 queue, claims via
   Dist-3, runs `resume(id)`, and reclaims expired leases. **Control ships in the same item**: today
   `cancel(id)`/`pause(id)` append `ExecutionCancelled`/`ExecutionPaused` directly when the execution

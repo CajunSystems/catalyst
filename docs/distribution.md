@@ -366,10 +366,14 @@ Being clear about the limits, since the comparison to BEAM invites them:
 - **Where CAS belongs on the tag KV.** A `compareAndSetTagValue(tag, key, expected, value)` on
   `PersistenceAdapter` is the obvious shape, and FDB gives it natively. The file adapter needs it only
   to be correct within one process, since a shared *file* directory is not the multi-writer target.
-- **Lease duration and heartbeat interval.** Too short causes spurious reclaims under GC pressure;
-  too long delays failover. Needs a default plus a knob.
-- **Fencing token vs. `expectedSeq`.** They may be the same thing: `expectedSeq` already fences the
-  write, so a separate token may be redundant. Worth resolving before implementing leases.
+- ~~**Lease duration and heartbeat interval.**~~ *Resolved in Dist-3:* defaults of 30s and 10s,
+  set with `Builder.lease(duration, heartbeat)`.
+- ~~**Fencing token vs. `expectedSeq`.**~~ *Resolved in Dist-3: no separate token.* Every stream
+  append is conditional on what its writer read. A takeover appends `ExecutionResumed` before any
+  work, so a holder that outlived its lease is refused at its next append. The lease row itself
+  changes only by CAS on its exact bytes. A token would add protection only for writes the fence
+  doesn't cover, and the only such writes are to external systems, which no token can fence unless
+  they check it themselves.
 - **Cost of per-tag sequencing.** Applying the `Sequencer` pattern at tag granularity is the natural
   fix (see above), but a distinct FDB key per execution is a very different access pattern from one
   global counter. Worth weighing against deriving `localId` from a persisted per-tag counter updated

@@ -185,4 +185,35 @@ class FoundationDBEventLogTest {
             assertThat(read.value().asText()).isEqualTo(big);
         }
     }
+
+    /**
+     * The claim Dist-3's leases rest on, across connections: two nodes race to claim the same
+     * execution's lease, 20 rounds, and exactly one wins each round.
+     */
+    @Test
+    void exactlyOneOfTwoNodesClaimsALease() throws Exception {
+        try (GumboEventLog a = node(); GumboEventLog b = node()) {
+            assertThat(a.supportsLeases()).isTrue();
+            for (int round = 0; round < 20; round++) {
+                ExecutionId id = ExecutionId.random();
+                CountDownLatch start = new CountDownLatch(1);
+                CompletableFuture<Boolean> fromA = CompletableFuture.supplyAsync(() -> claim(a, id, "node-a", start));
+                CompletableFuture<Boolean> fromB = CompletableFuture.supplyAsync(() -> claim(b, id, "node-b", start));
+                start.countDown();
+                boolean wonA = fromA.get();
+                boolean wonB = fromB.get();
+                assertThat(wonA ^ wonB).as("round %d: exactly one winner", round).isTrue();
+                assertThat(b.readLease(id).orElseThrow().holder()).isEqualTo(wonA ? "node-a" : "node-b");
+            }
+        }
+    }
+
+    private static boolean claim(GumboEventLog log, ExecutionId id, String node, CountDownLatch start) {
+        try {
+            start.await();
+        } catch (InterruptedException e) {
+            throw new IllegalStateException(e);
+        }
+        return log.compareAndSetLease(id, null, new com.cajunsystems.catalyst.log.Lease(node, Long.MAX_VALUE));
+    }
 }

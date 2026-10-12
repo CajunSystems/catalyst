@@ -5,6 +5,7 @@ import com.cajunsystems.catalyst.events.CatalystEvent;
 import com.cajunsystems.catalyst.events.SequencedEvent;
 import com.cajunsystems.catalyst.log.EventLog;
 import com.cajunsystems.catalyst.log.ExecutionIndex;
+import com.cajunsystems.catalyst.log.Lease;
 import com.cajunsystems.catalyst.log.Snapshot;
 import com.cajunsystems.catalyst.log.StaleWriterException;
 
@@ -25,6 +26,7 @@ public final class InMemoryEventLog implements EventLog {
     private final Map<ExecutionId, List<SequencedEvent>> streams = new ConcurrentHashMap<>();
     private final Map<String, ExecutionId> keyIndex = new ConcurrentHashMap<>();
     private final Map<ExecutionId, Snapshot> snapshots = new ConcurrentHashMap<>();
+    private final Map<ExecutionId, Lease> leases = new ConcurrentHashMap<>();
 
     /** Creation-ordered open set; guarded by its own monitor. See {@link ExecutionIndex}. */
     private final Set<ExecutionId> open = new LinkedHashSet<>();
@@ -125,6 +127,25 @@ public final class InMemoryEventLog implements EventLog {
     @Override
     public void putKey(String idempotencyKey, ExecutionId executionId) {
         keyIndex.put(idempotencyKey, executionId);
+    }
+
+    /** Leases live as long as this log; runtimes sharing one instance in a JVM see each other's. */
+    @Override
+    public boolean supportsLeases() {
+        return true;
+    }
+
+    @Override
+    public Optional<Lease> readLease(ExecutionId executionId) {
+        return Optional.ofNullable(leases.get(executionId));
+    }
+
+    @Override
+    public boolean compareAndSetLease(ExecutionId executionId, Lease expected, Lease replacement) {
+        if (expected == null) {
+            return replacement == null ? !leases.containsKey(executionId) : leases.putIfAbsent(executionId, replacement) == null;
+        }
+        return replacement == null ? leases.remove(executionId, expected) : leases.replace(executionId, expected, replacement);
     }
 
     @Override

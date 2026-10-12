@@ -76,6 +76,9 @@ public final class CatalystRuntime implements AutoCloseable {
 
     private static final Logger LOG = LoggerFactory.getLogger(CatalystRuntime.class);
     private static final Duration DEFAULT_DRAIN_TIMEOUT = Duration.ofSeconds(10);
+    /** How long a node's claim on an execution lasts without renewal; see {@link Builder#lease}. */
+    private static final Duration DEFAULT_LEASE_DURATION = Duration.ofSeconds(30);
+    private static final Duration DEFAULT_LEASE_HEARTBEAT = Duration.ofSeconds(10);
     /** How often a retry backoff checks whether it was cancelled or abandoned. */
     private static final long BACKOFF_POLL_MILLIS = 50;
     /** How many still-running ids a drain-timeout warning names before summarising the rest. */
@@ -102,6 +105,8 @@ public final class CatalystRuntime implements AutoCloseable {
     private final ShardRing shardRing;
     /** Built with {@link Builder#distributed()}: the log is shared with runtimes in other processes. */
     private final boolean distributed;
+    /** This node's leases (Dist-3); null unless {@link #distributed}. */
+    private final LeaseKeeper leases;
 
     /**
      * True once {@link #close()} has begun. Every attempt's token reads it as its abandon flag, so this
@@ -156,7 +161,13 @@ public final class CatalystRuntime implements AutoCloseable {
 
     /** A running attempt's cancellation token plus its worker thread (set once the worker starts). */
     private final class RunningAttempt {
-        final CancellationToken token = new CancellationToken(() -> closing);
+        /**
+         * Set when a lease renewal finds another node has taken the execution over (Dist-3). Read as
+         * an abandon flag alongside {@link #closing}: the attempt unwinds at its next boundary and
+         * appends nothing.
+         */
+        volatile boolean leaseLost;
+        final CancellationToken token = new CancellationToken(() -> closing || leaseLost);
         volatile Thread thread;
     }
 
@@ -179,6 +190,7 @@ public final class CatalystRuntime implements AutoCloseable {
         this.shard = b.shard;
         this.shardRing = b.shardRing;
         this.distributed = b.distributed;
+        this.leases = b.distributed ? new LeaseKeeper(log, b.nodeId, b.clock, b.leaseDuration, b.leaseHeartbeat) : null;
         this.executor = Executors.newThreadPerTaskExecutor(
                 Thread.ofVirtual().name("catalyst-exec-", 0).factory());
     }
@@ -202,10 +214,10 @@ public final class CatalystRuntime implements AutoCloseable {
         // it and leave this FRESH attempt as a second writer on the same stream.
         if (key.isEmpty()) {
             ExecutionId id = mintId();
-            return byExecution.withLock(id, () -> {
+            return byExecution.withLock(id, () -> underLease(id, () -> {
                 createExecution(id, taskType, "", opts);
                 return scheduleAttempt(task, id, taskType, opts, Mode.FRESH);
-            });
+            }));
         }
 
         // Keyed: hold the key lock across the whole decision — resolving the key, creating the
@@ -218,10 +230,10 @@ public final class CatalystRuntime implements AutoCloseable {
                 ExecutionId id = mintId();
                 log.putKey(key.get(), id);
                 // Created under the id lock for the same reason as the keyless path above.
-                return byExecution.withLock(id, () -> {
+                return byExecution.withLock(id, () -> underLease(id, () -> {
                     createExecution(id, taskType, key.get(), opts);
                     return scheduleAttempt(task, id, taskType, opts, Mode.FRESH);
-                });
+                }));
             }
             ExecutionId id = existing.get();
             return byExecution.withLock(id, () -> {
@@ -254,8 +266,38 @@ public final class CatalystRuntime implements AutoCloseable {
         if (closing) {
             return new FutureExecutionHandle<>(id, CompletableFuture.failedFuture(notStartedHere(id, null)));
         }
+        // A distributed runtime runs an execution only while holding its lease: claimed here, under the
+        // id lock, before anything is registered or written, and released when the attempt ends —
+        // whatever the outcome, waiting and paused included. A live lease held by another node throws
+        // LeaseHeldException: the execution is running there. Replaying a terminal outcome writes
+        // nothing, so it needs no lease.
+        if (leases != null && mode != Mode.REPLAY_TERMINAL) {
+            boolean claimedHere = leases.acquire(id);
+            // Claim, then decide. The caller chose RESUME from a fold read before the claim, and
+            // another node may have finished the execution, or parked it on a signal, and released
+            // its lease in between. Re-read now that no other node can write. Resuming a terminal
+            // stream would append after its end and re-run the task, and resuming a waiting one would
+            // fold it back to RUNNING.
+            if (mode == Mode.RESUME) {
+                ExecutionState now;
+                try {
+                    now = foldState(id);
+                } catch (RuntimeException e) {
+                    if (claimedHere) leases.release(id);
+                    throw e;
+                }
+                if (now.isTerminal() || now.status() == Status.WAITING) {
+                    if (claimedHere) leases.release(id);
+                    if (!now.isTerminal()) return waitingHandle(id, now);
+                    @SuppressWarnings("unchecked") // completes from the recorded outcome; never runs a task
+                    Task<R> replayOnly = (Task<R>) TERMINAL_REPLAY_TASK;
+                    return scheduleAttempt(replayOnly, id, now.taskType(), opts, Mode.REPLAY_TERMINAL);
+                }
+            }
+        }
         CompletableFuture<R> future = new CompletableFuture<>(); // completed by runAttempt
         RunningAttempt attempt = new RunningAttempt();
+        if (leases != null) leases.onLost(id, () -> attempt.leaseLost = true);
         // Every caller — this handle, and anyone who attaches via inFlight — sees `visible`, which
         // completes only AFTER the attempt is deregistered. Completing the attempt's own future first
         // and deregistering in a dependent let a caller observe the result while the attempt still
@@ -263,6 +305,9 @@ public final class CatalystRuntime implements AutoCloseable {
         // attempt and scheduled nothing. The unconditional inFlight.remove is safe: no other attempt
         // for this id can be scheduled while `visible` is not yet done.
         CompletableFuture<R> visible = future.whenComplete((r, t) -> {
+            // Released before deregistering, so a caller who sees the handle complete can take the
+            // execution over from another node at once.
+            if (leases != null && running.get(id) == attempt) leases.release(id);
             if (running.remove(id, attempt)) inFlight.remove(id);
         });
         inFlight.put(id, visible);
@@ -276,6 +321,24 @@ public final class CatalystRuntime implements AutoCloseable {
             future.completeExceptionally(notStartedHere(id, e));
         }
         return new FutureExecutionHandle<>(id, visible);
+    }
+
+    /**
+     * Runs {@code body} holding the lease on {@code id}, when this runtime is distributed: for the
+     * paths that write to a stream outside an attempt (creating, signalling, pausing, cancelling). If
+     * {@code body} scheduled an attempt, that attempt now owns the lease and releases it when it ends.
+     * Otherwise it is released here. Called under the id lock.
+     *
+     * @throws LeaseHeldException if another node holds a live lease on {@code id}
+     */
+    private <T> T underLease(ExecutionId id, java.util.function.Supplier<T> body) {
+        if (leases == null) return body.get();
+        boolean claimedHere = leases.acquire(id);
+        try {
+            return body.get();
+        } finally {
+            if (claimedHere && !running.containsKey(id)) leases.release(id);
+        }
     }
 
     /** The attempt running for {@code id} in this process, or null; a finished one does not count. */
@@ -575,16 +638,14 @@ public final class CatalystRuntime implements AutoCloseable {
      * {@link #resume(ExecutionId, ExecutionOptions)}. Executions recorded before the log kept an
      * index are not listed by it, and so are not recovered here.
      *
-     * <p><strong>Refused on a {@linkplain Builder#distributed() distributed} runtime</strong>, until
-     * leases exist (Dist-3/4). The index is shared, so "open and not running here" includes work
-     * running on another node. Resuming that would append {@code ExecutionResumed} while the other
-     * node is mid-call. Its result would then be refused by the fence, and the call it had started
-     * would be left in doubt, which is terminal under the default {@code InDoubtPolicy.FAIL}.
+     * <p>On a {@linkplain Builder#distributed() distributed} runtime the index is shared, so it lists
+     * work running on other nodes too. Each resume claims the execution's lease first, and one that
+     * another node holds live is left alone and reported {@code RUNNING}: it is running there. One
+     * whose holder died has a lapsed lease and is taken over.
      *
-     * @throws IllegalStateException if the log keeps no execution index, or this runtime is distributed
+     * @throws IllegalStateException if the log keeps no execution index
      */
     public RecoveryReport recoverAll() {
-        if (distributed) throw new IllegalStateException(DISTRIBUTED_RECOVERY_REFUSED);
         if (!log.supportsExecutionIndex()) {
             throw new IllegalStateException(log.getClass().getSimpleName()
                     + " keeps no execution index, so open executions cannot be found after a restart");
@@ -600,16 +661,26 @@ public final class CatalystRuntime implements AutoCloseable {
                         leftAlone.put(id, Status.RUNNING);
                         return;
                     }
-                    ExecutionState state = foldState(id);
-                    if (!isCrashInterrupted(state.status())) {
-                        leftAlone.put(id, state.status());
-                        return;
+                    // Distributed: claim, then decide. The whole decision is made holding the lease, so
+                    // the fold it rests on cannot be overtaken by another node pausing, parking or
+                    // finishing the execution and releasing in between. Recovery must never undo a
+                    // deliberate PAUSED or WAITING (Deploy-2). A live lease held elsewhere means it is
+                    // running there.
+                    try {
+                        underLease(id, () -> {
+                            ExecutionState state = foldState(id);
+                            if (!isCrashInterrupted(state.status())) {
+                                leftAlone.put(id, state.status());
+                            } else if (registry.lookup(state.taskType()).isEmpty()) {
+                                notRecovered.put(id, "no task registered for type '" + state.taskType() + "'");
+                            } else {
+                                resumed.put(id, resume(id)); // reentrant on the id lock and the lease
+                            }
+                            return null;
+                        });
+                    } catch (LeaseHeldException held) {
+                        leftAlone.put(id, Status.RUNNING); // running on held.lease().holder()
                     }
-                    if (registry.lookup(state.taskType()).isEmpty()) {
-                        notRecovered.put(id, "no task registered for type '" + state.taskType() + "'");
-                        return;
-                    }
-                    resumed.put(id, resume(id)); // the lock is reentrant
                 });
             } catch (RuntimeException e) {
                 notRecovered.put(id, String.valueOf(e));
@@ -622,12 +693,6 @@ public final class CatalystRuntime implements AutoCloseable {
         notRecovered.forEach((id, reason) -> LOG.warn("Not recovered: {} ({})", id.value(), reason));
         return report;
     }
-
-    private static final String DISTRIBUTED_RECOVERY_REFUSED = "A distributed runtime cannot run the recovery"
-            + " scan yet: the execution index is shared, so the scan would resume executions running on other"
-            + " nodes, fencing them out and leaving their in-flight calls in doubt. Cross-node recovery needs"
-            + " leases (Dist-3/4); until then resume by id only executions you know are not running on"
-            + " another node (a keyed execute or resume(id) of one that is has the same effect).";
 
     /** The states a process death leaves an execution in — as opposed to ones recorded deliberately. */
     private static boolean isCrashInterrupted(Status status) {
@@ -692,41 +757,47 @@ public final class CatalystRuntime implements AutoCloseable {
             if (liveAttempt(id) != null) {
                 throw new IllegalStateException("Execution " + id + " is running, not waiting for signal '" + name + "'");
             }
-            ExecutionState state = foldState(id);
-            Optional<String> waitingFor = state.awaitingSignal();
-            if (waitingFor.isEmpty() || !waitingFor.get().equals(name)) {
-                throw new IllegalStateException("Execution " + id + " is " + state.status()
-                        + (waitingFor.map(w -> " waiting for signal '" + w + "'").orElse(""))
-                        + ", not waiting for signal '" + name + "'");
-            }
-            // A branch child records no task type (its stream starts with ExecutionBranched) and cannot be
-            // resumed — its overrides are not recorded. Refuse before writing: a recorded signal nothing
-            // can consume would strand it in RESUMING.
-            if (state.taskType() == null) {
-                throw new IllegalStateException("Execution " + id + " has no recorded task type (a branch child)"
-                        + " and cannot be resumed, so it cannot accept signal '" + name + "'");
-            }
-            // Refuse a payload the resume could never accept — before writing it. Once recorded it would be
-            // substituted into every resume and fail each one, terminally, on an append-only log.
-            com.fasterxml.jackson.databind.JsonNode tree = payloads.toTree(payload);
-            Object decoded;
-            try {
-                decoded = payloads.fromTree(tree); // the allowlist the resume will apply
-            } catch (RuntimeException e) {
-                throw new IllegalArgumentException("Signal '" + name + "' payload cannot be recorded: " + e.getMessage()
-                        + " Use a record, enum, string, number, java.time value or UUID.", e);
-            }
-            requirePayloadType(id, name, state.awaitingSignalType(), decoded);
-            // Fenced on the fold the checks above were made against.
-            StreamCursor.after(log, id, state.lastSeq()).append(new CatalystEvent.SignalReceived(now(), name, tree));
-            if (registry.lookup(state.taskType()).isEmpty()) {
-                return new FutureExecutionHandle<>(id, CompletableFuture.failedFuture(new IllegalStateException(
-                        "Signal '" + name + "' recorded for " + id + ", but no task is registered for type '"
-                                + state.taskType() + "' to resume it here; re-submit the task with its"
-                                + " idempotency key, or register it with Catalyst.builder().task(...)")));
-            }
-            return resume(id, opts); // reentrant on the id lock
+            // Held across the checks, the append and the resume, so no other node writes in between.
+            return underLease(id, () -> signalUnderLock(id, name, payload, opts));
         });
+    }
+
+    /** {@link #signal}'s checks, append and resume; called under the id lock and the lease. */
+    private ExecutionHandle<?> signalUnderLock(ExecutionId id, String name, Object payload, ExecutionOptions opts) {
+        ExecutionState state = foldState(id);
+        Optional<String> waitingFor = state.awaitingSignal();
+        if (waitingFor.isEmpty() || !waitingFor.get().equals(name)) {
+            throw new IllegalStateException("Execution " + id + " is " + state.status()
+                    + (waitingFor.map(w -> " waiting for signal '" + w + "'").orElse(""))
+                    + ", not waiting for signal '" + name + "'");
+        }
+        // A branch child records no task type (its stream starts with ExecutionBranched) and cannot be
+        // resumed — its overrides are not recorded. Refuse before writing: a recorded signal nothing
+        // can consume would strand it in RESUMING.
+        if (state.taskType() == null) {
+            throw new IllegalStateException("Execution " + id + " has no recorded task type (a branch child)"
+                    + " and cannot be resumed, so it cannot accept signal '" + name + "'");
+        }
+        // Refuse a payload the resume could never accept — before writing it. Once recorded it would be
+        // substituted into every resume and fail each one, terminally, on an append-only log.
+        com.fasterxml.jackson.databind.JsonNode tree = payloads.toTree(payload);
+        Object decoded;
+        try {
+            decoded = payloads.fromTree(tree); // the allowlist the resume will apply
+        } catch (RuntimeException e) {
+            throw new IllegalArgumentException("Signal '" + name + "' payload cannot be recorded: " + e.getMessage()
+                    + " Use a record, enum, string, number, java.time value or UUID.", e);
+        }
+        requirePayloadType(id, name, state.awaitingSignalType(), decoded);
+        // Fenced on the fold the checks above were made against.
+        StreamCursor.after(log, id, state.lastSeq()).append(new CatalystEvent.SignalReceived(now(), name, tree));
+        if (registry.lookup(state.taskType()).isEmpty()) {
+            return new FutureExecutionHandle<>(id, CompletableFuture.failedFuture(new IllegalStateException(
+                    "Signal '" + name + "' recorded for " + id + ", but no task is registered for type '"
+                            + state.taskType() + "' to resume it here; re-submit the task with its"
+                            + " idempotency key, or register it with Catalyst.builder().task(...)")));
+        }
+        return resume(id, opts); // reentrant on the id lock, and on the lease
     }
 
     /** Refuses a payload that is not of the type the task awaits; a type not loadable here is not checked. */
@@ -850,7 +921,9 @@ public final class CatalystRuntime implements AutoCloseable {
                 throw new IllegalStateException("Cannot pause an execution running in this process: " + id);
             }
             // Fenced on the fold just read: a writer elsewhere that moved the stream on makes this refuse.
-            StreamCursor.after(log, id, state.lastSeq()).append(new CatalystEvent.ExecutionPaused(now(), "paused by request"));
+            // Distributed: only under the lease — refused while another node is running it.
+            underLease(id, () -> StreamCursor.after(log, id, state.lastSeq())
+                    .append(new CatalystEvent.ExecutionPaused(now(), "paused by request")));
         });
     }
 
@@ -882,9 +955,9 @@ public final class CatalystRuntime implements AutoCloseable {
                 if (worker != null) worker.interrupt();
                 return;
             }
-            // Fenced on the fold just read, like pause().
-            StreamCursor.after(log, id, state.lastSeq())
-                    .append(new CatalystEvent.ExecutionCancelled(now(), "cancelled by request", state.lastSeq()));
+            // Fenced on the fold just read, and under the lease, like pause().
+            underLease(id, () -> StreamCursor.after(log, id, state.lastSeq())
+                    .append(new CatalystEvent.ExecutionCancelled(now(), "cancelled by request", state.lastSeq())));
         });
     }
 
@@ -954,7 +1027,7 @@ public final class CatalystRuntime implements AutoCloseable {
                 // Shutting down before this attempt began: don't record a start for work this
                 // process will not do. The execution stays as it is for the next start.
                 if (runningAttempt.token.isAbandoned()) {
-                    abandon(id, future);
+                    abandon(id, future, runningAttempt);
                     return;
                 }
                 int attempt = state.attempt() + 1;
@@ -997,7 +1070,7 @@ public final class CatalystRuntime implements AutoCloseable {
                         return;
                     }
                     if (ctx.raisedAbandon()) {
-                        abandon(id, future);
+                        abandon(id, future, runningAttempt);
                         return;
                     }
                     if (ctx.raisedWaiting()) {
@@ -1048,7 +1121,7 @@ public final class CatalystRuntime implements AutoCloseable {
                         return;
                     }
                     if (stoppedByAbandon) {
-                        abandon(id, future);
+                        abandon(id, future, runningAttempt);
                         return;
                     }
                     // Parked on a signal: SignalAwaited is recorded, so append nothing more — the execution
@@ -1092,7 +1165,7 @@ public final class CatalystRuntime implements AutoCloseable {
                         if (runningAttempt.token.isCancelled()) {
                             recordCancelled(cursor, runningAttempt.token.reason(), future);
                         } else {
-                            abandon(id, future);
+                            abandon(id, future, runningAttempt);
                         }
                         return;
                     }
@@ -1175,7 +1248,11 @@ public final class CatalystRuntime implements AutoCloseable {
      * The shutdown unwind: completes the handle and appends <strong>nothing</strong>, leaving the
      * execution non-terminal in the log for the next start's recovery scan.
      */
-    private <R> void abandon(ExecutionId id, CompletableFuture<R> future) {
+    private <R> void abandon(ExecutionId id, CompletableFuture<R> future, RunningAttempt attempt) {
+        if (attempt.leaseLost && !closing) {
+            future.completeExceptionally(new LeaseLostException(id));
+            return;
+        }
         future.completeExceptionally(new ExecutionAbandonedSignal(
                 "Runtime shut down; " + id + " is left for the next start to resume"));
     }
@@ -1290,6 +1367,9 @@ public final class CatalystRuntime implements AutoCloseable {
                         + " the log under them — they will be recovered on the next start",
                         drainTimeout, running.size(), sample);
             }
+            // After the drain: attempts that unwound have released their own leases; this releases
+            // any still running past the drain timeout, so other nodes need not wait them out.
+            if (leases != null) leases.close();
             log.close();
         } finally {
             closeFinished.countDown();
@@ -1302,6 +1382,7 @@ public final class CatalystRuntime implements AutoCloseable {
         closing = true;
         executor.shutdown();
         closeFinished.countDown();
+        if (leases != null) leases.close();
         if (closeLog) log.close();
     }
 
@@ -1351,6 +1432,9 @@ public final class CatalystRuntime implements AutoCloseable {
         private ShardRing shardRing;
         private boolean distributed;
         private boolean nodeIdSet;
+        private Duration leaseDuration = DEFAULT_LEASE_DURATION;
+        private Duration leaseHeartbeat = DEFAULT_LEASE_HEARTBEAT;
+        private boolean leaseSet;
 
         /** Uses a log the caller already built. Exclusive with {@link #logFactory}. */
         public Builder log(EventLog log) {
@@ -1535,21 +1619,63 @@ public final class CatalystRuntime implements AutoCloseable {
          *       refused rather than appended.</li>
          *   <li>The log reports {@link EventLog#supportsMultiWriter()}, so writers in different
          *       processes are safe at all. A file-backed log is fenced but not multi-writer.</li>
+         *   <li>The log reports {@link EventLog#supportsLeases()}, so nodes can tell which of them
+         *       is running an execution.</li>
          *   <li>A {@link #nodeId(String)} was set. Two nodes left at the default would be
          *       indistinguishable in the log.</li>
-         *   <li>Neither {@link #shard} nor {@link #recoverOnStart} is set. Sharding is the
-         *       alternative to sharing a log: each shard has its own. The recovery scan is not yet
-         *       safe on a shared index (see {@link CatalystRuntime#recoverAll()}).</li>
+         *   <li>{@link #shard} is not set. Sharding is the alternative to sharing a log: each shard
+         *       has its own.</li>
          * </ul>
          * The capabilities are read from the log, never assumed. A log that does not report them is
          * refused even if it could in fact handle several writers.
          *
-         * <p>What this mode gives today: every append is fenced (Dist-1), so runtimes sharing the log
-         * cannot corrupt a stream. Leases and the claim loop, which hand a dead node's work to a live
-         * one, are Dist-3/4.
+         * <p>What this mode gives:
+         * <ul>
+         *   <li>Every append is fenced (Dist-1), so runtimes sharing the log cannot corrupt a
+         *       stream.</li>
+         *   <li>Every write is made under the execution's lease (Dist-3), claimed before the first
+         *       write and renewed on a heartbeat ({@link #lease}). An execution another node is
+         *       running is refused with {@link LeaseHeldException} rather than started a second time.
+         *       {@link CatalystRuntime#recoverAll()} skips what other nodes hold and takes over what
+         *       dead nodes left.</li>
+         * </ul>
+         * The claim loop, which keeps watching for work instead of only scanning at startup, is Dist-4.
          */
         public Builder distributed() {
             this.distributed = true;
+            return this;
+        }
+
+        /**
+         * A {@linkplain #distributed() distributed} runtime's lease timing (defaults 30s and 10s).
+         * {@code duration} is how long a claim lasts unrenewed: after a node dies, its executions wait
+         * this long before another node may take them. {@code heartbeat} is how often a node renews
+         * the leases it holds.
+         *
+         * <p>Too short a duration lets a GC pause or a slow renewal hand a live node's work to
+         * another node. The fence keeps the stream from being corrupted, but the takeover is not
+         * free. The paused node's in-flight model or tool call is left recorded as requested and
+         * never completed, so the new holder finds it <em>in doubt</em> and applies the
+         * {@code InDoubtPolicy}. Under the default {@code FAIL} that ends the execution as
+         * {@code FAILED}; under {@code RETRY} the call is re-issued (and may be billed twice). Set the
+         * duration well above your longest pause and slowest renewal. Too long delays failover. Keep
+         * the heartbeat at a third of the duration or less, so a renewal can fail twice before the
+         * lease lapses. Clock skew between nodes eats into the margin. Refused on a runtime that is
+         * not distributed.
+         */
+        public Builder lease(Duration duration, Duration heartbeat) {
+            if (duration == null || heartbeat == null || heartbeat.toMillis() < 1) {
+                // The heartbeat is scheduled in whole milliseconds; anything shorter would become a
+                // zero delay, which the scheduler rejects inside build().
+                throw new IllegalArgumentException("lease heartbeat must be at least 1ms, and both must be set");
+            }
+            if (heartbeat.compareTo(duration) >= 0) {
+                throw new IllegalArgumentException("lease heartbeat (" + heartbeat + ") must be shorter than its"
+                        + " duration (" + duration + "), or every lease lapses before it is renewed");
+            }
+            this.leaseDuration = duration;
+            this.leaseHeartbeat = heartbeat;
+            this.leaseSet = true;
             return this;
         }
 
@@ -1560,11 +1686,14 @@ public final class CatalystRuntime implements AutoCloseable {
                     throw new IllegalStateException("distributed() and shard(...) are alternatives: a sharded"
                             + " deployment gives each node its own log, a distributed one shares one log");
                 }
-                if (recoverOnStart) throw new IllegalStateException(DISTRIBUTED_RECOVERY_REFUSED);
                 if (!nodeIdSet) {
                     throw new IllegalStateException("A distributed runtime needs nodeId(...), unique per node:"
                             + " nodes left at the default '" + nodeId + "' are indistinguishable in a shared log");
                 }
+            }
+            if (leaseSet && !distributed) {
+                throw new IllegalStateException("lease(...) applies only to a distributed() runtime;"
+                        + " a runtime that does not share its log takes no leases");
             }
             if (log != null && logFactory != null) {
                 throw new IllegalStateException("Set either log(...) or logFactory(...), not both");
@@ -1588,11 +1717,13 @@ public final class CatalystRuntime implements AutoCloseable {
                 if (blobStore != null) blobStore.close();
                 throw e;
             }
-            if (distributed && !(resolved.supportsConditionalAppend() && resolved.supportsMultiWriter())) {
+            if (distributed && !(resolved.supportsConditionalAppend() && resolved.supportsMultiWriter()
+                    && resolved.supportsLeases())) {
                 IllegalStateException refused = new IllegalStateException("distributed() needs a log that is"
-                        + " fenced and multi-writer; " + resolved.getClass().getSimpleName() + " reports"
+                        + " fenced, multi-writer and stores leases; " + resolved.getClass().getSimpleName() + " reports"
                         + " supportsConditionalAppend()=" + resolved.supportsConditionalAppend()
                         + ", supportsMultiWriter()=" + resolved.supportsMultiWriter()
+                        + ", supportsLeases()=" + resolved.supportsLeases()
                         + ". Use a multi-writer log such as GumboEventLog.foundationDB(...).");
                 if (log == null) resolved.close(); // the builder opened it, so the builder releases it
                 throw refused;
