@@ -299,7 +299,11 @@ checkout's pom to `com.github.CajunSystems` before installing.
   **no attempt** (its `ExecutionResumed` would fold to `RUNNING` and recovery would treat a waiter as
   crashed) — `waitingHandle`. The stop rule extends to waiting (swallowed `ExecutionWaitingSignal` →
   still parked; a pending cancel wins, since `cancel()` only tripped the token while the attempt was
-  registered). `replay` of a waiting execution ends cleanly at the wait. `ExecutionState.awaitingSignal()`
+  registered). `replay` of a waiting execution ends cleanly at the wait. A **live** attempt that reaches a still-recorded
+  wait (only possible after something folded it out of `WAITING`, e.g. `pause` then `resume`)
+  **re-records** `SignalAwaited` so the fold returns to `WAITING` — otherwise it stays `RUNNING`, refused by
+  `signal()` and re-resumed by every recovery. `signal()` treats a *done* in-flight future as not running
+  (`inFlight` is cleared by a `whenComplete` that runs after the handle completes). `ExecutionState.awaitingSignal()`
   is **derived from the timeline**, so the state records and snapshot format are unchanged.
   `Context.awaitSignal` is a default method (throws) so other `Context` implementations still compile.
 

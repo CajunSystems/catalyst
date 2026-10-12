@@ -544,13 +544,22 @@ public final class ReplayingContext implements Context {
             return type.cast(payload);
         }
         if (awaitingSignal != null) {
-            // Still waiting (the recorded tail is this wait): park again without recording a second one.
-            // A different signal at this point means the task no longer waits where it did — a divergence.
+            // Still waiting: the recorded wait has no signal after it. A different signal at this point
+            // means the task no longer waits where it did — a divergence.
             String recordedWait = awaitingSignal;
             awaitingSignal = null;
             if (!recordedWait.equals(name)) {
                 forkOrThrow(-1, "await signal " + recordedWait, "await signal " + name);
             } else {
+                // A live attempt only gets here if something folded the execution out of WAITING after
+                // the wait was recorded — a pause, then a resume whose ExecutionResumed folded it to
+                // RUNNING. Parking without a record would leave it RUNNING: refused by signal(), and
+                // re-resumed by every startup recovery. Re-record the wait so the stream folds back to
+                // WAITING for this name. A pure replay (no appends) just stops here.
+                if (appendEnabled) {
+                    requireAppendable("await signal " + name);
+                    append(new SignalAwaited(now(), name));
+                }
                 throw raisedWaiting = new ExecutionWaitingSignal(name, "Execution " + id + " is waiting for signal '" + name + "'");
             }
         }

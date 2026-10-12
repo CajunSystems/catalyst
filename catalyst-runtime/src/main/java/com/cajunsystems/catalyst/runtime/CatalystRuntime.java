@@ -637,7 +637,11 @@ public final class CatalystRuntime implements AutoCloseable {
         requireOwned(id);
         java.util.Objects.requireNonNull(name, "name");
         return byExecution.withLock(id, () -> {
-            if (inFlight.containsKey(id)) {
+            // A completed future is not in flight: inFlight is cleared by a whenComplete that runs after
+            // the handle completes, so a caller that saw ExecutionWaitingSignal and signals at once can
+            // still find the attempt registered for an instant.
+            CompletableFuture<?> live = inFlight.get(id);
+            if (live != null && !live.isDone()) {
                 throw new IllegalStateException("Execution " + id + " is running, not waiting for signal '" + name + "'");
             }
             ExecutionState state = foldState(id);

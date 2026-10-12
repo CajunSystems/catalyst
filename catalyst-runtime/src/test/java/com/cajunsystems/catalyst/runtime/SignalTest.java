@@ -221,6 +221,54 @@ class SignalTest {
         }
     }
 
+    /**
+     * Pausing a waiter, then resuming it, must leave it waiting — not RUNNING. The resume's attempt
+     * folds the status to RUNNING before the task re-parks, so the re-park re-records the wait;
+     * otherwise signal() would refuse it forever and every restart would re-resume it.
+     */
+    @Test
+    void aPausedThenResumedWaiterIsStillWaitingAndStillAcceptsItsSignal() {
+        InMemoryEventLog log = new InMemoryEventLog();
+        MockModel model = model();
+        try (CatalystRuntime runtime = runtime(log, model)) {
+            ExecutionId id = parked(runtime);
+            runtime.pause(id);
+            assertThat(runtime.inspect(id).status()).isEqualTo(Status.PAUSED);
+
+            assertThatThrownBy(() -> runtime.resume(id).result()).isInstanceOf(ExecutionWaitingSignal.class);
+            assertThat(runtime.inspect(id).status()).isEqualTo(Status.WAITING);
+            assertThat(runtime.inspect(id).awaitingSignal()).contains("approval");
+
+            assertThat(runtime.signal(id, "approval", new Approval("dana", true)).result())
+                    .isEqualTo("DRAFT|FINAL (approved by dana)");
+            assertThat(model.callCount()).isEqualTo(2);
+        }
+        try (CatalystRuntime restarted = CatalystRuntime.builder().log(log).model(model)
+                .task(new ReviewedReport()).recoverOnStart(true).build()) {
+            assertThat(restarted.startupRecovery().orElseThrow().resumed()).as("nothing to re-resume").isEmpty();
+        }
+    }
+
+    /**
+     * The documented flow — result() reports the wait, then signal() at once — repeated back to back.
+     * signal() treats a completed attempt as not in flight, because the in-flight entry is cleared by a
+     * whenComplete that runs just after the handle completes. That interleaving is too narrow to hit
+     * reliably here (this test passes without the fix too), so read it as a check of the flow, not a
+     * regression test for the race.
+     */
+    @Test
+    void signallingImmediatelyAfterTheWaitIsReportedIsNeverRefused() {
+        InMemoryEventLog log = new InMemoryEventLog();
+        try (CatalystRuntime runtime = runtime(log, model())) {
+            for (int i = 0; i < 200; i++) {
+                ExecutionHandle<String> handle = runtime.execute(new ReviewedReport(), ExecutionOptions.withKey("k-" + i));
+                assertThatThrownBy(handle::result).isInstanceOf(ExecutionWaitingSignal.class);
+                assertThat(runtime.signal(handle.id(), "approval", new Approval("dana", true)).result())
+                        .isEqualTo("DRAFT|FINAL (approved by dana)");
+            }
+        }
+    }
+
     @Test
     void aWaitingExecutionCanBeCancelled() {
         InMemoryEventLog log = new InMemoryEventLog();
