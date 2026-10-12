@@ -418,7 +418,20 @@ TimelineReport.writeTo(runtime.inspect(id), Path.of("build/reports/" + id.value(
 
 You get a status header, the roll-ups (model/tool calls, prompt and completion tokens, cost, boundary
 latency, wall clock), and the step-by-step trajectory: each boundary with its kind, label, offset,
-latency and recorded payload in a collapsed block. The page is:
+latency, a **latency bar** on the execution's time axis, and its recorded payload in a collapsed
+block. The bars form a waterfall, so the slow model and tool calls stand out.
+
+**Branch comparison:** render an original run and a branch of it (or an eval candidate's run, since
+`CaseResult.sample()` carries both trajectories) side by side:
+
+```java
+Trajectory base = Trajectory.of(runtime.inspect(id));
+Trajectory fork = runtime.branch(id, atSeq).withModel(otherModel).run(task);
+TimelineReport.writeDiffTo(base, fork, Path.of("build/reports/branch.html"));
+```
+
+Each work step is aligned and marked SAME, CHANGED, ADDED or REMOVED. A changed row previews what
+each side said, and the header shows the token and cost delta. Both pages are:
 
 - **self-contained:** inline CSS, no scripts, no fonts or images, so it opens from a `file://` URL and
   can be attached to a ticket

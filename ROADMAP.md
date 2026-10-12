@@ -198,9 +198,12 @@ exporter, the auto-capture agent, streaming completions, and the timeline UI hav
   `file://` years later; everything interpolated is HTML-escaped, since tool names, effect labels and
   recorded payloads are log content and a report gets opened in a browser by someone who did not
   produce the execution. The module depends on `catalyst-core` alone — no templating engine, no web
-  server. Gated by the v0.2 Timeline exit demo in CI. *Deferred (noted): latency bars and a
-  `TrajectoryDiff` view (the M2 branch comparison) — the table is the read-only view the roadmap asked
-  for; visual timing and diff rendering are polish on top.*
+  server. Gated by the v0.2 Timeline exit demo in CI. ✅ *Polish shipped:* each step's **latency
+  bar** forms a waterfall on the execution's time axis (MODEL steps are stamped at completion, so
+  their bar ends there; TOOL steps at request, so theirs starts there). `TimelineReport.diffHtml` /
+  `writeDiffTo` render the **`TrajectoryDiff` view**: aligned work steps marked
+  SAME/CHANGED/ADDED/REMOVED, a payload preview on differing rows, and token and cost deltas. Both
+  are pure CSS and gated in the same demo.
 
 ---
 

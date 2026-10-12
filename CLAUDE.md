@@ -160,6 +160,14 @@ checkout's pom to `com.github.CajunSystems` before installing.
   (no scripts/external refs — portable, openable from `file://`) and **deterministic** (a pure fold, so
   reports diff cleanly). Everything interpolated is HTML-escaped — tool names, effect labels and
   payloads are log content. Oversized payloads are elided at 2000 chars rather than inlined.
+  **Polish:**
+  - **Latency bars:** a CSS-only waterfall, `TimelineReport.bar`, with geometry pinned in
+    `TimelineReportTest`. A MODEL step is stamped at *completion* (bar = `at-latency..at`); a TOOL
+    step at *request* (bar = `at..at+latency`). Only computed numbers enter `style`.
+  - **Branch comparison:** `diffHtml(base, fork)` / `writeDiffTo` over `Trajectory.diff`. Differing
+    rows show a `preview` of the payload, because both sides of a changed model call are usually
+    labelled `stop`.
+  - The demo asserts one bar per step and exactly one changed step in its branch comparison.
 - **v0.2 Observability / OTel exporter** — `OtelAcceptanceTest` + `Demo otel`: an execution's event log
   folds into one OpenTelemetry trace via `catalyst-otel`'s `CatalystTracer.export(id, events)` — a root
   span for the run, a child span per boundary (model/tool/effect/memory; model/tool carry real latency,

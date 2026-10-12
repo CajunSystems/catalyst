@@ -83,4 +83,34 @@ class TimelineAcceptanceTest {
             assertThat(TimelineReport.html(state)).isEqualTo(html);
         }
     }
+
+    /**
+     * The M2 comparison as a report: an execution and a branch of it with a different model from the
+     * second step, rendered side by side. The first step is the same in both, the second changed.
+     * No FilesystemTool here, so this runs on every platform.
+     */
+    @Test
+    void aBranchRendersAsAStepByStepComparison(@TempDir Path dir) throws Exception {
+        Task<String> twoStep = ctx -> ctx.model().complete(STEP1).message() + "|" + ctx.model().complete(STEP2).message();
+        try (CatalystRuntime runtime = Catalyst.builder()
+                .log(GumboEventLog.at(Files.createDirectory(dir.resolve("log"))))
+                .model(MockModel.scripted("SUMMARY", "FINAL"))
+                .costModel(CostModel.perMillionTokens(3.0, 15.0))
+                .build()) {
+            ExecutionHandle<String> handle = runtime.execute(twoStep, ExecutionOptions.withKey("t:2"));
+            handle.result();
+            long secondPrompt = runtime.log().read(handle.id()).stream()
+                    .filter(e -> e.event() instanceof com.cajunsystems.catalyst.events.CatalystEvent.PromptBuilt)
+                    .skip(1).findFirst().orElseThrow().seq();
+            var base = com.cajunsystems.catalyst.engine.Trajectory.of(runtime.inspect(handle.id()));
+            var fork = runtime.branch(handle.id(), secondPrompt - 1).withModel(MockModel.alwaysReturn("REVISED")).run(twoStep);
+
+            Path file = TimelineReport.writeDiffTo(base, fork, dir.resolve("diff.html"));
+            String html = Files.readString(file);
+
+            assertThat(html).contains(base.id().value()).contains(fork.id().value());
+            assertThat(html).contains("<dt>Steps changed</dt><dd>1</dd>").contains("REVISED").contains("FINAL");
+            assertThat(html).doesNotContain("http://").doesNotContain("https://").doesNotContain("<script");
+        }
+    }
 }
