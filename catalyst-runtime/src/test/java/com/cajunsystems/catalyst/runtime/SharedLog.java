@@ -21,6 +21,8 @@ final class SharedLog implements EventLog {
     private final boolean multiWriter;
     private final boolean leases;
     final AtomicBoolean closed = new AtomicBoolean();
+    /** Runs at the start of every {@link #readLease}: a test's way to act "on another node" mid-claim. */
+    volatile java.util.function.Consumer<ExecutionId> beforeReadLease = id -> { };
 
     SharedLog(boolean fenced, boolean multiWriter, boolean leases) {
         this.fenced = fenced;
@@ -38,7 +40,10 @@ final class SharedLog implements EventLog {
     @Override public boolean supportsConditionalAppend() { return fenced; }
     @Override public boolean supportsMultiWriter() { return multiWriter; }
     @Override public boolean supportsLeases() { return leases; }
-    @Override public Optional<Lease> readLease(ExecutionId id) { return delegate.readLease(id); }
+    @Override public Optional<Lease> readLease(ExecutionId id) {
+        beforeReadLease.accept(id);
+        return delegate.readLease(id);
+    }
     @Override public boolean compareAndSetLease(ExecutionId id, Lease expected, Lease replacement) {
         return delegate.compareAndSetLease(id, expected, replacement);
     }

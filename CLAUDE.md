@@ -386,7 +386,11 @@ checkout's pom to `com.github.CajunSystems` before installing.
     - Renewal and release synchronize per lease, so a release can't lose to a renewal it raced.
   - **Runtime integration:**
     - `scheduleAttempt` claims (except `REPLAY_TERMINAL`) before registering anything, and releases
-      in the deregistering `whenComplete`, *before* `visible` completes.
+      in the deregistering `whenComplete`, *before* `visible` completes. **Claim, then decide:** a
+      `RESUME` re-folds after the claim, because the caller's fold predates it. If another node
+      finished the execution or parked it waiting and released in between, the attempt becomes a
+      terminal replay or a waiting handle, never `ExecutionResumed` after the end
+      (`LeaseTest.an…DuringTheClaimIsNotResumed`, via `SharedLog.beforeReadLease`).
     - `underLease` covers the writes outside an attempt: create, signal, pause and cancel when not in
       flight here. It releases only if no attempt took ownership.
     - `RunningAttempt.leaseLost` is read by the token as an abandon, so the existing abandon path

@@ -271,7 +271,30 @@ public final class CatalystRuntime implements AutoCloseable {
         // whatever the outcome, waiting and paused included. A live lease held by another node throws
         // LeaseHeldException: the execution is running there. Replaying a terminal outcome writes
         // nothing, so it needs no lease.
-        if (leases != null && mode != Mode.REPLAY_TERMINAL) leases.acquire(id);
+        if (leases != null && mode != Mode.REPLAY_TERMINAL) {
+            boolean claimedHere = leases.acquire(id);
+            // Claim, then decide. The caller chose RESUME from a fold read before the claim, and
+            // another node may have finished the execution, or parked it on a signal, and released
+            // its lease in between. Re-read now that no other node can write. Resuming a terminal
+            // stream would append after its end and re-run the task, and resuming a waiting one would
+            // fold it back to RUNNING.
+            if (mode == Mode.RESUME) {
+                ExecutionState now;
+                try {
+                    now = foldState(id);
+                } catch (RuntimeException e) {
+                    if (claimedHere) leases.release(id);
+                    throw e;
+                }
+                if (now.isTerminal() || now.status() == Status.WAITING) {
+                    if (claimedHere) leases.release(id);
+                    if (!now.isTerminal()) return waitingHandle(id, now);
+                    @SuppressWarnings("unchecked") // completes from the recorded outcome; never runs a task
+                    Task<R> replayOnly = (Task<R>) TERMINAL_REPLAY_TASK;
+                    return scheduleAttempt(replayOnly, id, now.taskType(), opts, Mode.REPLAY_TERMINAL);
+                }
+            }
+        }
         CompletableFuture<R> future = new CompletableFuture<>(); // completed by runAttempt
         RunningAttempt attempt = new RunningAttempt();
         if (leases != null) leases.onLost(id, () -> attempt.leaseLost = true);

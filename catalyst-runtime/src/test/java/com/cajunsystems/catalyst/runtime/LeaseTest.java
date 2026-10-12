@@ -233,6 +233,45 @@ class LeaseTest {
         }
     }
 
+    /**
+     * Claim, then decide. Node B folds the execution as resumable, and before its claim lands another
+     * node finishes it and releases the lease. B must re-read after claiming and replay the recorded
+     * outcome. Appending {@code ExecutionResumed} after the terminal event would re-run a finished task.
+     */
+    @Test
+    void anExecutionFinishedElsewhereDuringTheClaimIsNotResumed() {
+        ExecutionId id = crashInterrupted();
+        MockModel modelB = MockModel.alwaysReturn("B");
+        try (CatalystRuntime nodeB = node("node-b", modelB)) {
+            log.beforeReadLease = leased -> {
+                log.beforeReadLease = x -> { };
+                log.append(leased, new CatalystEvent.ExecutionCompleted(T, new com.cajunsystems.catalyst.engine.PayloadCodec().toTree("done elsewhere")), 2);
+            };
+            assertThat(nodeB.resume(id).result()).isEqualTo("done elsewhere");
+            assertThat(log.read(id)).as("nothing appended after the terminal event").hasSize(3);
+            assertThat(modelB.callCount()).isZero();
+            assertThat(log.readLease(id)).isEmpty();
+        }
+    }
+
+    /** The same window, landing on a wait: the execution must stay WAITING, not be folded back to RUNNING. */
+    @Test
+    void anExecutionThatStartedWaitingDuringTheClaimIsNotResumed() {
+        ExecutionId id = ExecutionId.random();
+        log.append(id, new CatalystEvent.ExecutionCreated(T, ApprovalTask.class.getName(), "novars", "cfg", ""), 0);
+        log.append(id, new CatalystEvent.ExecutionStarted(T, 1, "node-dead"), 1);
+        try (CatalystRuntime nodeB = node("node-b", MockModel.alwaysReturn("B"))) {
+            log.beforeReadLease = leased -> {
+                log.beforeReadLease = x -> { };
+                log.append(leased, new CatalystEvent.SignalAwaited(T, "approve", String.class.getName()), 2);
+            };
+            assertThatThrownBy(() -> nodeB.resume(id).result()).isInstanceOf(com.cajunsystems.catalyst.engine.ExecutionWaitingSignal.class);
+            assertThat(log.read(id)).hasSize(3);
+            assertThat(nodeB.inspect(id).status()).isEqualTo(Status.WAITING);
+            assertThat(log.readLease(id)).isEmpty();
+        }
+    }
+
     /** A waiting execution holds no lease, so a signal can arrive at any node. */
     @Test
     void aWaitingExecutionReleasesItsLeaseAndASignalOnAnotherNodeResumesIt() {
