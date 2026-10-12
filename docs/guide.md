@@ -153,9 +153,10 @@ fallback cannot guarantee containment. `HttpTool` takes a `Sender` for tests tha
   ```
 
   Vars are **not persisted**, only their hash. A task that reads vars must be resumed or replayed with
-  the same `ExecutionOptions`. Startup recovery resumes without vars, so a task that depends on them
-  should carry its inputs in the key, in a record your task looks up through an effect, or be resumed
-  individually with `resume(id, opts)`.
+  the same `ExecutionOptions`, and a task cannot read its own idempotency key. So `recoverOnStart`,
+  which resumes without vars, cannot correctly resume a task that depends on them. For such tasks,
+  keep each execution's vars alongside its id and resume it yourself with `resume(id, opts)`. Tasks
+  that don't read vars recover automatically.
 
 ## Idempotency keys and resuming
 
