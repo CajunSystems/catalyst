@@ -504,14 +504,13 @@ public final class ReplayingContext implements Context {
         String inputHash = Hashing.canonicalJsonHash(inputTree);
         String key = BranchSpec.toolKey(tool.name(), inputHash);
         long replayedThrough = lastReplayedSeq;
-        java.util.List<com.fasterxml.jackson.databind.JsonNode> outputs = branchSpec.recordedToolResults()
+        java.util.List<BranchSpec.RecordedOutput> outputs = branchSpec.recordedToolResults()
                 .getOrDefault(key, java.util.List.of()).stream()
                 .filter(r -> r.seq() > replayedThrough)   // earlier ones were substituted by replay
-                .map(BranchSpec.RecordedOutput::output)
                 .toList();
         int next = recordedToolCursor.getOrDefault(key, 0);
-        com.fasterxml.jackson.databind.JsonNode recordedOutput = next < outputs.size() ? outputs.get(next) : null;
-        if (recordedOutput == null) {
+        BranchSpec.RecordedOutput recorded = next < outputs.size() ? outputs.get(next) : null;
+        if (recorded == null) {
             if (branchSpec.toolReplay() == BranchSpec.ToolReplay.RECORDED_ONLY) {
                 // Remembered, like the stop signals: a task that catches tool errors must not turn
                 // "the candidate took a path the recording cannot answer" into a completion.
@@ -523,8 +522,16 @@ public final class ReplayingContext implements Context {
         requireAppendable("tool " + tool.name());
         recordedToolCursor.put(key, next + 1);
         append(new ToolRequested(now(), tool.name(), inputTree));
-        append(new ToolCompleted(now(), recordedOutput, null, 0));
-        return (O) payloads.fromTree(recordedOutput);
+        if (recorded.error() != null) {
+            // The recorded call failed: fail the same way, recorded and attributed like any failure.
+            long failedSeq = append(new ToolCompleted(now(), null, recorded.error(), 0));
+            RecordedToolFailureException failure = new RecordedToolFailureException(tool.name(), recorded.error());
+            lastToolFailureSeq = failedSeq;
+            lastToolFailureException = failure;
+            throw failure;
+        }
+        append(new ToolCompleted(now(), recorded.output(), null, 0));
+        return (O) payloads.fromTree(recorded.output());
     }
 
     private <I, O> O runToolLive(Tool<I, O> tool, I input) {

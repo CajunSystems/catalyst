@@ -64,6 +64,12 @@ public final class AgentTool<I, O> {
                 if (value == null || value.isNull()) throw new IllegalArgumentException("missing \"value\"");
                 return JSON.treeToValue(value, tool.inputType());
             }
+            // The schema marks every component required. Jackson would fill a missing one with null or 0
+            // and the tool would run on it; the model is told instead, as it is for a missing "value".
+            for (RecordComponent c : tool.inputType().getRecordComponents()) {
+                JsonNode v = args.get(c.getName());
+                if (v == null || v.isNull()) throw new IllegalArgumentException("missing \"" + c.getName() + "\"");
+            }
             return JSON.treeToValue(args, tool.inputType());
         } catch (JsonProcessingException | IllegalArgumentException e) {
             throw new IllegalArgumentException("arguments do not fit " + tool.name() + ": " + getOriginalMessageOf(e), e);

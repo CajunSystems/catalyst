@@ -472,6 +472,8 @@ checkout's pom to `com.github.CajunSystems` before installing.
   - **Engine signals are rethrown,** never fed to the model: cancel, abandon, waiting, paused,
     stale writer, divergence, in-doubt, unrecorded tool (mutation-checked).
   - **Tool inputs:** a flat record of scalars and enums, or one scalar wrapped as `{"value":…}`.
+    Every component is required, and a missing one is fed back as an error, never decoded to
+    null/0.
     The schema is derived, and anything else is refused at `tool(...)`.
   - **Tests and the demo:**
     - The crash-mid-loop test uses a tool that `close()`s its own runtime. The next boundary
@@ -492,6 +494,10 @@ checkout's pom to `com.github.CajunSystems` before installing.
       replay consumed, pulled back to `seq - 1` by `fork(seq)`. It is not `atSeq`: a candidate can
       fork earlier, and the parent's calls from there on are unused (review finding).
     - Repeats are consumed in order. Answering each with the first output made a poll loop forever.
+    - **Recorded failures are answers too** (`RecordedOutput.error`), reproduced as a recorded,
+      attributed `RecordedToolFailureException`. Dropping them made every run that recovered from a
+      failed call (an agent) unevaluable. A failure named by a `RetryRequested` is excluded: the
+      parent re-ran that call.
     - `raisedUnrecordedTool()` makes a swallowed refusal still fail the branch.
     - `BranchBuilder.childId()` is the *next* run's id; each `run()` takes it and mints a fresh one.
     `ReplayingContext.answerFromRecording` handles a forked, non-deterministic tool call: it records

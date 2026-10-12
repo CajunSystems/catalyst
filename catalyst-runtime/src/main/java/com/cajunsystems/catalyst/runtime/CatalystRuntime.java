@@ -1043,18 +1043,24 @@ public final class CatalystRuntime implements AutoCloseable {
      * Every successful tool call the parent recorded, keyed by {@link BranchSpec#toolKey}, each key's
      * outputs in recorded order with the seq of their {@code ToolCompleted}. The context uses only those
      * after the point its replay actually reached, which can be earlier than {@code atSeq}. A failed
-     * call is left out, so a branch repeating it gets no recorded answer rather than a recorded failure.
+     * call is kept as its recorded error, since a branch reproduces it as a replay does. The exception
+     * is a failure a retry superseded (named by a {@code RetryRequested}): the parent re-ran that call,
+     * and its later result is the one that counts.
      */
     private static Map<String, List<BranchSpec.RecordedOutput>> recordedToolResults(List<SequencedEvent> events) {
+        java.util.Set<Long> retried = new java.util.HashSet<>();
+        for (SequencedEvent se : events) {
+            if (se.event() instanceof CatalystEvent.RetryRequested rr && rr.failedSeq() >= 0) retried.add(rr.failedSeq());
+        }
         Map<String, List<BranchSpec.RecordedOutput>> out = new HashMap<>();
         CatalystEvent.ToolRequested pending = null;
         for (SequencedEvent se : events) {
             if (se.event() instanceof CatalystEvent.ToolRequested tr) {
                 pending = tr;
             } else if (se.event() instanceof CatalystEvent.ToolCompleted tc && pending != null) {
-                if (tc.error() == null) {
+                if (tc.error() == null || !retried.contains(se.seq())) {
                     out.computeIfAbsent(BranchSpec.toolKey(pending.toolName(), Hashing.canonicalJsonHash(pending.input())),
-                            k -> new ArrayList<>()).add(new BranchSpec.RecordedOutput(se.seq(), tc.output()));
+                            k -> new ArrayList<>()).add(new BranchSpec.RecordedOutput(se.seq(), tc.output(), tc.error()));
                 }
                 pending = null;
             }

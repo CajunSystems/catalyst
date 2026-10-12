@@ -34,8 +34,17 @@ import java.util.Map;
 public record BranchSpec(long atSeq, String parentId, Map<String, JsonNode> toolOverrides, String changedComponents,
                          ToolReplay toolReplay, Map<String, List<RecordedOutput>> recordedToolResults) {
 
-    /** One recorded tool output and the seq of the {@code ToolCompleted} that recorded it. */
-    public record RecordedOutput(long seq, JsonNode output) {}
+    /**
+     * One recorded tool result and the seq of the {@code ToolCompleted} that recorded it: an output,
+     * or, if the call failed, the recorded error. A recorded failure is an answer too. A branch
+     * reproduces it as a replay does, so a run that recovered from a failed call (an agent telling
+     * the model) can be re-run without re-running the call.
+     */
+    public record RecordedOutput(long seq, JsonNode output, String error) {
+        public RecordedOutput(long seq, JsonNode output) {
+            this(seq, output, null);
+        }
+    }
 
     /** How a branch answers tool calls once it has forked off the recording. */
     public enum ToolReplay {

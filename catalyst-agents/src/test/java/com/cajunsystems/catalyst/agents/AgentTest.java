@@ -315,6 +315,24 @@ class AgentTest {
         }
     }
 
+    /** The schema marks every field required; a call missing one is refused, not run on null. */
+    @Test
+    void aCallMissingARequiredArgumentIsRefused() {
+        Model sloppy = new Model() {
+            int turn;
+            @Override public Completion complete(CompletionRequest request) {
+                if (++turn == 1) return new Completion("", List.of(new ToolCall("a", "lookup", "{}")), Usage.ZERO, "tool_calls");
+                List<Message> m = request.prompt().messages();
+                return Completion.ofText(m.get(m.size() - 1).content());
+            }
+        };
+        try (CatalystRuntime runtime = CatalystRuntime.builder().log(EventLogs.inMemory()).model(sloppy).build()) {
+            String answer = runtime.execute(ctx -> agent.run(ctx, "go").answer(), ExecutionOptions.none()).result();
+            assertThat(answer).isEqualTo("error: arguments do not fit lookup: missing \"id\"");
+            assertThat(lookup.calls).hasValue(0);
+        }
+    }
+
     @Test
     void theStepBudgetEndsALoopThatNeverAnswers() {
         Model insistent = request -> new Completion("thinking", List.of(new ToolCall(null, "page", "{\"value\":\"NETWORK\"}")), Usage.ZERO, "tool_calls");
