@@ -515,12 +515,14 @@ The substrate becomes a platform. This is where the other CajunSystems component
 
 ### Memory & retrieval → Needle
 - **Not built in Catalyst.** Memory types, embeddings, vector stores and RAG belong to **Needle**,
-  a separate project. Catalyst's part is the seam: a task reaches Needle through a
-  `Tool` (or the `Memory` SPI), so every retrieval is a recorded boundary. Replay and eval
-  substitute what Needle returned at the time instead of querying an index that has since changed.
-  The work here is an adapter module, plus a check that retrieval results round-trip through the
-  payload codec, once Needle's API is settled. Deliberately excluded from v0 (spec §10), and still
-  a consumer, not core.
+  a separate project. Catalyst's part is the seam: a task reaches Needle through a **`Tool`**, so
+  every retrieval is a recorded boundary. A replay, and an eval (its default tool replay is
+  `RECORDED_ONLY`), substitute what Needle returned at the time instead of querying an index that
+  has since changed. A plain `branch` under the default `ToolReplay.LIVE` re-queries. (`Context.memory()`
+  is not this seam: it is a per-execution key-value store built from the execution's own events, and
+  not pluggable.) The work here is an adapter module, plus a check that retrieval results
+  round-trip through the payload codec, once Needle's API is settled. Deliberately excluded from v0
+  (spec §10), and still a consumer, not core.
 
 ---
 
