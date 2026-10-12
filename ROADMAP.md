@@ -515,7 +515,7 @@ The substrate becomes a platform. This is where the other CajunSystems component
 
 ### Memory & retrieval → Needle
 - **Not built in Catalyst.** Memory types, embeddings, vector stores and RAG belong to **Needle**,
-  a separate CajunSystems project. Catalyst's part is the seam: a task reaches Needle through a
+  a separate project. Catalyst's part is the seam: a task reaches Needle through a
   `Tool` (or the `Memory` SPI), so every retrieval is a recorded boundary. Replay and eval
   substitute what Needle returned at the time instead of querying an index that has since changed.
   The work here is an adapter module, plus a check that retrieval results round-trip through the
