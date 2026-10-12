@@ -16,7 +16,9 @@ import com.cajunsystems.catalyst.events.CatalystEvent;
  * <p>Branch children are deliberately not indexed. They begin with
  * {@link CatalystEvent.ExecutionBranched} rather than {@code ExecutionCreated}, run synchronously in
  * the caller, and depend on overrides (a swapped model, counterfactual tool results) that are not
- * recorded — so there is nothing a restart could correctly resume them with.
+ * recorded — so there is nothing a restart could correctly resume them with. A log therefore writes
+ * a closing event to its index only if that execution was opened; a branch child's terminal event
+ * stays in its own stream.
  */
 public final class ExecutionIndex {
 
@@ -36,10 +38,5 @@ public final class ExecutionIndex {
             case CatalystEvent.ExecutionCancelled c -> Change.CLOSES;
             default -> Change.NONE;
         };
-    }
-
-    /** Whether {@code event} must be written to the index as well as to its execution's stream. */
-    public static boolean isIndexed(CatalystEvent event) {
-        return changeFor(event) != Change.NONE;
     }
 }

@@ -94,6 +94,13 @@ checkout's pom to `com.github.CajunSystems` before installing.
   `path/blobs`, SHA-256 refs, dedup) and rehydrated transparently on inspect/replay — offloading lives at
   the `EventCodec` seam (`encode` externalizes large top-level payload fields, `decode` inlines them), so
   the core only ever sees fully-inlined events. Small events stay byte-identical (old logs interoperate).
+  **Deploy-3:** `BlobStore extends AutoCloseable` (default no-op) and the log **owns** the store bound
+  into its codec — `GumboEventLog.close()` closes it (in a `finally`). A remote store is one line on
+  the embedded path: `Catalyst.builder(path).blobStore(store[, threshold])`. That works through the
+  runtime builder's `logFactory(EventLogFactory)` seam (runtime can't depend on gumbo, so the facade
+  supplies the factory). `blobStore(...)` with `log(...)` is **rejected** at `build()` (the codec is
+  fixed once a log exists — never silently ignore an option), as is `log` + `logFactory`. Tests:
+  `BuilderLogOptionsTest`, `BlobStoreAcceptanceTest.aSuppliedBlobStore...`, `GumboEventLogTest.closingTheLogClosesItsBlobStore`.
 - **v0.2 Collection payloads** — `CollectionPayloadAcceptanceTest` + `Demo collections`: a task captures a
   `List`/`Map` of records (via `ctx.effect` or as its result); `PayloadCodec` encodes collections/arrays
   structurally (each element in its own typed envelope, recursively) so element types survive the
@@ -208,7 +215,12 @@ checkout's pom to `com.github.CajunSystems` before installing.
   and `decode` reads `entry.streamVersion(execTag)` for the same reason. The scan folds from a
   checkpoint in the queue tag's KV (`open-set`: queue version + ids) and reads only the tail; the
   checkpoint is a plain overwrite because resuming the fold from *any* earlier checkpoint gives the
-  same set — a lost/stale one costs a read, never a wrong answer. Executions recorded before the
+  same set — a lost/stale one costs a read, never a wrong answer. The checkpoint starts with a
+  **format byte** (`OPEN_SET_FORMAT`); an unknown format is refolded, never misread. A closing event
+  is dual-tagged only if its execution was **opened** (`GumboEventLog.wasOpened`: an in-process map
+  of open/branched ids, else the stream's first event) — so a branch child's terminal event stays
+  out of the queue. Only `ExecutionBranched` at **seq 0** marks a branch child; the BRANCH-replay
+  divergence marker appears mid-stream of an indexed execution. Executions recorded before the
   index existed are not in it.
 
 - **Startup recovery (Deploy-2)** — `RecoveryTest` (runtime) + `RecoveryAcceptanceTest` +

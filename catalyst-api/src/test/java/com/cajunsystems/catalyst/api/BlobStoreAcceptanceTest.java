@@ -60,6 +60,48 @@ class BlobStoreAcceptanceTest {
         }
     }
 
+    /**
+     * Deploy-3: a caller-supplied store — standing in for S3/GCS — is one builder line on the
+     * embedded path. Large payloads go to it instead of {@code dir/blobs}, it is closed with the
+     * runtime, and a later runtime handed the same store reads them back.
+     */
+    @Test
+    void aSuppliedBlobStoreIsOneBuilderLineAndClosesWithTheRuntime(@TempDir Path dir) throws Exception {
+        String bigDocument = "IPSUM-".repeat(30_000);
+        Task<Integer> task = ctx -> ctx.effect("fetch-document", () -> bigDocument).length();
+        RemoteStore remote = new RemoteStore();
+
+        ExecutionId id;
+        try (CatalystRuntime runtime = Catalyst.builder(dir).blobStore(remote).build()) {
+            var handle = runtime.execute(task);
+            assertThat(handle.result()).isEqualTo(bigDocument.length());
+            id = handle.id();
+            assertThat(remote.puts).as("offloaded to the supplied store").isGreaterThanOrEqualTo(1);
+            assertThat(Files.exists(dir.resolve("blobs"))).as("not to the default store").isFalse();
+            assertThat(logContainsText(dir, "IPSUM-IPSUM-IPSUM-")).isFalse();
+            assertThat(remote.closed).isFalse();
+        }
+        assertThat(remote.closed).as("closed with the runtime").isTrue();
+
+        remote.closed = false;
+        try (CatalystRuntime runtime = Catalyst.builder(dir).blobStore(remote).build()) {
+            assertThat(runtime.replay(id, task).status()).isEqualTo(Status.COMPLETED);
+        }
+    }
+
+    /** A remote store as far as Catalyst can tell: content-addressed, and it has a client to close. */
+    private static final class RemoteStore implements com.cajunsystems.catalyst.events.BlobStore {
+        private final com.cajunsystems.catalyst.events.BlobStore bytes =
+                com.cajunsystems.catalyst.events.BlobStore.inMemory();
+        int puts;
+        boolean closed;
+
+        public String put(byte[] content) { puts++; return bytes.put(content); }
+        public byte[] get(String ref) { return bytes.get(ref); }
+        public boolean has(String ref) { return bytes.has(ref); }
+        @Override public void close() { closed = true; }
+    }
+
     /** True if any file under {@code dir} that is not in the blob store inlines {@code needle}. */
     private static boolean logContainsText(Path dir, String needle) throws Exception {
         Path blobs = dir.resolve("blobs");

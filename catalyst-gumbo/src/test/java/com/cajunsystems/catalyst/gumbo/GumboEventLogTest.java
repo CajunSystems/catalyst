@@ -567,6 +567,13 @@ class GumboEventLogTest {
 
             log.service().getView(QUEUE).setValue(GumboEventLog.OPEN_SET_KEY, new byte[] {1, 2}).join();
             assertThat(log.openExecutions()).as("an unreadable checkpoint is refolded").containsExactly(b);
+
+            // A layout this reader does not know — a later format, or the unversioned one — is
+            // refolded rather than misread, even when its bytes happen to parse.
+            byte[] future = checkpoint(1L, a, b);
+            future[0] = (byte) (GumboEventLog.OPEN_SET_FORMAT + 1);
+            log.service().getView(QUEUE).setValue(GumboEventLog.OPEN_SET_KEY, future).join();
+            assertThat(log.openExecutions()).as("an unknown format is refolded").containsExactly(b);
         }
     }
 
@@ -601,12 +608,14 @@ class GumboEventLogTest {
 
     private static long checkpointVersion(GumboEventLog log) {
         byte[] framed = log.service().getView(QUEUE).getValue(GumboEventLog.OPEN_SET_KEY).join();
-        return java.nio.ByteBuffer.wrap(framed).getLong();
+        assertThat(framed[0]).as("format byte").isEqualTo(GumboEventLog.OPEN_SET_FORMAT);
+        return java.nio.ByteBuffer.wrap(framed, 1, Long.BYTES).getLong();
     }
 
     private static byte[] checkpoint(long through, ExecutionId... open) {
         java.io.ByteArrayOutputStream bytes = new java.io.ByteArrayOutputStream();
         try (java.io.DataOutputStream out = new java.io.DataOutputStream(bytes)) {
+            out.writeByte(GumboEventLog.OPEN_SET_FORMAT);
             out.writeLong(through);
             out.writeInt(open.length);
             for (ExecutionId id : open) out.writeUTF(id.value());
@@ -614,5 +623,78 @@ class GumboEventLogTest {
             throw new java.io.UncheckedIOException(e);
         }
         return bytes.toByteArray();
+    }
+
+    /**
+     * A branch child was never listed, so its terminal event has nothing to remove — and is kept out
+     * of the queue rather than written there as churn. A divergence marker mid-stream (BRANCH replay
+     * mode) does not make an indexed execution look like a branch child.
+     */
+    @Test
+    void aBranchChildsTerminalEventStaysOutOfTheQueue() {
+        try (GumboEventLog log = GumboEventLog.inMemory()) {
+            ExecutionId parent = ExecutionId.random();
+            log.append(parent, created());
+
+            ExecutionId child = ExecutionId.random();
+            log.append(child, new CatalystEvent.ExecutionBranched(T, parent.value(), 0, "branch@0"));
+            log.append(child, new CatalystEvent.ExecutionStarted(T, 1, "node-0"));
+            log.append(child, new CatalystEvent.ExecutionCompleted(T, new TextNode("fork")));
+
+            log.append(parent, new CatalystEvent.ExecutionBranched(T, null, 0, "divergence"));
+            log.append(parent, new CatalystEvent.ExecutionCompleted(T, new TextNode("parent")));
+
+            assertThat(queuedExecutions(log)).containsExactly(parent, parent);
+            assertThat(log.openExecutions()).isEmpty();
+        }
+    }
+
+    /**
+     * The same rule from a process that did not write the execution's first event — the restart
+     * case, where whether it was opened has to come from the stream itself.
+     */
+    @Test
+    void afterAReopenATerminalEventIsQueuedOnlyIfItsExecutionWasOpened(@TempDir Path dir) {
+        ExecutionId opened = ExecutionId.random();
+        ExecutionId child = ExecutionId.random();
+        try (GumboEventLog log = GumboEventLog.at(dir)) {
+            log.append(opened, created());
+            log.append(child, new CatalystEvent.ExecutionBranched(T, opened.value(), 0, "branch@0"));
+        }
+        try (GumboEventLog reopened = GumboEventLog.at(dir)) {
+            reopened.append(child, new CatalystEvent.ExecutionFailed(T, "boom", 0));
+            reopened.append(opened, new CatalystEvent.ExecutionCompleted(T, new TextNode("ok")));
+
+            assertThat(queuedExecutions(reopened)).containsExactly(opened, opened);
+            assertThat(reopened.openExecutions()).isEmpty();
+        }
+    }
+
+    @Test
+    void closingTheLogClosesItsBlobStore(@TempDir Path dir) {
+        boolean[] closed = {false};
+        com.cajunsystems.catalyst.events.BlobStore store = new com.cajunsystems.catalyst.events.BlobStore() {
+            final com.cajunsystems.catalyst.events.BlobStore bytes = com.cajunsystems.catalyst.events.BlobStore.inMemory();
+            public String put(byte[] content) { return bytes.put(content); }
+            public byte[] get(String ref) { return bytes.get(ref); }
+            public boolean has(String ref) { return bytes.has(ref); }
+            @Override public void close() { closed[0] = true; }
+        };
+        GumboEventLog log = GumboEventLog.at(dir, store, 1024);
+        log.append(ExecutionId.random(), created());
+        assertThat(closed[0]).isFalse();
+        log.close();
+        assertThat(closed[0]).isTrue();
+    }
+
+    /** The executions the queue's entries belong to, in queue order. */
+    private static List<ExecutionId> queuedExecutions(GumboEventLog log) {
+        List<ExecutionId> ids = new ArrayList<>();
+        for (LogEntry e : log.service().getView(QUEUE).readAfterVersion(-1).join()) {
+            for (LogTag tag : e.tags()) {
+                if (tag.namespace().equals("catalyst-exec")) ids.add(ExecutionId.of(tag.key()));
+            }
+        }
+        return ids;
     }
 }

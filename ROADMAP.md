@@ -241,7 +241,7 @@ Labels follow the build order (see *Order* below).
   operator or a pending in-doubt verdict is holding. Unregistered task types are reported, not fatal.
   Exit demo `Demo recover`: crash with several executions in flight plus one paused, restart, the
   in-flight ones finish with zero duplicate model calls and the paused one stays paused.
-- **Deploy-3. Blob store ergonomics** — `BlobStore extends AutoCloseable` (default no-op) and a
+- ✅ **Deploy-3. Blob store ergonomics** — `BlobStore extends AutoCloseable` (default no-op) and a
   `.blobStore(...)` builder option, so a remote store (S3/GCS) is a builder line and closes with the
   log. The store is bound into the `EventCodec` when the log is constructed, so the option only
   applies when the builder constructs the log itself (the `embedded(path)` path); combined with
