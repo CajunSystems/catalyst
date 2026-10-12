@@ -34,11 +34,22 @@ public final class BranchBuilder {
     private final Map<String, Object> vars = new LinkedHashMap<>();
     private final List<String> changed = new ArrayList<>();
     private BranchSpec.ToolReplay toolReplay = BranchSpec.ToolReplay.LIVE;
+    private final ExecutionId childId;
 
     BranchBuilder(CatalystRuntime runtime, ExecutionId parentId, long atSeq) {
         this.runtime = runtime;
         this.parentId = parentId;
         this.atSeq = atSeq;
+        this.childId = runtime.mintId();
+    }
+
+    /**
+     * The id the branch's own execution will have, known before {@link #run}, so a caller can find
+     * the branch's record even when the run throws. A failed branch still leaves its
+     * {@code ExecutionBranched} … {@code ExecutionFailed} stream.
+     */
+    public ExecutionId childId() {
+        return childId;
     }
 
     /** Run the branch forward with a different model from the branch point. */
@@ -74,6 +85,6 @@ public final class BranchBuilder {
     /** Runs {@code task} forward from the branch point and returns the fork's trajectory. */
     public <R> Trajectory run(Task<R> task) {
         return runtime.runBranch(parentId, atSeq, overrideModel, toolOverrides, vars,
-                String.join(",", changed), toolReplay, task);
+                String.join(",", changed), toolReplay, childId, task);
     }
 }

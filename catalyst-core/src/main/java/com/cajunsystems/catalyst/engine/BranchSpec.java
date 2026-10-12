@@ -2,6 +2,7 @@ package com.cajunsystems.catalyst.engine;
 
 import com.fasterxml.jackson.databind.JsonNode;
 
+import java.util.List;
 import java.util.Map;
 
 /**
@@ -21,11 +22,15 @@ import java.util.Map;
  * @param toolOverrides       counterfactual outputs by tool name (already serialized to JSON)
  * @param changedComponents   human description of what was swapped, for the event/timeline
  * @param toolReplay          how tool calls past the fork are answered
- * @param recordedToolResults the parent's successful tool outputs, keyed by {@link #toolKey}; used
- *                            unless {@code toolReplay} is {@link ToolReplay#LIVE}
+ * @param recordedToolResults the parent's tool outputs <em>past the fork</em>, keyed by {@link #toolKey},
+ *                            each key's outputs in recorded order. A repeated call (a second clock
+ *                            read, a poll that answered "pending" then "done") is answered by the
+ *                            next output in turn, not the first again. Calls before the fork are not
+ *                            here, since replay has already substituted them. Used unless
+ *                            {@code toolReplay} is {@link ToolReplay#LIVE}
  */
 public record BranchSpec(long atSeq, String parentId, Map<String, JsonNode> toolOverrides, String changedComponents,
-                         ToolReplay toolReplay, Map<String, JsonNode> recordedToolResults) {
+                         ToolReplay toolReplay, Map<String, List<JsonNode>> recordedToolResults) {
 
     /** How a branch answers tool calls once it has forked off the recording. */
     public enum ToolReplay {
@@ -40,7 +45,9 @@ public record BranchSpec(long atSeq, String parentId, Map<String, JsonNode> tool
     public BranchSpec {
         toolOverrides = toolOverrides == null ? Map.of() : Map.copyOf(toolOverrides);
         toolReplay = toolReplay == null ? ToolReplay.LIVE : toolReplay;
-        recordedToolResults = recordedToolResults == null ? Map.of() : Map.copyOf(recordedToolResults);
+        recordedToolResults = recordedToolResults == null ? Map.of()
+                : recordedToolResults.entrySet().stream().collect(java.util.stream.Collectors.toUnmodifiableMap(
+                        Map.Entry::getKey, e -> List.copyOf(e.getValue())));
     }
 
     public BranchSpec(long atSeq, String parentId, Map<String, JsonNode> toolOverrides, String changedComponents) {

@@ -73,6 +73,8 @@ public final class ReplayingContext implements Context {
     private final CostModel costModel;
     private final ReplayMode replayMode;
     private final BranchSpec branchSpec; // nullable: present only when driving a branch
+    /** Per tool key, how many of the branch's recorded post-fork outputs have been handed out. */
+    private final java.util.Map<String, Integer> recordedToolCursor = new java.util.HashMap<>();
     private final Clock clock;
     private final Logger logger;
     private final boolean appendEnabled;
@@ -491,8 +493,10 @@ public final class ReplayingContext implements Context {
     private <I, O> O answerFromRecording(Tool<I, O> tool, I input) {
         com.fasterxml.jackson.databind.JsonNode inputTree = eventMapper.valueToTree(input);
         String inputHash = Hashing.canonicalJsonHash(inputTree);
-        com.fasterxml.jackson.databind.JsonNode recordedOutput =
-                branchSpec.recordedToolResults().get(BranchSpec.toolKey(tool.name(), inputHash));
+        String key = BranchSpec.toolKey(tool.name(), inputHash);
+        java.util.List<com.fasterxml.jackson.databind.JsonNode> outputs = branchSpec.recordedToolResults().getOrDefault(key, java.util.List.of());
+        int next = recordedToolCursor.getOrDefault(key, 0);
+        com.fasterxml.jackson.databind.JsonNode recordedOutput = next < outputs.size() ? outputs.get(next) : null;
         if (recordedOutput == null) {
             if (branchSpec.toolReplay() == BranchSpec.ToolReplay.RECORDED_ONLY) {
                 throw new UnrecordedToolCallException(tool.name(), inputHash);
@@ -500,6 +504,7 @@ public final class ReplayingContext implements Context {
             return runToolLive(tool, input);
         }
         requireAppendable("tool " + tool.name());
+        recordedToolCursor.put(key, next + 1);
         append(new ToolRequested(now(), tool.name(), inputTree));
         append(new ToolCompleted(now(), recordedOutput, null, 0));
         return (O) payloads.fromTree(recordedOutput);

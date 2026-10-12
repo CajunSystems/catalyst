@@ -12,7 +12,7 @@ import java.util.List;
  * @param candidate           the candidate's name
  * @param outcome             how the candidate's run ended
  * @param branchId            the branch execution holding the candidate's run (inspectable like any
- *                            other execution), or null if none was started
+ *                            other execution, failed runs included), or null if the case was skipped
  * @param sample              what the scorers saw; null unless the outcome is {@link Outcome#COMPLETED}
  * @param scores              one per scorer; empty unless completed
  * @param error               why it did not complete, or null

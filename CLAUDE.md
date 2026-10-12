@@ -440,8 +440,11 @@ checkout's pom to `com.github.CajunSystems` before installing.
   - **Branch point** = just before the first `PromptBuilt`/`CompletionRequested`. **Not** before
     `CompletionRequested` alone: the model boundary starts at `PromptBuilt`, and branching between
     them duplicated the PROMPT step and broke every diff.
-  - **Recorded tool replay:** `BranchSpec.ToolReplay` + `recordedToolResults` (the parent's
-    successful `ToolRequested`→`ToolCompleted` pairs keyed `name#canonicalJsonHash(input)`).
+  - **Recorded tool replay:** `BranchSpec.ToolReplay` + `recordedToolResults`. These are the
+    parent's successful `ToolRequested`→`ToolCompleted` pairs **past the fork only** (replay
+    substitutes earlier ones), keyed `name#canonicalJsonHash(input)`, each key a **queue in recorded
+    order**. Answering every repeat with the first output made a poll loop forever (review finding).
+    A call beyond the recorded ones has no answer.
     `ReplayingContext.answerFromRecording` handles a forked, non-deterministic tool call: it records
     the boundary with the recorded output, runs live (`RECORDED_OR_LIVE`), or throws
     `UnrecordedToolCallException` (`RECORDED_ONLY`). The default `LIVE` keeps M2 unchanged.
@@ -451,6 +454,9 @@ checkout's pom to `com.github.CajunSystems` before installing.
       unnoticed.
     - Vars aren't persisted, so case inputs must come through boundaries.
     - A `Candidate.task` without a model runs on the runtime's default (production) model.
+    - **Robustness:** a result that can't be decoded and a scorer that throws are confined to their
+      case or score; one bad candidate never aborts `run()`. `BranchBuilder.childId()` mints the
+      branch id up front, so failed and `UNRECORDED_TOOL` cases still link to their branch execution.
 
 - **In-doubt model completions** — `ReplayingContextInDoubtCompletionTest`: a `CompletionRequested`
   with no `CompletionReceived` is a provider call that may have been accepted and *billed*, so it

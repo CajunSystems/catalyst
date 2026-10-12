@@ -266,4 +266,111 @@ class EvalTest {
         assertThatThrownBy(() -> eval().candidate(Candidate.model("m", production)).candidate(Candidate.model("m", production)).run())
                 .isInstanceOf(IllegalStateException.class).hasMessageContaining("named 'm'");
     }
+
+    /** A status endpoint: answers "pending" until the third call. Polled repeatedly with the same input. */
+    static final class StatusTool implements Tool<String, String> {
+        final AtomicInteger calls = new AtomicInteger();
+        @Override public String name() { return "status"; }
+        @Override public Class<String> inputType() { return String.class; }
+        @Override public String apply(String job) { return calls.incrementAndGet() >= 2 ? "done" : "pending"; }
+    }
+
+    /** The model names a job, then the task polls its status until done: repeated identical calls past the fork. */
+    static final class PollTask implements Task<String> {
+        final StatusTool status;
+        PollTask(StatusTool status) { this.status = status; }
+        @Override public String execute(Context ctx) {
+            String job = ctx.model().complete(CompletionRequest.of(Prompt.builder().user("job").build())).message();
+            List<String> seen = new ArrayList<>();
+            String s;
+            do {
+                s = ctx.call(status, job);
+                seen.add(s);
+            } while (!s.equals("done") && seen.size() < 5);
+            return String.join(",", seen);
+        }
+    }
+
+    /**
+     * Repeated identical calls are answered in recorded order. Answering each with the first recorded
+     * output would make an identical candidate poll "pending" forever and look like a regression.
+     */
+    @Test
+    void repeatedIdenticalToolCallsAreAnsweredInRecordedOrder() {
+        StatusTool status = new StatusTool();
+        var recordedRun = runtime.execute(new PollTask(status), ExecutionOptions.none());
+        assertThat(recordedRun.result()).isEqualTo("pending,done");
+        int polls = status.calls.get();
+
+        EvalReport report = Eval.on(runtime).cases(recordedRun.id()).task(new PollTask(status))
+                .candidate(Candidate.model("twin", new StyledModel("sum"))).scorer(Scorers.sameResult()).run();
+
+        assertThat(report.summary("twin").passedAllScorers()).isEqualTo(1);
+        assertThat(report.resultsFor("twin").get(0).sample().candidateResult()).isEqualTo("pending,done");
+        assertThat(status.calls).as("answered from the recording").hasValue(polls);
+    }
+
+    /** One more call than the recording made has no answer left: reported, not run, not a repeat of the last one. */
+    @Test
+    void aCallBeyondTheRecordedOnesHasNoAnswer() {
+        StatusTool status = new StatusTool();
+        var recordedRun = runtime.execute(new PollTask(status), ExecutionOptions.none());
+        recordedRun.result();
+        Task<String> pollsOnceMore = ctx -> {
+            String job = ctx.model().complete(CompletionRequest.of(Prompt.builder().user("job").build())).message();
+            return ctx.call(status, job) + "," + ctx.call(status, job) + "," + ctx.call(status, job);
+        };
+        EvalReport report = Eval.on(runtime).cases(recordedRun.id()).task(pollsOnceMore)
+                .candidate(Candidate.model("twin", new StyledModel("sum"))).run();
+        assertThat(report.summary("twin").outcomes()).containsEntry(CaseResult.Outcome.UNRECORDED_TOOL, 1);
+    }
+
+    /** Not on the payload allowlist: recorded fine (toTree does not check), refused on read. */
+    static final class Plain { public String value = "x"; }
+
+    @Test
+    void aCandidateWhoseResultCannotBeReadBackFailsAloneAndKeepsItsBranch() {
+        Task<Plain> plain = ctx -> {
+            ctx.effect("ticket", () -> "unused");
+            ctx.effect("received-at", () -> "unused");
+            ctx.call(lookup, "unused-input-is-fine-under-live");
+            return new Plain();
+        };
+        EvalReport report = eval().toolReplay(BranchSpec.ToolReplay.RECORDED_OR_LIVE)
+                .candidate(Candidate.task("plain", plain))
+                .candidate(Candidate.model("twin", new StyledModel("sum")))
+                .scorer(Scorers.sameResult()).run();
+
+        CaseResult failed = report.resultsFor("plain").get(0);
+        assertThat(failed.outcome()).isEqualTo(CaseResult.Outcome.FAILED);
+        assertThat(failed.error()).contains("could not be read back");
+        assertThat(failed.branchId()).as("the run is still findable").isNotNull();
+        assertThat(report.summary("twin").passedAllScorers()).as("the other candidate is unaffected").isEqualTo(3);
+    }
+
+    @Test
+    void aScorerThatThrowsFailsThatScoreNotTheEvaluation() {
+        EvalReport report = eval().candidate(Candidate.model("twin", new StyledModel("sum")))
+                .scorer(Scorers.sameResult())
+                .scorer(sample -> { throw new IllegalStateException("scorer bug"); })
+                .run();
+
+        CaseResult r = report.resultsFor("twin").get(0);
+        assertThat(r.scores()).extracting(Score::scorer).containsExactly("same-result", "scorer[1]");
+        assertThat(r.scores().get(0).pass()).isTrue();
+        assertThat(r.scores().get(1).detail()).contains("scorer bug");
+        assertThat(report.results()).hasSize(3);
+    }
+
+    /** Failed and unrecorded-tool cases link to their branch execution, which the log kept. */
+    @Test
+    void failedCasesLinkToTheirBranchExecution() {
+        EvalReport report = eval().candidate(Candidate.task("v3", new TriageTaskV3(lookup)))
+                .candidate(Candidate.model("broken", request -> { throw new IllegalStateException("provider down"); }))
+                .run();
+        for (CaseResult r : report.results()) {
+            assertThat(r.branchId()).isNotNull();
+            assertThat(runtime.inspect(r.branchId()).status()).isEqualTo(Status.FAILED);
+        }
+    }
 }

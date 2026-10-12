@@ -258,4 +258,32 @@ class BranchTest {
             assertThat(send.sent).hasValue(2);
         }
     }
+
+    /** Only calls past the fork are in the table; repeated identical ones are answered in recorded order. */
+    @Test
+    void recordedAnswersArePastTheForkAndConsumedInOrder() {
+        java.util.concurrent.atomic.AtomicInteger reads = new java.util.concurrent.atomic.AtomicInteger();
+        Tool<String, Integer> counter = new Tool<>() {
+            @Override public String name() { return "counter"; }
+            @Override public Class<String> inputType() { return String.class; }
+            @Override public Integer apply(String in) { return reads.incrementAndGet(); }
+        };
+        Task<String> task = ctx -> {
+            int before = ctx.call(counter, "x");                       // before the fork: replayed
+            String m = ctx.model().complete(STEP1).message();
+            return before + "," + ctx.call(counter, "x") + "," + ctx.call(counter, "x") + "," + m;
+        };
+        try (CatalystRuntime runtime = CatalystRuntime.builder().log(EventLogs.inMemory())
+                .model(MockModel.alwaysReturn("m")).build()) {
+            var parent = runtime.execute(task, com.cajunsystems.catalyst.ExecutionOptions.none());
+            assertThat(parent.result()).isEqualTo("1,2,3,m");
+            long fork = runtime.log().read(parent.id()).stream()
+                    .filter(e -> e.event() instanceof com.cajunsystems.catalyst.events.CatalystEvent.PromptBuilt)
+                    .findFirst().orElseThrow().seq() - 1;
+            var child = runtime.branch(parent.id(), fork).withModel(MockModel.alwaysReturn("m"))
+                    .toolReplay(com.cajunsystems.catalyst.engine.BranchSpec.ToolReplay.RECORDED_ONLY).run(task);
+            assertThat(runtime.inspect(child.id()).result().toString()).contains("1,2,3,m");
+            assertThat(reads).as("nothing re-run").hasValue(3);
+        }
+    }
 }

@@ -400,7 +400,7 @@ public final class CatalystRuntime implements AutoCloseable {
     }
 
     /** A fresh id, stamped with this node's shard when the runtime is one shard of several. */
-    private ExecutionId mintId() {
+    ExecutionId mintId() { // package-private: BranchBuilder mints its child's id up front
         return shard == null ? ExecutionId.random() : ExecutionId.random(shard);
     }
 
@@ -972,7 +972,8 @@ public final class CatalystRuntime implements AutoCloseable {
      */
     <R> Trajectory runBranch(ExecutionId parentId, long atSeq, Model overrideModel,
                              Map<String, Object> toolOverrideObjects, Map<String, Object> vars,
-                             String changedComponents, BranchSpec.ToolReplay toolReplay, Task<R> task) {
+                             String changedComponents, BranchSpec.ToolReplay toolReplay, ExecutionId childId,
+                             Task<R> task) {
         List<SequencedEvent> parentEvents = log.read(parentId);
         if (parentEvents.isEmpty()) {
             throw new IllegalArgumentException("Cannot branch unknown execution: " + parentId);
@@ -982,11 +983,10 @@ public final class CatalystRuntime implements AutoCloseable {
         Map<String, JsonNode> overrides = new HashMap<>();
         toolOverrideObjects.forEach((name, value) -> overrides.put(name, payloads.toTree(value)));
 
-        ExecutionId childId = mintId();
         String components = changedComponents == null || changedComponents.isBlank()
                 ? "branch@" + atSeq : changedComponents;
         BranchSpec spec = new BranchSpec(atSeq, parentId.value(), overrides, components,
-                toolReplay, toolReplay == BranchSpec.ToolReplay.LIVE ? Map.of() : recordedToolResults(parentEvents));
+                toolReplay, toolReplay == BranchSpec.ToolReplay.LIVE ? Map.of() : recordedToolResults(parentEvents, atSeq));
 
         // The child log begins with the branch marker + started (the fork itself won't re-record it).
         StreamCursor childCursor = StreamCursor.after(log, childId, -1);
@@ -1038,19 +1038,24 @@ public final class CatalystRuntime implements AutoCloseable {
     }
 
     /**
-     * The parent's successful tool outputs, keyed by {@link BranchSpec#toolKey}: each
-     * {@code ToolRequested} paired with the {@code ToolCompleted} after it. A failed call is left out, so
-     * a branch repeating it gets no recorded answer rather than a recorded failure.
+     * The parent's successful tool outputs past the fork ({@code seq > atSeq}), keyed by
+     * {@link BranchSpec#toolKey}, each key's outputs in recorded order: each {@code ToolRequested}
+     * paired with the {@code ToolCompleted} after it. Calls at or before the fork are left out, since
+     * replay substitutes those. A failed call is left out too, so a branch repeating it gets no
+     * recorded answer rather than a recorded failure.
      */
-    private static Map<String, JsonNode> recordedToolResults(List<SequencedEvent> events) {
-        Map<String, JsonNode> out = new HashMap<>();
+    private static Map<String, List<JsonNode>> recordedToolResults(List<SequencedEvent> events, long atSeq) {
+        Map<String, List<JsonNode>> out = new HashMap<>();
         CatalystEvent.ToolRequested pending = null;
+        long pendingSeq = -1;
         for (SequencedEvent se : events) {
             if (se.event() instanceof CatalystEvent.ToolRequested tr) {
                 pending = tr;
+                pendingSeq = se.seq();
             } else if (se.event() instanceof CatalystEvent.ToolCompleted tc && pending != null) {
-                if (tc.error() == null) {
-                    out.putIfAbsent(BranchSpec.toolKey(pending.toolName(), Hashing.canonicalJsonHash(pending.input())), tc.output());
+                if (tc.error() == null && pendingSeq > atSeq) {
+                    out.computeIfAbsent(BranchSpec.toolKey(pending.toolName(), Hashing.canonicalJsonHash(pending.input())),
+                            k -> new ArrayList<>()).add(tc.output());
                 }
                 pending = null;
             }

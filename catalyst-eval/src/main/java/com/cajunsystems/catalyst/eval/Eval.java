@@ -131,26 +131,42 @@ public final class Eval {
         if (candidate.model() != null) branch.withModel(candidate.model());
         Task<?> toRun = candidate.task() != null ? candidate.task() : task;
 
+        ExecutionId branchId = branch.childId();
         Trajectory forked;
         try {
             forked = branch.run(toRun);
         } catch (RuntimeException e) {
             UnrecordedToolCallException unrecorded = unrecordedIn(e);
             if (unrecorded != null) {
-                return new CaseResult(id, candidate.name(), CaseResult.Outcome.UNRECORDED_TOOL, null, null, List.of(),
+                return new CaseResult(id, candidate.name(), CaseResult.Outcome.UNRECORDED_TOOL, branchId, null, List.of(),
                         unrecorded.getMessage());
             }
-            return new CaseResult(id, candidate.name(), CaseResult.Outcome.FAILED, null, null, List.of(), String.valueOf(e));
+            return new CaseResult(id, candidate.name(), CaseResult.Outcome.FAILED, branchId, null, List.of(), String.valueOf(e));
         }
 
-        ExecutionState candidateState = runtime.inspect(forked.id());
-        Trajectory baselineTrajectory = Trajectory.of(baseline);
-        Sample sample = new Sample(id, candidate.name(),
-                decode(baseline.result()), decode(candidateState.result()),
-                baselineTrajectory, forked, Trajectory.diff(baselineTrajectory, forked));
+        // Decoding can fail too: a result recorded fine (toTree does not check the payload allowlist)
+        // but refused on read. That is this candidate's failure, not the evaluation's.
+        Sample sample;
+        try {
+            ExecutionState candidateState = runtime.inspect(forked.id());
+            Trajectory baselineTrajectory = Trajectory.of(baseline);
+            sample = new Sample(id, candidate.name(),
+                    decode(baseline.result()), decode(candidateState.result()),
+                    baselineTrajectory, forked, Trajectory.diff(baselineTrajectory, forked));
+        } catch (RuntimeException e) {
+            return new CaseResult(id, candidate.name(), CaseResult.Outcome.FAILED, branchId, null, List.of(),
+                    "result could not be read back: " + e);
+        }
         List<Score> scores = new ArrayList<>();
-        for (Scorer scorer : scorers) scores.add(scorer.score(sample));
-        return new CaseResult(id, candidate.name(), CaseResult.Outcome.COMPLETED, forked.id(), sample, scores, null);
+        for (int i = 0; i < scorers.size(); i++) {
+            try {
+                scores.add(scorers.get(i).score(sample));
+            } catch (RuntimeException e) {
+                // A scorer bug fails that score, not the evaluation.
+                scores.add(Score.fail("scorer[" + i + "]", Double.NaN, "scorer threw " + e));
+            }
+        }
+        return new CaseResult(id, candidate.name(), CaseResult.Outcome.COMPLETED, branchId, sample, scores, null);
     }
 
     /**
