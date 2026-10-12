@@ -2,6 +2,7 @@ package com.cajunsystems.catalyst.runtime;
 
 import com.cajunsystems.catalyst.ExecutionId;
 import com.cajunsystems.catalyst.Task;
+import com.cajunsystems.catalyst.engine.BranchSpec;
 import com.cajunsystems.catalyst.engine.Trajectory;
 import com.cajunsystems.catalyst.model.Model;
 
@@ -32,11 +33,24 @@ public final class BranchBuilder {
     private final Map<String, Object> toolOverrides = new LinkedHashMap<>();
     private final Map<String, Object> vars = new LinkedHashMap<>();
     private final List<String> changed = new ArrayList<>();
+    private BranchSpec.ToolReplay toolReplay = BranchSpec.ToolReplay.LIVE;
+    private ExecutionId childId;
 
     BranchBuilder(CatalystRuntime runtime, ExecutionId parentId, long atSeq) {
         this.runtime = runtime;
         this.parentId = parentId;
         this.atSeq = atSeq;
+        this.childId = runtime.mintId();
+    }
+
+    /**
+     * The id the <em>next</em> {@link #run}'s execution will have, known before it runs, so a caller
+     * can find the branch's record even when the run throws. A failed branch still leaves its
+     * {@code ExecutionBranched} … {@code ExecutionFailed} stream. Each run takes this id and mints a
+     * fresh one, so running one builder twice gives two independent branches.
+     */
+    public ExecutionId childId() {
+        return childId;
     }
 
     /** Run the branch forward with a different model from the branch point. */
@@ -59,9 +73,21 @@ public final class BranchBuilder {
         return this;
     }
 
+    /**
+     * How tool calls are answered once the branch has forked (default {@link BranchSpec.ToolReplay#LIVE}).
+     * The recorded modes answer from the parent's log, so a counterfactual run does not repeat
+     * the parent's side effects. That is what an evaluation needs.
+     */
+    public BranchBuilder toolReplay(BranchSpec.ToolReplay toolReplay) {
+        this.toolReplay = java.util.Objects.requireNonNull(toolReplay, "toolReplay");
+        return this;
+    }
+
     /** Runs {@code task} forward from the branch point and returns the fork's trajectory. */
     public <R> Trajectory run(Task<R> task) {
+        ExecutionId id = childId;
+        childId = runtime.mintId();
         return runtime.runBranch(parentId, atSeq, overrideModel, toolOverrides, vars,
-                String.join(",", changed), task);
+                String.join(",", changed), toolReplay, id, task);
     }
 }

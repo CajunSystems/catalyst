@@ -1,0 +1,32 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<project xmlns="http://maven.apache.org/POM/4.0.0"
+         xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance"
+         xsi:schemaLocation="http://maven.apache.org/POM/4.0.0 http://maven.apache.org/xsd/maven-4.0.0.xsd">
+    <modelVersion>4.0.0</modelVersion>
+
+    <parent>
+        <groupId>com.cajunsystems</groupId>
+        <artifactId>catalyst-parent</artifactId>
+        <version>0.1.0-SNAPSHOT</version>
+    </parent>
+
+    <artifactId>catalyst-eval</artifactId>
+    <name>Catalyst Eval</name>
+    <description>Eval harness: replay recorded executions against candidate models and prompts, and score them (spec §12).</description>
+
+    <dependencies>
+        <!--
+          The harness is a consumer of the runtime: it batches branch (M2) over recorded executions and
+          scores the forks. No new storage and no new event types. Every evaluation is itself a branch
+          execution in the log.
+        -->
+        <dependency>
+            <groupId>com.cajunsystems</groupId>
+            <artifactId>catalyst-core</artifactId>
+        </dependency>
+        <dependency>
+            <groupId>com.cajunsystems</groupId>
+            <artifactId>catalyst-runtime</artifactId>
+        </dependency>
+    </dependencies>
+</project>

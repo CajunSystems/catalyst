@@ -327,6 +327,47 @@ TrajectoryDiff diff = Trajectory.diff(Trajectory.of(runtime.inspect(id)), fork);
 
 The fork is a new execution; the diff shows which steps changed.
 
+Past the fork a branch runs live, tools included. To explore without repeating side effects, answer
+tool calls from the recording instead:
+`.toolReplay(BranchSpec.ToolReplay.RECORDED_ONLY)` (or `RECORDED_OR_LIVE` to run only calls the
+recording can't answer).
+
+## Evaluating models and prompts
+
+The log is a dataset. `catalyst-eval` (included in `catalyst-api`) replays recorded executions
+against candidate models and prompt rewrites and scores them, so a model upgrade or a prompt change
+can be checked against real traffic before it ships:
+
+```java
+EvalReport report = Eval.on(runtime)
+        .cases(recordedIds)                                    // completed executions
+        .task(new TriageTask())                                // the production task
+        .candidate(Candidate.model("mini", miniModel))         // a cheaper model
+        .candidate(Candidate.task("prompt-v2", new TriageTaskV2()))   // rewritten prompts
+        .scorer(Scorers.sameResult())
+        .scorer(Scorers.costAtMost(0.5))
+        .scorer(Scorer.check("names-the-floor", s -> String.valueOf(s.candidateResult()).contains("floor")))
+        .run();
+System.out.print(report.pretty());   // pass rates, token and cost deltas, and why each failure failed
+```
+
+How each case runs:
+- **It branches just before the recorded run's first model call.** Everything the run did before
+  that (clock reads, ids, lookups) is substituted exactly, so only the candidate's change differs.
+- **Tools are never re-run.** A tool call the recorded run made with the same input gets its
+  recorded output. A call it never made ends the case as `UNRECORDED_TOOL`, a finding that the
+  candidate took a different path; nothing is sent to the outside world. Opt into live tools with
+  `.toolReplay(RECORDED_OR_LIVE)`.
+- **Only the candidate's model is called.** A candidate without a model uses the runtime's default.
+- **Every evaluated run is a branch execution in the log** (`CaseResult.branchId()`), which you can
+  inspect, render or replay like any other.
+
+Scorers are pure functions of a `Sample`: both results, both trajectories, and their diff. The
+built-ins are `sameResult`, `sameSteps`, `costAtMost` and `tokensAtMost`, and `Scorer.check(name,
+predicate)` covers a domain check. Task vars are not persisted (only their hash is), so a case's
+input must reach the task through a recorded boundary, such as `ctx.effect("ticket", ...)` or a tool
+call, to be replayed. A task that reads `ctx.var(...)` sees nothing in an evaluation.
+
 ## Streaming completions
 
 A task that wants tokens as they arrive asks for a sink instead of a return value:

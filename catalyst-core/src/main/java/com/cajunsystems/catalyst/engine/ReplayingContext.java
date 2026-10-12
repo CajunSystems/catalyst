@@ -73,6 +73,15 @@ public final class ReplayingContext implements Context {
     private final CostModel costModel;
     private final ReplayMode replayMode;
     private final BranchSpec branchSpec; // nullable: present only when driving a branch
+    /** Per tool key, how many of the branch's still-unused recorded outputs have been handed out. */
+    private final java.util.Map<String, Integer> recordedToolCursor = new java.util.HashMap<>();
+    /**
+     * The last recorded seq replay actually used: the highest boundary consumed, pulled back to just
+     * before the fork on a divergence. Recorded tool outputs after it were never handed to this run.
+     */
+    private long lastReplayedSeq = -1;
+    /** Raised (and possibly swallowed by the task): a branch that hit an unanswerable tool call. */
+    private UnrecordedToolCallException raisedUnrecordedTool;
     private final Clock clock;
     private final Logger logger;
     private final boolean appendEnabled;
@@ -475,7 +484,45 @@ public final class ReplayingContext implements Context {
         if (danglingTool != null) {
             return handleInDoubt(tool, input);
         }
+        if (branchSpec != null && branchSpec.toolReplay() != BranchSpec.ToolReplay.LIVE && !isDeterministic(tool)) {
+            return answerFromRecording(tool, input);
+        }
         return runToolLive(tool, input);
+    }
+
+    /**
+     * A forked branch that must not re-run side effects: answer from the parent's recording when it
+     * made the identical call, recording the boundary as usual so the branch's trajectory shows the
+     * step. Otherwise run it live, or refuse under {@link BranchSpec.ToolReplay#RECORDED_ONLY}.
+     * Deterministic tools never get here: re-running them is safe and is what they are for.
+     */
+    @SuppressWarnings("unchecked")
+    private <I, O> O answerFromRecording(Tool<I, O> tool, I input) {
+        com.fasterxml.jackson.databind.JsonNode inputTree = eventMapper.valueToTree(input);
+        String inputHash = Hashing.canonicalJsonHash(inputTree);
+        String key = BranchSpec.toolKey(tool.name(), inputHash);
+        long replayedThrough = lastReplayedSeq;
+        java.util.List<com.fasterxml.jackson.databind.JsonNode> outputs = branchSpec.recordedToolResults()
+                .getOrDefault(key, java.util.List.of()).stream()
+                .filter(r -> r.seq() > replayedThrough)   // earlier ones were substituted by replay
+                .map(BranchSpec.RecordedOutput::output)
+                .toList();
+        int next = recordedToolCursor.getOrDefault(key, 0);
+        com.fasterxml.jackson.databind.JsonNode recordedOutput = next < outputs.size() ? outputs.get(next) : null;
+        if (recordedOutput == null) {
+            if (branchSpec.toolReplay() == BranchSpec.ToolReplay.RECORDED_ONLY) {
+                // Remembered, like the stop signals: a task that catches tool errors must not turn
+                // "the candidate took a path the recording cannot answer" into a completion.
+                raisedUnrecordedTool = new UnrecordedToolCallException(tool.name(), inputHash);
+                throw raisedUnrecordedTool;
+            }
+            return runToolLive(tool, input);
+        }
+        requireAppendable("tool " + tool.name());
+        recordedToolCursor.put(key, next + 1);
+        append(new ToolRequested(now(), tool.name(), inputTree));
+        append(new ToolCompleted(now(), recordedOutput, null, 0));
+        return (O) payloads.fromTree(recordedOutput);
     }
 
     private <I, O> O runToolLive(Tool<I, O> tool, I input) {
@@ -686,6 +733,7 @@ public final class ReplayingContext implements Context {
         }
         if (type.isInstance(head.event())) {
             boundaries.poll();
+            lastReplayedSeq = Math.max(lastReplayedSeq, head.seq());
             return Optional.of(head);
         }
         // structural divergence (wrong boundary type/order) → STRICT throws, BRANCH forks (go live)
@@ -724,6 +772,8 @@ public final class ReplayingContext implements Context {
     private void fork(long seq) {
         if (branched) return;
         branched = true;
+        // The boundary at seq was polled but not used: it is where the run left the recording.
+        lastReplayedSeq = Math.min(lastReplayedSeq, seq - 1);
         if (appendEnabled && branchSpec == null) {
             append(new ExecutionBranched(now(), null, seq, "divergence"));
         }
@@ -778,6 +828,11 @@ public final class ReplayingContext implements Context {
     /** Whether this context raised {@link CancellationSignal} — whether or not the task let it unwind. */
     public boolean raisedCancellation() {
         return raisedCancellation;
+    }
+
+    /** The unanswerable tool call this branch raised, whether or not the task let it unwind; null if none. */
+    public UnrecordedToolCallException raisedUnrecordedTool() {
+        return raisedUnrecordedTool;
     }
 
     /** Whether this context raised {@link ExecutionAbandonedSignal} — whether or not the task let it unwind. */

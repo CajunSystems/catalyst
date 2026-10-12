@@ -400,7 +400,7 @@ public final class CatalystRuntime implements AutoCloseable {
     }
 
     /** A fresh id, stamped with this node's shard when the runtime is one shard of several. */
-    private ExecutionId mintId() {
+    ExecutionId mintId() { // package-private: BranchBuilder mints its child's id up front
         return shard == null ? ExecutionId.random() : ExecutionId.random(shard);
     }
 
@@ -972,7 +972,8 @@ public final class CatalystRuntime implements AutoCloseable {
      */
     <R> Trajectory runBranch(ExecutionId parentId, long atSeq, Model overrideModel,
                              Map<String, Object> toolOverrideObjects, Map<String, Object> vars,
-                             String changedComponents, Task<R> task) {
+                             String changedComponents, BranchSpec.ToolReplay toolReplay, ExecutionId childId,
+                             Task<R> task) {
         List<SequencedEvent> parentEvents = log.read(parentId);
         if (parentEvents.isEmpty()) {
             throw new IllegalArgumentException("Cannot branch unknown execution: " + parentId);
@@ -982,10 +983,10 @@ public final class CatalystRuntime implements AutoCloseable {
         Map<String, JsonNode> overrides = new HashMap<>();
         toolOverrideObjects.forEach((name, value) -> overrides.put(name, payloads.toTree(value)));
 
-        ExecutionId childId = mintId();
         String components = changedComponents == null || changedComponents.isBlank()
                 ? "branch@" + atSeq : changedComponents;
-        BranchSpec spec = new BranchSpec(atSeq, parentId.value(), overrides, components);
+        BranchSpec spec = new BranchSpec(atSeq, parentId.value(), overrides, components,
+                toolReplay, toolReplay == BranchSpec.ToolReplay.LIVE ? Map.of() : recordedToolResults(parentEvents));
 
         // The child log begins with the branch marker + started (the fork itself won't re-record it).
         StreamCursor childCursor = StreamCursor.after(log, childId, -1);
@@ -1002,6 +1003,8 @@ public final class CatalystRuntime implements AutoCloseable {
                 parentEvents, /* appendEnabled */ true, null, childCursor);
         try (AutoCapture.Scope captured = AutoCapture.bind(ctx)) {
             R result = task.execute(ctx);
+            // The task swallowed an unanswerable tool call: still that finding, not a completion.
+            if (ctx.raisedUnrecordedTool() != null) throw ctx.raisedUnrecordedTool();
             childCursor.append(new CatalystEvent.ExecutionCompleted(now(), payloads.toTree(result)));
         } catch (ExecutionPausedSignal pause) {
             // ExecutionPaused already recorded by the context (e.g. an ASK in-doubt tool); the child
@@ -1034,6 +1037,29 @@ public final class CatalystRuntime implements AutoCloseable {
         Cost childCost = childState.cost();
         Cost combined = prefixCost.plus(childCost.promptTokens(), childCost.completionTokens(), childCost.usd());
         return Trajectory.of(childId, childState.status(), forkSteps, combined);
+    }
+
+    /**
+     * Every successful tool call the parent recorded, keyed by {@link BranchSpec#toolKey}, each key's
+     * outputs in recorded order with the seq of their {@code ToolCompleted}. The context uses only those
+     * after the point its replay actually reached, which can be earlier than {@code atSeq}. A failed
+     * call is left out, so a branch repeating it gets no recorded answer rather than a recorded failure.
+     */
+    private static Map<String, List<BranchSpec.RecordedOutput>> recordedToolResults(List<SequencedEvent> events) {
+        Map<String, List<BranchSpec.RecordedOutput>> out = new HashMap<>();
+        CatalystEvent.ToolRequested pending = null;
+        for (SequencedEvent se : events) {
+            if (se.event() instanceof CatalystEvent.ToolRequested tr) {
+                pending = tr;
+            } else if (se.event() instanceof CatalystEvent.ToolCompleted tc && pending != null) {
+                if (tc.error() == null) {
+                    out.computeIfAbsent(BranchSpec.toolKey(pending.toolName(), Hashing.canonicalJsonHash(pending.input())),
+                            k -> new ArrayList<>()).add(new BranchSpec.RecordedOutput(se.seq(), tc.output()));
+                }
+                pending = null;
+            }
+        }
+        return out;
     }
 
     /**

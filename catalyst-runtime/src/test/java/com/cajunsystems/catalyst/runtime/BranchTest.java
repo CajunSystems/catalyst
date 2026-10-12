@@ -199,4 +199,111 @@ class BranchTest {
                     .isInstanceOf(CatalystEvent.ExecutionPaused.class);
         }
     }
+
+    /** A side-effecting tool that counts its real invocations. */
+    static final class SendTool implements Tool<String, String> {
+        final java.util.concurrent.atomic.AtomicInteger sent = new java.util.concurrent.atomic.AtomicInteger();
+        @Override public String name() { return "send"; }
+        @Override public Class<String> inputType() { return String.class; }
+        @Override public String apply(String to) { sent.incrementAndGet(); return "sent to " + to; }
+    }
+
+    /** Model call first, then a tool whose input depends on the model's answer: a branch forks before the tool. */
+    private static Task<String> notify(SendTool send) {
+        return ctx -> {
+            String who = ctx.model().complete(STEP1).message();
+            return ctx.call(send, who);
+        };
+    }
+
+    @Test
+    void pastTheForkALiveBranchRunsToolsForRealByDefault() {
+        SendTool send = new SendTool();
+        try (CatalystRuntime runtime = CatalystRuntime.builder().log(EventLogs.inMemory())
+                .model(MockModel.alwaysReturn("ops")).build()) {
+            var parent = runtime.execute(notify(send), com.cajunsystems.catalyst.ExecutionOptions.none());
+            assertThat(parent.result()).isEqualTo("sent to ops");
+            runtime.branch(parent.id(), 1).withModel(MockModel.alwaysReturn("ops")).run(notify(send));
+            assertThat(send.sent).as("unchanged M2 behaviour: the fork is live").hasValue(2);
+        }
+    }
+
+    @Test
+    void aRecordedOnlyBranchAnswersRepeatedToolCallsFromTheParentAndRefusesNewOnes() {
+        SendTool send = new SendTool();
+        try (CatalystRuntime runtime = CatalystRuntime.builder().log(EventLogs.inMemory())
+                .model(MockModel.alwaysReturn("ops")).build()) {
+            var parent = runtime.execute(notify(send), com.cajunsystems.catalyst.ExecutionOptions.none());
+            parent.result();
+
+            // Same model answer → the identical tool call → the parent's recorded output, nothing sent.
+            var same = runtime.branch(parent.id(), 1).withModel(MockModel.alwaysReturn("ops"))
+                    .toolReplay(com.cajunsystems.catalyst.engine.BranchSpec.ToolReplay.RECORDED_ONLY).run(notify(send));
+            assertThat(same.status()).isEqualTo(com.cajunsystems.catalyst.Status.COMPLETED);
+            assertThat(send.sent).hasValue(1);
+            assertThat(runtime.inspect(same.id()).trajectory()).extracting(s -> s.kind())
+                    .as("the substituted call is still a recorded step of the branch")
+                    .contains(com.cajunsystems.catalyst.engine.TimelineStep.Kind.TOOL);
+
+            // A different answer → a call the parent never made → refused, nothing sent.
+            assertThatThrownBy(() -> runtime.branch(parent.id(), 1).withModel(MockModel.alwaysReturn("everyone"))
+                    .toolReplay(com.cajunsystems.catalyst.engine.BranchSpec.ToolReplay.RECORDED_ONLY).run(notify(send)))
+                    .isInstanceOf(com.cajunsystems.catalyst.engine.UnrecordedToolCallException.class)
+                    .hasMessageContaining("send");
+            assertThat(send.sent).hasValue(1);
+
+            // RECORDED_OR_LIVE runs the new call for real.
+            runtime.branch(parent.id(), 1).withModel(MockModel.alwaysReturn("everyone"))
+                    .toolReplay(com.cajunsystems.catalyst.engine.BranchSpec.ToolReplay.RECORDED_OR_LIVE).run(notify(send));
+            assertThat(send.sent).hasValue(2);
+        }
+    }
+
+    /** Only calls past the fork are in the table; repeated identical ones are answered in recorded order. */
+    @Test
+    void recordedAnswersArePastTheForkAndConsumedInOrder() {
+        java.util.concurrent.atomic.AtomicInteger reads = new java.util.concurrent.atomic.AtomicInteger();
+        Tool<String, Integer> counter = new Tool<>() {
+            @Override public String name() { return "counter"; }
+            @Override public Class<String> inputType() { return String.class; }
+            @Override public Integer apply(String in) { return reads.incrementAndGet(); }
+        };
+        Task<String> task = ctx -> {
+            int before = ctx.call(counter, "x");                       // before the fork: replayed
+            String m = ctx.model().complete(STEP1).message();
+            return before + "," + ctx.call(counter, "x") + "," + ctx.call(counter, "x") + "," + m;
+        };
+        try (CatalystRuntime runtime = CatalystRuntime.builder().log(EventLogs.inMemory())
+                .model(MockModel.alwaysReturn("m")).build()) {
+            var parent = runtime.execute(task, com.cajunsystems.catalyst.ExecutionOptions.none());
+            assertThat(parent.result()).isEqualTo("1,2,3,m");
+            long fork = runtime.log().read(parent.id()).stream()
+                    .filter(e -> e.event() instanceof com.cajunsystems.catalyst.events.CatalystEvent.PromptBuilt)
+                    .findFirst().orElseThrow().seq() - 1;
+            var child = runtime.branch(parent.id(), fork).withModel(MockModel.alwaysReturn("m"))
+                    .toolReplay(com.cajunsystems.catalyst.engine.BranchSpec.ToolReplay.RECORDED_ONLY).run(task);
+            assertThat(runtime.inspect(child.id()).result().toString()).contains("1,2,3,m");
+            assertThat(reads).as("nothing re-run").hasValue(3);
+        }
+    }
+
+    /** Each run of one builder is an independent branch, as before child ids were minted up front. */
+    @Test
+    void runningOneBuilderTwiceGivesTwoBranches() {
+        SendTool send = new SendTool();
+        try (CatalystRuntime runtime = CatalystRuntime.builder().log(EventLogs.inMemory())
+                .model(MockModel.alwaysReturn("ops")).build()) {
+            var parent = runtime.execute(notify(send), com.cajunsystems.catalyst.ExecutionOptions.none());
+            parent.result();
+            BranchBuilder builder = runtime.branch(parent.id(), 1).withModel(MockModel.alwaysReturn("ops"))
+                    .toolReplay(com.cajunsystems.catalyst.engine.BranchSpec.ToolReplay.RECORDED_ONLY);
+            var expected = builder.childId();
+            var first = builder.run(notify(send));
+            var second = builder.run(notify(send));
+            assertThat(first.id()).isEqualTo(expected);
+            assertThat(second.id()).isNotEqualTo(first.id());
+            assertThat(first.status()).isEqualTo(com.cajunsystems.catalyst.Status.COMPLETED);
+            assertThat(second.status()).isEqualTo(com.cajunsystems.catalyst.Status.COMPLETED);
+        }
+    }
 }
