@@ -40,6 +40,8 @@ import java.time.Instant;
         @JsonSubTypes.Type(value = CatalystEvent.ExecutionCompleted.class, name = "ExecutionCompleted"),
         @JsonSubTypes.Type(value = CatalystEvent.ExecutionFailed.class, name = "ExecutionFailed"),
         @JsonSubTypes.Type(value = CatalystEvent.ExecutionCancelled.class, name = "ExecutionCancelled"),
+        @JsonSubTypes.Type(value = CatalystEvent.SignalAwaited.class, name = "SignalAwaited"),
+        @JsonSubTypes.Type(value = CatalystEvent.SignalReceived.class, name = "SignalReceived"),
 })
 public sealed interface CatalystEvent {
 
@@ -73,6 +75,27 @@ public sealed interface CatalystEvent {
      * observed (the log tail for an out-of-band cancel, or the live boundary a running task unwound at).
      */
     record ExecutionCancelled(Instant at, String reason, long atSeq) implements CatalystEvent {}
+
+    // ── Signals (spec §5 WAITING) ──────────────────────────────────────────────
+
+    /**
+     * The task is waiting for the named signal: folds the execution to {@code WAITING}. Not a
+     * substitutable boundary on its own — the boundary's recorded result is the {@link SignalReceived}
+     * that follows it. Recorded with no thread held: the attempt unwinds once it is appended.
+     *
+     * <p>{@code payloadType} is the class name the task awaits, so a signal of another type can be
+     * refused before it is recorded — once recorded, a payload the task cannot accept would fail every
+     * resume, and the log is append-only.
+     */
+    record SignalAwaited(Instant at, String name, String payloadType) implements CatalystEvent {}
+
+    /**
+     * A signal delivered to an execution waiting for it: the recorded result of its await boundary,
+     * substituted on resume/replay like any other. Folds {@code WAITING → RESUMING} — a state change,
+     * not just a wake-up — so a crash between delivery and the resume leaves an execution startup
+     * recovery resumes, rather than a waiting one whose signal nothing will ever consume.
+     */
+    record SignalReceived(Instant at, String name, JsonNode payload) implements CatalystEvent {}
 
     // ── Model boundary ───────────────────────────────────────────────────────
 

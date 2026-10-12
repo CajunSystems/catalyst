@@ -224,7 +224,7 @@ public final class TimelineReport {
             case MEMORY_READ, MEMORY_WRITE -> "memory";
             case FAILED, CANCELLED -> "bad";
             case COMPLETED -> "ok";
-            case RETRY, PAUSED, BRANCHED -> "warn";
+            case RETRY, PAUSED, WAITING, BRANCHED -> "warn";
             default -> "other";
         };
     }

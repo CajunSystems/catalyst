@@ -10,8 +10,8 @@ package com.cajunsystems.catalyst;
  *        WAITING / PAUSED → RESUMING          FAILED / CANCELLED
  * </pre>
  *
- * {@code WAITING} is reserved for v1 durable signals / human-in-the-loop; it is in the state machine
- * now so v1 adds await APIs without a breaking schema change, but v0 drives no transitions into it.
+ * {@code WAITING} is an execution parked on {@code ctx.awaitSignal(name, type)}, holding no thread
+ * until {@code runtime.signal(id, name, payload)} delivers it, which folds it to {@code RESUMING}.
  */
 public enum Status {
     NEW,

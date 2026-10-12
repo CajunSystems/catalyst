@@ -88,6 +88,13 @@ public final class ReplayingContext implements Context {
      */
     private volatile boolean raisedCancellation;
     private volatile boolean raisedAbandon;
+    /** The signal this context parked the attempt on, if any — honoured even if the task swallowed it. */
+    private volatile ExecutionWaitingSignal raisedWaiting;
+    /**
+     * A recorded {@code SignalAwaited} with no {@code SignalReceived} after it: the execution is still
+     * waiting. Reaching it again parks the attempt without recording a second wait.
+     */
+    private String awaitingSignal;
 
     /** Result-bearing recorded boundaries, in order, consumed as the task replays its prefix. */
     private final Deque<Boundary> boundaries = new ArrayDeque<>();
@@ -228,6 +235,12 @@ public final class ReplayingContext implements Context {
                     }
                 }
                 case EffectRecorded er -> boundaries.add(new Boundary(se.seq(), e, er.label(), null));
+                case SignalAwaited sa -> this.awaitingSignal = sa.name();
+                case SignalReceived sr -> {
+                    // The await boundary's result; the SignalAwaited before it carries no result of its own.
+                    boundaries.add(new Boundary(se.seq(), e, sr.name(), null));
+                    this.awaitingSignal = null;
+                }
                 case MemoryRead mr -> boundaries.add(new Boundary(se.seq(), e, mr.key(), null));
                 case MemoryWritten mw -> {
                     boundaries.add(new Boundary(se.seq(), e, mw.key(), null));
@@ -517,6 +530,59 @@ public final class ReplayingContext implements Context {
         return value;
     }
 
+    // ── Signals ────────────────────────────────────────────────────────────────
+
+    @Override
+    @SuppressWarnings("unchecked")
+    public <T> T awaitSignal(String name, Class<T> requested) {
+        // Box a primitive (int.class -> Integer.class) before recording or checking anything: a payload
+        // is always an object, Class.isInstance is false for every primitive class, and the recorded
+        // name of a primitive ("int") cannot be loaded for signal()'s pre-write type check.
+        Class<T> type = (Class<T>) java.lang.invoke.MethodType.methodType(requested).wrap().returnType();
+        Optional<Boundary> recorded = pollExpected(SignalReceived.class, "signal " + name);
+        if (recorded.isPresent() && identityMatchesOrFork(recorded.get(), "signal", name)) {
+            Object payload = payloads.fromTree(((SignalReceived) recorded.get().event()).payload());
+            if (payload != null && !type.isInstance(payload)) {
+                throw new ClassCastException("Signal '" + name + "' carried a " + payload.getClass().getName()
+                        + " but was awaited as " + type.getName());
+            }
+            return type.cast(payload);
+        }
+        if (awaitingSignal != null) {
+            // Still waiting: the recorded wait has no signal after it. A different signal at this point
+            // means the task no longer waits where it did — a divergence.
+            String recordedWait = awaitingSignal;
+            awaitingSignal = null;
+            if (!recordedWait.equals(name)) {
+                forkOrThrow(-1, "await signal " + recordedWait, "await signal " + name);
+            } else {
+                // A live attempt only gets here if something folded the execution out of WAITING after
+                // the wait was recorded — a pause, then a resume whose ExecutionResumed folded it to
+                // RUNNING. Parking without a record would leave it RUNNING: refused by signal(), and
+                // re-resumed by every startup recovery. Re-record the wait so the stream folds back to
+                // WAITING for this name. A pure replay (no appends) just stops here.
+                if (appendEnabled) {
+                    requireAppendable("await signal " + name);
+                    append(new SignalAwaited(now(), name, type.getName()));
+                }
+                throw raisedWaiting = new ExecutionWaitingSignal(name, "Execution " + id + " is waiting for signal '" + name + "'");
+            }
+        }
+        requireAppendable("await signal " + name);
+        append(new SignalAwaited(now(), name, type.getName()));
+        throw raisedWaiting = new ExecutionWaitingSignal(name, "Execution " + id + " is waiting for signal '" + name + "'");
+    }
+
+    /** Whether this context parked the attempt on a signal — whether or not the task let it unwind. */
+    public boolean raisedWaiting() {
+        return raisedWaiting != null;
+    }
+
+    /** The signal this context parked the attempt on, or null. */
+    public ExecutionWaitingSignal waitingSignal() {
+        return raisedWaiting;
+    }
+
     // ── Memory ─────────────────────────────────────────────────────────────────
 
     @Override
@@ -648,6 +714,13 @@ public final class ReplayingContext implements Context {
     }
 
     private void requireAppendable(String what) {
+        // A swallowed wait stays a wait, as the stop signals do: nothing may be recorded after
+        // SignalAwaited. A fallback that made a model/tool/effect call would put its events between the
+        // wait and the signal delivered later, and the resume — which looks for SignalReceived where the
+        // task waits — could never get past them. Checked FIRST, so a pure replay that reaches a recorded
+        // wait unwinds as a wait (and replay() ends there) rather than as "ran past the log". Cancel
+        // still wins: the runtime's park path records a pending cancel whichever signal unwound.
+        if (raisedWaiting != null) throw raisedWaiting;
         if (!appendEnabled) {
             throw new NonDeterministicReplayException(-1,
                     "recorded boundary", "live execution at " + what

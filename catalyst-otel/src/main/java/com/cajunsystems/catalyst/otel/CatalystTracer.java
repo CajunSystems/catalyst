@@ -123,6 +123,8 @@ public final class CatalystTracer {
                 case ExecutionStarted s2 -> root.addEvent("started", attr("catalyst.attempt", s2.attempt()), s2.at());
                 case ExecutionResumed r -> root.addEvent("resumed", attr("catalyst.attempt", r.attempt()), r.at());
                 case ExecutionPaused p -> root.addEvent("paused", attr("catalyst.reason", p.reason()), p.at());
+                case SignalAwaited sa -> root.addEvent("waiting", attr("catalyst.signal", sa.name()), sa.at());
+                case SignalReceived sr -> root.addEvent("signalled", attr("catalyst.signal", sr.name()), sr.at());
                 case RetryRequested rr -> root.addEvent("retry", attr("catalyst.cause", rr.cause()), rr.at());
                 case ExecutionBranched b -> root.addEvent("branched", attr("catalyst.parent.id", b.parentId()), b.at());
                 case ExecutionCancelled c -> root.addEvent("cancelled", attr("catalyst.reason", c.reason()), c.at());

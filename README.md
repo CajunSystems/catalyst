@@ -143,7 +143,7 @@ scripts/demo.sh /tmp/catalyst-demo resume   # a new process resumes it
 [resume] model calls THIS run: 1 (step 1 was substituted from the log; only step 2 ran live)
 ```
 
-Other demos: `scripts/demo.sh replay`, `branch`, `retry`, `cancel`, `shutdown`, `streaming`,
+Other demos: `scripts/demo.sh replay`, `branch`, `signal`, `retry`, `cancel`, `shutdown`, `streaming`,
 `timeline`, `otel`, `autocapture`, and more. The full list is at the top of `scripts/demo.sh`, and CI
 runs every one of them as a gate.
 
@@ -152,8 +152,8 @@ runs every one of them as a gate.
 - **Task:** your code, `Task<R>`, a unit of AI work. Make it a named class if it may be resumed by
   another process.
 - **Context (`ctx`):** the only way a task touches the outside world: `ctx.model()`,
-  `ctx.call(tool, input)`, `ctx.effect(label, supplier)`, `ctx.memory()`, `ctx.var(name)`. Each call is
-  a **boundary**, and its result is recorded.
+  `ctx.call(tool, input)`, `ctx.effect(label, supplier)`, `ctx.memory()`, `ctx.awaitSignal(name, type)`,
+  `ctx.var(name)`. Each call is a **boundary**, and its result is recorded.
 - **Execution:** one run of a task, with an `ExecutionId` and an event log. Give it an **idempotency
   key** (`ExecutionOptions.withKey(...)`) and resubmitting that key never runs the work twice.
 - **Resume, replay, branch:** a task always re-runs from the top. Boundaries already in the log are
@@ -172,6 +172,7 @@ runs every one of them as a gate.
 | retry transient failures | `.retryPolicy(RetryPolicy.exponential(…))` | [Failures](docs/guide.md#failures-retries-and-in-doubt-calls) |
 | decide what happens to a call cut off by a crash | `.inDoubtPolicy(…)` | [Failures](docs/guide.md#failures-retries-and-in-doubt-calls) |
 | resume crashed work after a restart | `.task(...)` + `.recoverOnStart(true)` | [Resuming](docs/guide.md#idempotency-keys-and-resuming) |
+| wait for a human's approval, then continue | `ctx.awaitSignal(name, type)` + `runtime.signal(id, name, payload)` | [Signals](docs/guide.md#signals-waiting-for-a-human) |
 | cancel or pause an execution | `runtime.cancel(id)`, `pause(id)`, `resume(id)` | [Control](docs/guide.md#cancel-pause-resume) |
 | check that my task code is deterministic | `runtime.replay(id, task)` | [Replay](docs/guide.md#inspect-replay-branch) |
 | try a different model on a past run | `runtime.branch(id, seq).withModel(m).run(task)` | [Branch](docs/guide.md#inspect-replay-branch) |

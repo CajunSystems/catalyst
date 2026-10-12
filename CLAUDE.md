@@ -287,6 +287,40 @@ checkout's pom to `com.github.CajunSystems` before installing.
   (pre-sharding) ids pass. The shard set is fixed for the life of the data. Not failover: a shard's
   work waits for that node — node takeover is the Dist track.
 
+- **Signals / WAITING (Deploy-6)** — `SignalTest` (runtime) + `SignalAcceptanceTest` + `Demo signal`,
+  and `Demo crashmany`/`recover` gained a waiting (left alone) and a signalled-then-crashed (finished)
+  execution. `ctx.awaitSignal(name, type)`: substituted if `SignalReceived` is recorded; else records
+  `SignalAwaited` (→ `WAITING`) and throws `ExecutionWaitingSignal` — the attempt ends, **no thread
+  held**, runtime appends nothing more. `SignalAwaited` is not a boundary; `SignalReceived` is (the
+  wait's result, identity = name). `runtime.signal(id, name, payload)` accepts only `WAITING` *for that
+  name* and not in flight — **no buffering**, so nothing ever appends to a running stream from
+  outside — appends `SignalReceived` (→ `RESUMING`, a state change so a crash before the resume is
+  recovered) then `resume(id)` (reentrant). `resume`/keyed `execute` of a still-`WAITING` execution run
+  **no attempt** (its `ExecutionResumed` would fold to `RUNNING` and recovery would treat a waiter as
+  crashed) — `waitingHandle`. The stop rule extends to waiting (swallowed `ExecutionWaitingSignal` →
+  still parked; a pending cancel wins, since `cancel()` only tripped the token while the attempt was
+  registered). `replay` of a waiting execution ends cleanly at the wait. A **live** attempt that reaches a still-recorded
+  wait (only possible after something folded it out of `WAITING`, e.g. `pause` then `resume`)
+  **re-records** `SignalAwaited` so the fold returns to `WAITING` — otherwise it stays `RUNNING`, refused by
+  `signal()` and re-resumed by every recovery. **Handles complete only after deregistration:**
+  `scheduleAttempt` returns (and registers in `inFlight`) a stage chained *behind* the deregistering
+  `whenComplete`, so no caller can observe a finished attempt still in flight — before this, an
+  immediate `signal()` after `ExecutionWaitingSignal` could be refused, or its `resume()` attach to the
+  dead attempt and schedule nothing. `liveAttempt(id)` (ignores done futures) is the second layer.
+  Parking (waiting **or** paused) ends via `parkUnlessCancelled`, which checks the token
+  and completes/deregisters **under the id lock** `cancel()` decides under — otherwise a `cancel()` between
+  the check and the deregistration only trips the token and is lost. A **swallowed wait** re-raises at every later boundary (`requireAppendable`, after cancel/abandon), so
+  nothing is recorded after `SignalAwaited` — a fallback's events there would make the signalled resume
+  diverge. `ExecutionState.awaitingSignal()`
+  is **derived from the timeline**, so the state records and snapshot format are unchanged.
+  `Context.awaitSignal` is a default method (throws) so other `Context` implementations still compile.
+  **`signal()` refuses before writing** everything a resume could never get past: wrong name, running,
+  branch child (no task type), a payload the allowlist would refuse on read (round-trip `fromTree`
+  first — `toTree` does not check it), and a payload not of the awaited type (`SignalAwaited` records
+  `payloadType`; `ExecutionState.awaitingSignalType()`). A recorded signal is substituted into every
+  resume, so a bad one is terminal on an append-only log. `signal(id, name, payload, opts)` for tasks
+  that read vars.
+
 - **In-doubt model completions** — `ReplayingContextInDoubtCompletionTest`: a `CompletionRequested`
   with no `CompletionReceived` is a provider call that may have been accepted and *billed*, so it
   routes through `InDoubtPolicy` exactly as a dangling `ToolRequested` does (it previously just
