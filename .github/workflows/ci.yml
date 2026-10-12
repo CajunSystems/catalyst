@@ -414,6 +414,10 @@ jobs:
             || { echo "FAIL: the report referenced something external"; exit 1; }
           echo "$OUT" | grep -q "deterministic for a given log: true" \
             || { echo "FAIL: the report is not a pure fold of the log"; exit 1; }
+          echo "$OUT" | grep -q "\[timeline\] latency bars drawn: " \
+            || { echo "FAIL: no latency bars reported (the demo itself asserts one per step)"; exit 1; }
+          echo "$OUT" | grep -q "\[timeline\] branch comparison written: .*(changed steps: 1)" \
+            || { echo "FAIL: the branch comparison did not isolate the post-branch step"; exit 1; }
           echo "$OUT" | grep -q "\[timeline\] timeline criterion holds" \
             || { echo "FAIL: timeline demo did not pass its assertions"; exit 1; }
           echo "v0.2 Timeline exit criterion holds: folded execution rendered to a portable HTML report."

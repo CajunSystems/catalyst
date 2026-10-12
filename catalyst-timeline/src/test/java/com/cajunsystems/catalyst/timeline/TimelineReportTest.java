@@ -202,4 +202,110 @@ class TimelineReportTest {
             }
         }
     }
+
+    // ── Latency waterfall ────────────────────────────────────────────────────
+
+    private static final java.time.Instant T0 = java.time.Instant.parse("2026-01-01T00:00:00Z");
+
+    private static com.cajunsystems.catalyst.engine.TimelineStep step(
+            com.cajunsystems.catalyst.engine.TimelineStep.Kind kind, long atMillis, long latency) {
+        return new com.cajunsystems.catalyst.engine.TimelineStep(0, kind, "x", T0.plusMillis(atMillis), latency, null);
+    }
+
+    /**
+     * Geometry, pinned: a MODEL step is stamped when its completion arrived, so its bar ends there; a
+     * TOOL step is stamped at its request, so its bar starts there. Over a 1000 ms span, a model call
+     * finishing at 600 ms after 400 ms of latency spans 20–60%.
+     */
+    @Test
+    void latencyBarsArePlacedOnTheExecutionsTimeAxis() {
+        assertThat(TimelineReport.bar(T0, 1000, step(com.cajunsystems.catalyst.engine.TimelineStep.Kind.MODEL, 600, 400)))
+                .contains("left:20.00%;width:40.00%").contains("class=\"model\"").contains("title=\"400 ms\"");
+        assertThat(TimelineReport.bar(T0, 1000, step(com.cajunsystems.catalyst.engine.TimelineStep.Kind.TOOL, 100, 200)))
+                .contains("left:10.00%;width:20.00%").contains("class=\"tool\"");
+        assertThat(TimelineReport.bar(T0, 1000, step(com.cajunsystems.catalyst.engine.TimelineStep.Kind.EFFECT, 500, 0)))
+                .as("an instant step is a tick").contains("class=\"tick effect\"").contains("left:50.00%");
+        assertThat(TimelineReport.bar(T0, 1000, step(com.cajunsystems.catalyst.engine.TimelineStep.Kind.MODEL, 100, 400)))
+                .as("a call that began before the execution's start is clamped to it").contains("left:0.00%");
+        assertThat(TimelineReport.bar(T0, 1000, step(com.cajunsystems.catalyst.engine.TimelineStep.Kind.TOOL, 900, 500)))
+                .as("never past the end of the axis").contains("left:90.00%;width:10.00%");
+    }
+
+    @Test
+    void everyStepOfARealExecutionGetsABar() {
+        try (CatalystRuntime runtime = CatalystRuntime.builder()
+                .log(EventLogs.inMemory()).model(MockModel.alwaysReturn("hello")).build()) {
+            Tool<In, String> echo = new EchoTool("echo");
+            ExecutionState state = runAndInspect(runtime, ctx -> {
+                ctx.model().complete(CompletionRequest.of(Prompt.builder().user("hi").build()));
+                return ctx.call(echo, new In("x"));
+            });
+            String html = TimelineReport.html(state);
+            assertThat(html).contains("<th class=\"wfcol\">waterfall</th>");
+            assertThat(countOf(html, "<div class=\"wf\"")).isEqualTo(state.timeline().size());
+            assertThat(html).doesNotContain("<script").doesNotContain("http://").doesNotContain("https://");
+        }
+    }
+
+    private static int countOf(String haystack, String needle) {
+        int n = 0;
+        for (int i = haystack.indexOf(needle); i >= 0; i = haystack.indexOf(needle, i + 1)) n++;
+        return n;
+    }
+
+    // ── Branch comparison ────────────────────────────────────────────────────
+
+    @Test
+    void aBranchComparisonShowsWhatChangedWithBothPayloadsEscaped() {
+        try (CatalystRuntime runtime = CatalystRuntime.builder()
+                .log(EventLogs.inMemory()).model(MockModel.alwaysReturn("<b>original</b>")).build()) {
+            Tool<In, String> echo = new EchoTool("echo");
+            Task<String> task = ctx -> {
+                ctx.call(echo, new In("lookup"));
+                return ctx.model().complete(CompletionRequest.of(Prompt.builder().user("hi").build())).message();
+            };
+            var handle = runtime.execute(task, ExecutionOptions.none());
+            handle.result();
+            com.cajunsystems.catalyst.engine.Trajectory base =
+                    com.cajunsystems.catalyst.engine.Trajectory.of(runtime.inspect(handle.id()));
+            long beforeModel = runtime.log().read(handle.id()).stream()
+                    .filter(e -> e.event() instanceof com.cajunsystems.catalyst.events.CatalystEvent.PromptBuilt)
+                    .findFirst().orElseThrow().seq() - 1;
+            com.cajunsystems.catalyst.engine.Trajectory fork = runtime.branch(handle.id(), beforeModel)
+                    .withModel(MockModel.alwaysReturn("<i>forked</i>")).run(task);
+
+            String html = TimelineReport.diffHtml(base, fork);
+
+            assertThat(html).startsWith("<!doctype html>").contains(base.id().value()).contains(fork.id().value());
+            assertThat(html).contains("<dt>Steps changed</dt><dd>1</dd>");
+            assertThat(html).contains("<span class=\"mark changed\">CHANGED</span>")
+                    .contains("<span class=\"mark same\">SAME</span>");
+            assertThat(html).contains("&lt;b&gt;original&lt;/b&gt;").contains("&lt;i&gt;forked&lt;/i&gt;")
+                    .doesNotContain("<b>original</b>").doesNotContain("<i>forked</i>");
+            assertThat(html).doesNotContain("<script").doesNotContain("http://").doesNotContain("https://");
+            assertThat(TimelineReport.diffHtml(base, fork)).as("deterministic").isEqualTo(html);
+            // The changed row previews what each side said, not just the shared "stop" label.
+            assertThat(html).contains("<div class=\"preview\">&lt;b&gt;original&lt;/b&gt;</div>")
+                    .contains("<div class=\"preview\">&lt;i&gt;forked&lt;/i&gt;</div>");
+            assertThat(html.split("class=\"preview\"", -1).length - 1).as("only differing rows preview").isEqualTo(2);
+        }
+    }
+
+    @Test
+    void writesTheComparisonToAFileAndRejectsMissingSides(@TempDir Path dir) throws Exception {
+        var t = com.cajunsystems.catalyst.engine.Trajectory.of(com.cajunsystems.catalyst.ExecutionId.random(),
+                com.cajunsystems.catalyst.Status.COMPLETED, java.util.List.of(), null);
+        Path file = TimelineReport.writeDiffTo(t, t, dir.resolve("nested/diff.html"));
+        assertThat(Files.readString(file)).contains("Neither run recorded a work step");
+        assertThatThrownBy(() -> TimelineReport.diffHtml(null, t)).isInstanceOf(IllegalArgumentException.class);
+    }
+
+    @Test
+    void aPreviewIsOneClippedLineOfTheReadablePart() {
+        var json = new com.fasterxml.jackson.databind.ObjectMapper();
+        assertThat(TimelineReport.preview(json.createObjectNode().put("message", "two\n  lines"))).isEqualTo("two lines");
+        assertThat(TimelineReport.preview(json.createObjectNode().put("type", "java.lang.String").put("value", "v"))).isEqualTo("v");
+        assertThat(TimelineReport.preview(json.createObjectNode().put("message", "x".repeat(400)))).hasSize(161).endsWith("…");
+        assertThat(TimelineReport.preview(null)).isEmpty();
+    }
 }

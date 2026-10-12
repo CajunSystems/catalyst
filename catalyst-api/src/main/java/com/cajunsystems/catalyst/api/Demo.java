@@ -1052,6 +1052,26 @@ public final class Demo {
             if (!html.contains(handle.id().value())) {
                 throw new AssertionError("report does not identify the execution");
             }
+            int bars = html.split("<div class=\"wf\"", -1).length - 1;
+            System.out.println("[timeline] latency bars drawn: " + bars + " of " + state.timeline().size() + " steps");
+            if (bars != state.timeline().size()) throw new AssertionError("a step is missing its latency bar");
+
+            // The branch comparison: fork before the second model call with a different model, and
+            // render the two trajectories side by side. Only the step that ran differently changes.
+            long secondPrompt = runtime.log().read(handle.id()).stream()
+                    .filter(e -> e.event() instanceof CatalystEvent.PromptBuilt)
+                    .skip(1).findFirst().orElseThrow().seq();
+            com.cajunsystems.catalyst.engine.Trajectory base = com.cajunsystems.catalyst.engine.Trajectory.of(state);
+            com.cajunsystems.catalyst.engine.Trajectory fork = runtime.branch(handle.id(), secondPrompt - 1)
+                    .withModel(answerModel("REVISED")).run(mixed);
+            Path comparison = TimelineReport.writeDiffTo(base, fork, dir.resolve("branch-diff.html"));
+            long changed = com.cajunsystems.catalyst.engine.Trajectory.diff(base, fork).changedCount();
+            System.out.println("[timeline] branch comparison written: " + comparison + " (changed steps: " + changed + ")");
+            String diffHtml = Files.readString(comparison);
+            if (diffHtml.contains("<script") || diffHtml.contains("http://") || diffHtml.contains("https://")) {
+                throw new AssertionError("comparison referenced something external");
+            }
+            if (changed != 1) throw new AssertionError("expected only the post-branch model step to change, got " + changed);
             System.out.println("[timeline] timeline criterion holds: the folded execution rendered to a"
                     + " self-contained, deterministic HTML report.");
         }
