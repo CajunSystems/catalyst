@@ -382,6 +382,59 @@ class ShutdownTest {
         assertThat(state.error()).contains("provider 503").doesNotContain("InDoubt");
     }
 
+    /**
+     * The other ordering: shutdown's abandon signal is raised first and swallowed by the task's
+     * fallback, and the cancel arrives while that fallback runs. Whether the task then returns
+     * normally or rethrows, the cancel must win — not be undone by the next start (return path), and
+     * not be recorded as FAILED with the abandon message (throw path).
+     */
+    @Test
+    void aCancelAfterASwallowedAbandonSignalStillWinsWhenTheTaskReturns() throws Exception {
+        assertCancelAfterSwallowedAbandonWins(false);
+    }
+
+    @Test
+    void aCancelAfterASwallowedAbandonSignalStillWinsWhenTheTaskRethrows() throws Exception {
+        assertCancelAfterSwallowedAbandonWins(true);
+    }
+
+    private void assertCancelAfterSwallowedAbandonWins(boolean rethrow) throws Exception {
+        InMemoryEventLog log = new InMemoryEventLog();
+        AtomicReference<CatalystRuntime> current = new AtomicReference<>();
+        CountDownLatch inStep1 = new CountDownLatch(1);
+        CountDownLatch swallowed = new CountDownLatch(1);
+        java.util.concurrent.atomic.AtomicBoolean cancelled = new java.util.concurrent.atomic.AtomicBoolean();
+        MockModel model = model(() -> {
+            inStep1.countDown();
+            while (!current.get().isShuttingDown()) Thread.onSpinWait();
+        });
+        Task<String> fallback = ctx -> {
+            String summary = ctx.model().complete(STEP1).message();
+            try {
+                return summary + "|" + ctx.model().complete(STEP2).message(); // raises abandon here
+            } catch (RuntimeException e) {
+                swallowed.countDown();
+                while (!cancelled.get()) Thread.onSpinWait(); // the cancel lands during the fallback
+                if (rethrow) throw e;
+                return summary + "|fallback";
+            }
+        };
+        CatalystRuntime runtime = CatalystRuntime.builder().log(log).model(model).build();
+        current.set(runtime);
+        ExecutionHandle<String> handle = runtime.execute(fallback);
+        assertThat(inStep1.await(5, TimeUnit.SECONDS)).isTrue();
+
+        Thread closer = Thread.ofVirtual().start(runtime::close);
+        assertThat(swallowed.await(5, TimeUnit.SECONDS)).isTrue();
+        runtime.cancel(handle.id());
+        cancelled.set(true);
+        closer.join(10_000);
+
+        assertThatThrownBy(handle::result).isInstanceOf(java.util.concurrent.CancellationException.class);
+        assertThat(fold(log, handle.id()).status()).isEqualTo(Status.CANCELLED);
+        assertThat(log.openExecutions()).doesNotContain(handle.id());
+    }
+
     /** Fails its effect on the first attempt only. */
     static final class FlakyTask implements Task<String> {
         private final AtomicInteger attempts;

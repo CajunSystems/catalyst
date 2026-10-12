@@ -247,9 +247,11 @@ checkout's pom to `com.github.CajunSystems` before installing.
   attempts scheduled concurrently with shutdown. `ReplayingContext.requireAppendable` raises
   `ExecutionAbandonedSignal` (after the cancel check — cancel wins) **before** a boundary records
   anything; `runAttempt` handles it in its own branch before the retry decision and appends
-  **nothing**, so the execution stays `RUNNING` and Deploy-2 recovery resumes it. **Only what the
-  abandon signal unwound is abandoned** (`t instanceof ExecutionAbandonedSignal || ctx.raisedAbandon()`,
-  and no cancel pending). A *genuine* failure during the drain goes through the normal retry/fail
+  **nothing**, so the execution stays `RUNNING` and Deploy-2 recovery resumes it. **One stop rule** at both
+  exits of an attempt: stopped by a signal (raised, or unwound by one) with a cancel pending →
+  `CANCELLED`, whichever signal stopped it and in whatever order (a cancel arriving while a task runs
+  the fallback for a swallowed abandon must not be undone by recovery); else stopped by abandon →
+  abandon. A *genuine* failure during the drain goes through the normal retry/fail
   decision — essential for model calls: `CompletionRequested` is appended before the provider call,
   so an abandoned provider failure would leave it dangling → in-doubt on restart → terminal under
   `InDoubtPolicy.FAIL`. A retryable one writes `RetryRequested`, then abandons instead of sleeping. A

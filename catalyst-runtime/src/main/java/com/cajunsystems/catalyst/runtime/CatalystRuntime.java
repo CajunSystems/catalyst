@@ -767,7 +767,9 @@ public final class CatalystRuntime implements AutoCloseable {
                     // and the boundary that raised it was never recorded. Honour the stop instead. A
                     // task that genuinely finishes without reaching another boundary raised nothing,
                     // and still records its completion.
-                    if (ctx.raisedCancellation()) {
+                    // The same stop rule as the failure path below: a stopped attempt with a cancel
+                    // pending is a cancel, whichever signal stopped it and in whatever order they came.
+                    if (ctx.raisedCancellation() || (ctx.raisedAbandon() && runningAttempt.token.isCancelled())) {
                         recordCancelled(id, runningAttempt.token.reason(), future);
                         return;
                     }
@@ -783,36 +785,32 @@ public final class CatalystRuntime implements AutoCloseable {
                     future.completeExceptionally(pause);
                     return;
                 } catch (Throwable t) {
-                    // A cancelled attempt folds to CANCELLED only via the cooperative unwind itself: the
-                    // CancellationSignal the context raises at the next live boundary once the token trips
-                    // (the task acknowledging cancellation). The interrupt() cancel() raises is only a
-                    // best-effort nudge to reach that boundary; it never reclassifies a failure.
-                    // ...or the task swallowed that signal and then failed some other way: still a cancel.
-                    if (t instanceof CancellationSignal || ctx.raisedCancellation()) {
+                    // The stop rule — one decision for every ordering of cancel and shutdown:
+                    //   1. stopped by a signal (raised here, or unwound by one) with a cancel pending
+                    //      → record CANCELLED. Cancel wins, whichever signal actually stopped the task:
+                    //      a cancel that arrives after the abandon signal (the task swallowed it and was
+                    //      still running its fallback) must not be undone by the next start's recovery.
+                    //   2. otherwise stopped by the abandon signal → abandon: append nothing. That signal
+                    //      is raised before a boundary records anything, so no request is left in doubt.
+                    //   3. otherwise → the normal retry/fail decision below.
+                    // "Stopped" is checked, not merely "token tripped". A cancel's interrupt that
+                    // surfaces as an ordinary exception inside a boundary stopped nothing cooperatively;
+                    // it gets the handling it always had (an interrupt never reclassifies a failure),
+                    // which is terminal, so recovery cannot resume it either. And a GENUINE failure
+                    // during the drain also falls to (3) — essential for model calls: the boundary
+                    // records CompletionRequested before calling the provider, and only the
+                    // RetryRequested or ExecutionFailed written below closes that request as a verdict.
+                    // Abandoned instead, the restart would see it in doubt and, under
+                    // InDoubtPolicy.FAIL, fail terminally over a known, unbilled failure. A retryable
+                    // one writes its RetryRequested and is then abandoned instead of sleeping (the
+                    // backoff wakes on shutdown), so the retry runs on the next start.
+                    boolean stoppedByCancel = t instanceof CancellationSignal || ctx.raisedCancellation();
+                    boolean stoppedByAbandon = t instanceof ExecutionAbandonedSignal || ctx.raisedAbandon();
+                    if (stoppedByCancel || (stoppedByAbandon && runningAttempt.token.isCancelled())) {
                         recordCancelled(id, runningAttempt.token.reason(), future);
                         return;
                     }
-                    // Shutdown, in its own branch BEFORE the retry decision — but only for what the
-                    // abandon signal itself unwound (directly, or swallowed and then failed another way).
-                    // That signal is raised before a boundary records anything, so abandoning it
-                    // appends nothing and leaves no request in doubt.
-                    //
-                    // A GENUINE failure during the drain is not abandoned: it falls through to the normal
-                    // retry/fail decision below. Abandoning it would be wrong for a model call in
-                    // particular — the boundary records CompletionRequested before calling the provider,
-                    // and a provider failure records nothing after it, so only the RetryRequested (or
-                    // ExecutionFailed) written below closes that request as a verdict. Left dangling, the
-                    // restart would see an in-doubt completion and, under InDoubtPolicy.FAIL, fail the
-                    // execution terminally over a failure that was known and not billed. A retryable
-                    // failure still writes its RetryRequested and is then abandoned instead of sleeping
-                    // (the backoff wakes on shutdown), so the next start runs the retry. A worker whose
-                    // writes fail because the log closed under it records nothing either way.
-                    //
-                    // Not if a cancel is pending, though: cancel() interrupts, and an interrupt that
-                    // surfaces as an ordinary exception inside a boundary matches neither cancel check.
-                    // Falling through gives it exactly the handling it gets outside a shutdown.
-                    boolean unwoundByAbandon = t instanceof ExecutionAbandonedSignal || ctx.raisedAbandon();
-                    if (unwoundByAbandon && runningAttempt.token.isAbandoned() && !runningAttempt.token.isCancelled()) {
+                    if (stoppedByAbandon) {
                         abandon(id, future);
                         return;
                     }
