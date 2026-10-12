@@ -248,22 +248,32 @@ public final class CatalystRuntime implements AutoCloseable {
                 if (live != null) {
                     return new FutureExecutionHandle<>(id, CatalystRuntime.<R>cast(live));
                 }
-                // Decided under the lease (distributed): another node may be creating or running it.
-                return underLease(id, () -> {
-                    ExecutionState state = foldState(id);
-                    // Registered but never created: this call's own claim, or a winner that has not
-                    // created it yet or died before it could. Whoever holds the lease creates it, and
-                    // the create is fenced at seq 0, so it happens once.
-                    if (state.lastSeq() < 0) {
+                ExecutionState state = foldState(id);
+                // Registered but never created: this call's own claim, or a winner that has not created
+                // it yet or died before it could. Whoever holds the lease creates it, and the create is
+                // fenced at seq 0, so it happens once. Decided again under the lease, since the winner
+                // may create it in between.
+                if (state.lastSeq() < 0) {
+                    return underLease(id, () -> {
+                        ExecutionState now = foldState(id);
+                        if (now.lastSeq() >= 0) return attachOrResume(task, id, taskType, opts, now);
                         createExecution(id, taskType, key.get(), opts);
                         return scheduleAttempt(task, id, taskType, opts, Mode.FRESH);
-                    }
-                    if (state.status() == Status.WAITING) return waitingHandle(id, state);
-                    Mode mode = state.isTerminal() ? Mode.REPLAY_TERMINAL : Mode.RESUME;
-                    return scheduleAttempt(task, id, taskType, opts, mode);
-                });
+                    });
+                }
+                // No lease for this decision: a terminal or waiting execution writes nothing, and a
+                // resume claims the lease in scheduleAttempt and decides again under it.
+                return attachOrResume(task, id, taskType, opts, state);
             });
         });
+    }
+
+    /** A keyed submission of an existing execution: its waiting handle, its recorded outcome, or a resume. */
+    private <R> ExecutionHandle<R> attachOrResume(Task<R> task, ExecutionId id, String taskType,
+                                                  ExecutionOptions opts, ExecutionState state) {
+        if (state.status() == Status.WAITING) return waitingHandle(id, state);
+        Mode mode = state.isTerminal() ? Mode.REPLAY_TERMINAL : Mode.RESUME;
+        return scheduleAttempt(task, id, taskType, opts, mode);
     }
 
     /**
@@ -1080,8 +1090,14 @@ public final class CatalystRuntime implements AutoCloseable {
             for (int i = 0; ; i++) {
                 if (leases != null && leases.requestCancel(id, "cancelled by request")) return;
                 try {
-                    underLease(id, () -> StreamCursor.after(log, id, state.lastSeq())
-                            .append(new CatalystEvent.ExecutionCancelled(now(), "cancelled by request", state.lastSeq())));
+                    // Re-folded under the lease: the fold above predates the claim, and another node
+                    // may have finished the execution and released in between. Then this is a no-op.
+                    underLease(id, () -> {
+                        ExecutionState now = foldState(id);
+                        if (now.isTerminal()) return null;
+                        return StreamCursor.after(log, id, now.lastSeq())
+                                .append(new CatalystEvent.ExecutionCancelled(now(), "cancelled by request", now.lastSeq()));
+                    });
                     return;
                 } catch (LeaseHeldException raced) {
                     if (i >= 2) throw raced;
@@ -1791,6 +1807,22 @@ public final class CatalystRuntime implements AutoCloseable {
         }
 
         /**
+         * How often a {@linkplain #distributed() distributed} runtime's claim loop scans the shared
+         * index for work no live node holds (default 10s). The loop is what makes "start another
+         * instance and it participates" true: a crashed node's executions are taken over within about
+         * the lease duration plus one interval. Each tick folds every open execution, snapshot-warm,
+         * and claims only those a crash could have left. Refused on a runtime that is not distributed.
+         */
+        public Builder claimInterval(Duration interval) {
+            if (interval == null || interval.toMillis() < 1) {
+                throw new IllegalArgumentException("claimInterval must be at least 1ms");
+            }
+            this.claimInterval = interval;
+            this.claimIntervalSet = true;
+            return this;
+        }
+
+        /**
          * A {@linkplain #distributed() distributed} runtime's lease timing (defaults 30s and 10s).
          * {@code duration} is how long a claim lasts unrenewed: after a node dies, its executions wait
          * this long before another node may take them. {@code heartbeat} is how often a node renews
@@ -1807,22 +1839,6 @@ public final class CatalystRuntime implements AutoCloseable {
          * lease lapses. Clock skew between nodes eats into the margin. Refused on a runtime that is
          * not distributed.
          */
-        /**
-         * How often a {@linkplain #distributed() distributed} runtime's claim loop scans the shared
-         * index for work no live node holds (default 10s). The loop is what makes "start another
-         * instance and it participates" true: a crashed node's executions are taken over within about
-         * the lease duration plus one interval. Each tick folds every open execution, snapshot-warm,
-         * and claims only those a crash could have left. Refused on a runtime that is not distributed.
-         */
-        public Builder claimInterval(Duration interval) {
-            if (interval == null || interval.toMillis() < 1) {
-                throw new IllegalArgumentException("claimInterval must be at least 1ms");
-            }
-            this.claimInterval = interval;
-            this.claimIntervalSet = true;
-            return this;
-        }
-
         public Builder lease(Duration duration, Duration heartbeat) {
             if (duration == null || heartbeat == null || heartbeat.toMillis() < 1) {
                 // The heartbeat is scheduled in whole milliseconds; anything shorter would become a

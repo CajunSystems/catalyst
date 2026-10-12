@@ -257,6 +257,25 @@ class CrossNodeTest {
         }
     }
 
+    /**
+     * Cancelling an execution another node finishes just before the claim lands is a no-op, as for
+     * any finished execution. It was refused as a stale writer, fenced on the fold read before the claim.
+     */
+    @Test
+    void cancellingAnExecutionThatFinishesDuringTheClaimIsANoOp() {
+        ExecutionId id = crashInterrupted();
+        log.beforeReadLease = leased -> {
+            log.beforeReadLease = x -> { };
+            log.append(leased, new CatalystEvent.ExecutionCompleted(T,
+                    new com.cajunsystems.catalyst.engine.PayloadCodec().toTree("done elsewhere")), 2);
+        };
+        try (CatalystRuntime nodeB = node("node-b", MockModel.alwaysReturn("B"))) {
+            nodeB.cancel(id);
+            assertThat(nodeB.inspect(id).status()).isEqualTo(Status.COMPLETED);
+            assertThat(log.read(id)).hasSize(3);
+        }
+    }
+
     /** No node is running it: the cancel is recorded directly, under the lease, as on one node. */
     @Test
     void cancellingAnExecutionNoNodeIsRunningRecordsItDirectly() {
@@ -300,6 +319,25 @@ class CrossNodeTest {
             assertThat(fromA[0].result()).isEqualTo("A|A");
         } finally {
             open.countDown();
+        }
+    }
+
+    /**
+     * Re-submitting a finished execution's key returns its recorded result without a lease, as in
+     * Dist-3, even while a stale lease row lingers from a release that failed.
+     */
+    @Test
+    void reSubmittingAFinishedKeyNeedsNoLease() {
+        try (CatalystRuntime nodeA = node("node-a", MockModel.alwaysReturn("A"));
+             CatalystRuntime nodeB = node("node-b", MockModel.alwaysReturn("B"))) {
+            ExecutionHandle<String> done = nodeA.execute(new GatedTask(), ExecutionOptions.withKey("order-9"));
+            assertThat(done.result()).isEqualTo("A|A");
+            assertThat(log.compareAndSetLease(done.id(), null,
+                    new Lease("node-x", clock.instant().plus(Duration.ofSeconds(30)).toEpochMilli()))).isTrue();
+            int writes = log.leaseWrites(done.id());
+
+            assertThat(nodeB.execute(new GatedTask(), ExecutionOptions.withKey("order-9")).result()).isEqualTo("A|A");
+            assertThat(log.leaseWrites(done.id())).as("no lease taken").isEqualTo(writes);
         }
     }
 
