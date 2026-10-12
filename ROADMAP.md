@@ -359,7 +359,9 @@ The original phasing rationale is in `docs/distribution.md`; **this list is the 
     holder is this node's own id counts as this node's, so a node restarted under its id needn't wait
     out its predecessor (node ids must be unique among live nodes).
   - **Clocks:** expiry is wall-clock from the writer's runtime `Clock`. Skew moves takeovers early or
-    late, never corrupts (`FoundationDBAcceptanceTest` uses a skewed node to show the fence catching
+    late, never corrupts — but an early takeover leaves the old holder's in-flight call in doubt,
+    terminal under the default `InDoubtPolicy.FAIL`, so lease duration is set well above pauses
+    (`FoundationDBAcceptanceTest` uses a skewed node to show the fence catching
     exactly that).
   - **Left to Dist-4:** the signal side ("re-enqueues it"). A signal on any node already resumes the
     execution, but nothing watches the queue yet.

@@ -216,7 +216,9 @@ Most of it exists:
   an execution and renews it while running. It refuses executions another node is running
   (`LeaseHeldException`), and its startup recovery takes over only what dead nodes left.
 - **Lease timing:** `lease(duration, heartbeat)`, defaults 30s and 10s. A dead node's work waits
-  out the lease duration.
+  out the lease duration. Don't set it short to speed up failover: a live node that pauses past its
+  lease loses the execution, and the call it had in flight is found in doubt by the node that takes
+  over. Under the default `InDoubtPolicy.FAIL`, that fails the execution.
 
 What is missing is the claim loop (Dist-4). Today a dead node's work is picked up only when some
 node runs `recoverAll()` or restarts with `recoverOnStart`, and cancel/pause of an execution running

@@ -16,8 +16,10 @@ import java.util.Objects;
  * compare-and-set on its exact previous value, so lease operations cannot race each other either.
  *
  * <p>{@code expiresAtMillis} is wall-clock time from the writing node's clock. Clock skew between
- * nodes can only make a takeover early or late, which costs duplicate or delayed work, never a
- * corrupt stream.
+ * nodes can make a takeover early or late. Neither corrupts the stream. An early takeover is not
+ * free, though: a call the old holder had in flight is found in doubt by the new holder and handled
+ * by its {@code InDoubtPolicy}, which under the default {@code FAIL} ends the execution as
+ * {@code FAILED}.
  *
  * @param holder          the node id of the runtime that holds it
  * @param expiresAtMillis epoch millis after which another node may take it over

@@ -1624,10 +1624,15 @@ public final class CatalystRuntime implements AutoCloseable {
          * the leases it holds.
          *
          * <p>Too short a duration lets a GC pause or a slow renewal hand a live node's work to
-         * another node. The fence keeps that from corrupting anything, but the work is wasted, and
-         * the paused node's in-flight call is re-issued. Too long delays failover. Keep the heartbeat
-         * at a third of the duration or less, so a renewal can fail twice before the lease lapses.
-         * Clock skew between nodes eats into the margin. Refused on a runtime that is not distributed.
+         * another node. The fence keeps the stream from being corrupted, but the takeover is not
+         * free. The paused node's in-flight model or tool call is left recorded as requested and
+         * never completed, so the new holder finds it <em>in doubt</em> and applies the
+         * {@code InDoubtPolicy}. Under the default {@code FAIL} that ends the execution as
+         * {@code FAILED}; under {@code RETRY} the call is re-issued (and may be billed twice). Set the
+         * duration well above your longest pause and slowest renewal. Too long delays failover. Keep
+         * the heartbeat at a third of the duration or less, so a renewal can fail twice before the
+         * lease lapses. Clock skew between nodes eats into the margin. Refused on a runtime that is
+         * not distributed.
          */
         public Builder lease(Duration duration, Duration heartbeat) {
             if (duration == null || heartbeat == null || heartbeat.isNegative() || heartbeat.isZero()) {
