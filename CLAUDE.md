@@ -413,11 +413,13 @@ checkout's pom to `com.github.CajunSystems` before installing.
   - **Cancel on the lease row:** `Lease.cancelRequest` uses format `lease1c`, with the reason in
     base64.
     - `LeaseKeeper.requestCancel` adds it by CAS.
-    - `renewAll` absorbs "my row + a request" and keeps the lease. The request counts as honoured
-      (`cancelFired`) **only if a live attempt took it**. `onCancel` is a predicate that returns false
-      once the attempt's future is done. Registering it fires any request already absorbed. A request
-      absorbed during a pause, before registration, or after the attempt parked therefore stays for
-      the next holder rather than being deleted by the release.
+    - `renewAll` absorbs "my row + a request", keeps the lease, and hands the request to the
+      attempt's `onCancel`. It is a predicate, false once the attempt's future is done, and registering
+      it fires any request already absorbed. `cancelFired` only stops a second hand-off.
+    - **Whether a request was honoured is read from the log, never tracked in memory.** `release`
+      keeps the request on a lapsed row unless the execution is terminal. Three review rounds found
+      in-memory "honoured" flags losing requests: set on read, set when no attempt was registered,
+      and set when a trip landed after the attempt decided to park or abandon.
     - `acquire` carries a request over on takeover; `pendingCancel` only peeks at it (marking on read
       lost a request the scan read and then left alone). `scheduleAttempt` honours a carried request
       before running, and `scan`'s `honourOrphanedCancel` honours one on a lapsed parked execution.

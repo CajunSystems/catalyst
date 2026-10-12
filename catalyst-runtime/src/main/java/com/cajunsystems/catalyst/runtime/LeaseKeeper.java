@@ -50,7 +50,11 @@ final class LeaseKeeper implements AutoCloseable {
          * honoured.
          */
         java.util.function.Predicate<String> onCancel;
-        /** Whether the request on {@link #lease} has been honoured; only then may a release drop it. */
+        /**
+         * Whether the request on {@link #lease} was handed to an attempt, so it is not handed over
+         * twice. Not whether it was honoured: an attempt can be tripped and still park or abandon
+         * without recording the cancel. Only the log says it was honoured, by a terminal execution.
+         */
         boolean cancelFired;
 
         Held(Lease lease) {
@@ -210,13 +214,14 @@ final class LeaseKeeper implements AutoCloseable {
     }
 
     /**
-     * Releases from {@code row}: deletes it, unless it carries a cancel request this process never
-     * honoured on an execution that is not finished. Whether the request came over with a takeover or
-     * was added since, it is kept on a lapsed row so the next claimer honours it. Returns whether the
-     * swap happened.
+     * Releases from {@code row}: deletes it, unless it carries a cancel request on an execution that is
+     * not finished. Such a request is kept on a lapsed row so the next claimer honours it, whether it
+     * came over with a takeover, was added since, or was handed to an attempt that then parked or
+     * abandoned without recording it. The log is the only reliable answer to "was it honoured": a
+     * recorded cancel makes the execution terminal. Returns whether the swap happened.
      */
     private boolean releaseFrom(ExecutionId id, Held h, Lease row) {
-        boolean keepRequest = row.cancelRequested().isPresent() && !h.cancelFired && !terminal.test(id);
+        boolean keepRequest = row.cancelRequested().isPresent() && !terminal.test(id);
         Lease replacement = keepRequest ? new Lease(nodeId, clock.instant().toEpochMilli(), row.cancelRequest()) : null;
         return log.compareAndSetLease(id, row, replacement);
     }

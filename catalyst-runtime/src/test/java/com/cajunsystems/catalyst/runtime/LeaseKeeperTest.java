@@ -53,10 +53,11 @@ class LeaseKeeperTest {
         assertThat(log.readLease(id)).isEmpty();
     }
 
+    /** Honoured means recorded, which makes the execution terminal: then the row goes. */
     @Test
     void aReleaseAfterHonouringTheCancelDeletesTheRow() {
         ExecutionId id = ExecutionId.random();
-        try (LeaseKeeper keeper = keeper(false)) {
+        try (LeaseKeeper keeper = keeper(true)) {
             keeper.acquire(id);
             requestCancelBehindItsBack(id);
             keeper.onCancel(id, reason -> true);
@@ -126,7 +127,7 @@ class LeaseKeeperTest {
     void anAttemptRegisteringAfterTheRequestWasAbsorbedIsCancelledAtOnce() {
         ExecutionId id = ExecutionId.random();
         String[] cancelled = {null};
-        try (LeaseKeeper keeper = keeper(false)) {
+        try (LeaseKeeper keeper = keeper(true)) {
             keeper.acquire(id);
             requestCancelBehindItsBack(id);
             keeper.renewAll();
@@ -137,7 +138,7 @@ class LeaseKeeperTest {
             assertThat(cancelled[0]).isEqualTo("stop");
             keeper.release(id);
         }
-        assertThat(log.readLease(id)).as("honoured, so released").isEmpty();
+        assertThat(log.readLease(id)).as("honoured (terminal), so released").isEmpty();
     }
 
     /** A finished attempt cannot take a cancel: it is not counted as honoured, and the release keeps it. */
@@ -147,6 +148,24 @@ class LeaseKeeperTest {
         try (LeaseKeeper keeper = keeper(false)) {
             keeper.acquire(id);
             keeper.onCancel(id, reason -> false);
+            requestCancelBehindItsBack(id);
+            keeper.renewAll();
+            keeper.release(id);
+        }
+        assertThat(log.readLease(id).orElseThrow().cancelRequested()).contains("stop");
+    }
+
+    /**
+     * The attempt took the cancel, but the trip landed after it had decided to park or abandon, so
+     * nothing was recorded and the execution is not terminal. The request must stay for the next
+     * holder. Before, "handed to an attempt" counted as honoured and the release deleted it.
+     */
+    @Test
+    void aCancelAnAttemptTookButNeverRecordedIsKept() {
+        ExecutionId id = ExecutionId.random();
+        try (LeaseKeeper keeper = keeper(false)) {
+            keeper.acquire(id);
+            keeper.onCancel(id, reason -> true);
             requestCancelBehindItsBack(id);
             keeper.renewAll();
             keeper.release(id);
