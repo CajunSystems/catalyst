@@ -4,6 +4,7 @@ import com.cajunsystems.catalyst.ExecutionId;
 import com.cajunsystems.catalyst.ExecutionInfo;
 import com.cajunsystems.catalyst.ExecutionOptions;
 import com.cajunsystems.catalyst.ReplayMode;
+import com.cajunsystems.catalyst.Status;
 import com.cajunsystems.catalyst.Task;
 import com.cajunsystems.catalyst.TaskFactory;
 import com.cajunsystems.catalyst.TaskRegistry;
@@ -44,6 +45,7 @@ import java.time.Duration;
 import java.time.Instant;
 import java.util.ArrayList;
 import java.util.HashMap;
+import java.util.LinkedHashMap;
 import java.util.List;
 import java.util.Map;
 import java.util.Optional;
@@ -61,6 +63,8 @@ import java.util.concurrent.Executors;
  */
 public final class CatalystRuntime implements AutoCloseable {
 
+    private static final Logger LOG = LoggerFactory.getLogger(CatalystRuntime.class);
+
     private final EventLog log;
     private final Model defaultModel;
     private final Clock clock;
@@ -74,6 +78,8 @@ public final class CatalystRuntime implements AutoCloseable {
     private final long snapshotInterval;
     private final TaskRegistry registry;
     private final ExecutorService executor;
+    /** Set once by {@code build()} when {@code recoverOnStart} is on, before the runtime is handed out. */
+    private RecoveryReport startupRecovery;
 
     /**
      * Attempts currently running in this process, keyed by execution. Guards against scheduling a
@@ -395,6 +401,83 @@ public final class CatalystRuntime implements AutoCloseable {
 
             return scheduleAttempt(factory.create(), id, taskType, opts, Mode.RESUME);
         });
+    }
+
+    /**
+     * Finds every execution a previous process left unfinished and resumes the ones a crash
+     * interrupted — the startup half of running Catalyst as a deployable node. Reads the log's
+     * execution index ({@link EventLog#openExecutions()}), folds each open execution (snapshot-warm),
+     * and resumes it via {@link #resume(ExecutionId)} only if its status is one a crash leaves behind:
+     * {@code NEW}, {@code STARTING}, {@code RUNNING} or {@code RESUMING}.
+     *
+     * <p>{@code PAUSED} and {@code WAITING} are left alone. Both are recorded on purpose — by
+     * {@link #pause(ExecutionId)}, or by {@code InDoubtPolicy.ASK} holding an execution for a verdict
+     * — and a restart must not undo what an operator or a pending decision is holding. They stay
+     * resumable by id. An execution already running in this process is left alone too, so calling
+     * this on a live runtime never schedules a second attempt.
+     *
+     * <p>Each decision is taken under that execution's lock, as {@code resume} does. Failures are
+     * per execution — an unregistered task type or an unreadable stream is reported in
+     * {@link RecoveryReport#notRecovered()} and the scan moves on.
+     *
+     * <p>Executions resume with no task input vars (vars are not persisted, only their hash), so a
+     * task that branches on {@code ctx.var(...)} should be resumed individually with
+     * {@link #resume(ExecutionId, ExecutionOptions)}. Executions recorded before the log kept an
+     * index are not listed by it, and so are not recovered here.
+     *
+     * @throws IllegalStateException if the log keeps no execution index
+     */
+    public RecoveryReport recoverAll() {
+        if (!log.supportsExecutionIndex()) {
+            throw new IllegalStateException(log.getClass().getSimpleName()
+                    + " keeps no execution index, so open executions cannot be found after a restart");
+        }
+        Map<ExecutionId, ExecutionHandle<?>> resumed = new LinkedHashMap<>();
+        Map<ExecutionId, Status> leftAlone = new LinkedHashMap<>();
+        Map<ExecutionId, String> notRecovered = new LinkedHashMap<>();
+
+        for (ExecutionId id : log.openExecutions()) {
+            try {
+                byExecution.withLock(id, () -> {
+                    if (inFlight.containsKey(id)) {
+                        leftAlone.put(id, Status.RUNNING);
+                        return;
+                    }
+                    ExecutionState state = foldState(id);
+                    if (!isCrashInterrupted(state.status())) {
+                        leftAlone.put(id, state.status());
+                        return;
+                    }
+                    if (registry.lookup(state.taskType()).isEmpty()) {
+                        notRecovered.put(id, "no task registered for type '" + state.taskType() + "'");
+                        return;
+                    }
+                    resumed.put(id, resume(id)); // the lock is reentrant
+                });
+            } catch (RuntimeException e) {
+                notRecovered.put(id, String.valueOf(e));
+            }
+        }
+
+        RecoveryReport report = new RecoveryReport(resumed, leftAlone, notRecovered);
+        LOG.info("Recovery: resumed {}, left alone {}, not recovered {}",
+                resumed.size(), leftAlone.size(), notRecovered.size());
+        notRecovered.forEach((id, reason) -> LOG.warn("Not recovered: {} ({})", id.value(), reason));
+        return report;
+    }
+
+    /** The states a process death leaves an execution in — as opposed to ones recorded deliberately. */
+    private static boolean isCrashInterrupted(Status status) {
+        return status == Status.NEW || status == Status.STARTING
+                || status == Status.RUNNING || status == Status.RESUMING;
+    }
+
+    /**
+     * The report from the recovery scan run by {@code build()} when the runtime was built with
+     * {@link Builder#recoverOnStart(boolean)}; empty otherwise.
+     */
+    public Optional<RecoveryReport> startupRecovery() {
+        return Optional.ofNullable(startupRecovery);
     }
 
     /**
@@ -760,6 +843,7 @@ public final class CatalystRuntime implements AutoCloseable {
         private String nodeId = "node-0";
         private long snapshotInterval = 100;
         private TaskRegistry registry = new TaskRegistry();
+        private boolean recoverOnStart;
 
         public Builder log(EventLog log) {
             this.log = log;
@@ -850,11 +934,38 @@ public final class CatalystRuntime implements AutoCloseable {
             return this;
         }
 
+        /**
+         * Runs {@link CatalystRuntime#recoverAll()} as part of {@code build()}, so a restarted node
+         * resumes the executions its predecessor was running before it accepts new work. Register
+         * every task type first — the scan reconstructs tasks from the registry. The report is
+         * available from {@link CatalystRuntime#startupRecovery()}.
+         *
+         * <p>Requires a log with an execution index; {@code build()} refuses otherwise rather than
+         * start a node that silently recovers nothing.
+         */
+        public Builder recoverOnStart(boolean recoverOnStart) {
+            this.recoverOnStart = recoverOnStart;
+            return this;
+        }
+
         public CatalystRuntime build() {
             if (log == null) {
                 throw new IllegalStateException("An EventLog is required (e.g. EventLogs.inMemory() or GumboEventLog.at(path))");
             }
-            return new CatalystRuntime(this);
+            if (recoverOnStart && !log.supportsExecutionIndex()) {
+                throw new IllegalStateException("recoverOnStart needs a log with an execution index; "
+                        + log.getClass().getSimpleName() + " cannot list its open executions");
+            }
+            CatalystRuntime runtime = new CatalystRuntime(this);
+            if (recoverOnStart) {
+                try {
+                    runtime.startupRecovery = runtime.recoverAll();
+                } catch (RuntimeException e) {
+                    runtime.close();
+                    throw e;
+                }
+            }
+            return runtime;
         }
     }
 }

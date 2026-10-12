@@ -96,6 +96,16 @@ public final class Demo {
             Runtime.getRuntime().halt(137); // abrupt death: no completion event, no graceful close
         } else if (args.length >= 2 && args[1].equals("resume")) {
             resume(Path.of(args[0]));
+        } else if (args.length >= 2 && args[1].equals("crashmany")) {
+            crashMany(Path.of(args[0]));
+            System.out.println("[crash] executions durably recorded mid-flight; simulating kill -9 (exit 137)...");
+            Runtime.getRuntime().halt(137);
+        } else if (args.length >= 2 && args[1].equals("recover")) {
+            recoverDemo(Path.of(args[0]));
+        } else if (args.length >= 1 && args[0].equals("recover")) {
+            Path dir = Files.createTempDirectory("catalyst-recover-");
+            crashMany(dir);
+            recoverDemo(dir);
         } else if (args.length >= 1 && args[0].equals("replay")) {
             replayDemo(Files.createTempDirectory("catalyst-replay-"));
         } else if (args.length >= 1 && args[0].equals("branch")) {
@@ -606,6 +616,98 @@ public final class Demo {
             }
             System.out.println("[resume-id] resume-by-id criterion holds: recovered from the id alone,"
                     + " zero duplicate model calls.");
+        }
+    }
+
+    /**
+     * Deploy-2, phase 1 of the startup-recovery demo: leave a log the way a crashed node would. Three
+     * executions of the named task have step 1 recorded and nothing after it; one more was paused by
+     * an operator first; one finished; one belongs to a task type the next process no longer has.
+     * The caller then dies with {@code halt(137)} — nothing is closed or flushed beyond what each
+     * append already made durable.
+     */
+    private static void crashMany(Path dir) {
+        MockModel model = summarizerModel();
+        try (GumboEventLog log = GumboEventLog.at(dir)) {
+            for (int i = 0; i < 3; i++) recordTwoStepPrefix(log, model, false);
+
+            ExecutionId paused = recordTwoStepPrefix(log, model, false);
+            log.append(paused, new CatalystEvent.ExecutionPaused(Instant.now(), "held by operator"));
+
+            recordTwoStepPrefix(log, model, true);
+
+            ExecutionId retired = ExecutionId.random();
+            log.append(retired, new CatalystEvent.ExecutionCreated(Instant.now(), "com.example.RetiredTask", "h", "cfg", ""));
+            log.append(retired, new CatalystEvent.ExecutionStarted(Instant.now(), 1, "node-0"));
+
+            System.out.println("[crash] recorded 3 in-flight + 1 paused + 1 completed + 1 retired-type executions"
+                    + " (model calls this run: " + model.callCount() + ")");
+        }
+    }
+
+    /** Records {@link TwoStepTask}'s step 1 — and, if {@code complete}, step 2 and the completion. */
+    private static ExecutionId recordTwoStepPrefix(GumboEventLog log, MockModel model, boolean complete) {
+        ExecutionId id = ExecutionId.random();
+        String taskType = TwoStepTask.class.getName();
+        Instant t = Instant.now();
+        log.append(id, new CatalystEvent.ExecutionCreated(t, taskType, "h", "cfg", ""));
+        log.append(id, new CatalystEvent.ExecutionStarted(t, 1, "node-0"));
+        ReplayingContext ctx = new ReplayingContext(id, log, model, new ExecutionInfo(id, 1, taskType, Map.of()),
+                Map.of(), EventJson.shared(), new PayloadCodec(), InDoubtPolicy.FAIL, CostModel.free(),
+                com.cajunsystems.catalyst.ReplayMode.STRICT, null,
+                Clock.systemUTC(), LoggerFactory.getLogger("demo.recover"), log.read(id), true);
+        String summary = ctx.model().complete(STEP1).message();
+        if (complete) {
+            String result = summary + "|" + ctx.model().complete(STEP2).message();
+            log.append(id, new CatalystEvent.ExecutionCompleted(Instant.now(), new PayloadCodec().toTree(result)));
+        }
+        return id;
+    }
+
+    /**
+     * Deploy-2, phase 2: a fresh process opens the crashed node's log with {@code recoverOnStart} and
+     * no ids in hand. The three in-flight executions finish with zero duplicate model calls (each
+     * step 1 is substituted; only step 2 runs live), the paused one stays paused, the finished one is
+     * not touched, and the retired task type is reported rather than failing startup.
+     */
+    private static void recoverDemo(Path dir) {
+        MockModel model = summarizerModel();
+        try (CatalystRuntime runtime = Catalyst.builder()
+                .log(GumboEventLog.at(dir))
+                .model(model)
+                .task(new TwoStepTask())
+                .recoverOnStart(true)
+                .build()) {
+
+            var report = runtime.startupRecovery().orElseThrow();
+            for (var entry : report.resumed().entrySet()) {
+                Object result = entry.getValue().result();
+                System.out.println("[recover] resumed " + entry.getKey().value() + " -> "
+                        + runtime.inspect(entry.getKey()).status() + " result: " + result);
+                if (!"SUMMARY|FINAL".equals(result)) throw new AssertionError("unexpected result " + result);
+            }
+            report.leftAlone().forEach((id, status) -> System.out.println("[recover] left alone "
+                    + id.value() + " (" + status + ") -> still " + runtime.inspect(id).status()));
+            report.notRecovered().forEach((id, reason) ->
+                    System.out.println("[recover] not recovered " + id.value() + ": " + reason));
+
+            System.out.println("[recover] resumed: " + report.resumed().size()
+                    + ", left alone: " + report.leftAlone().size()
+                    + ", not recovered: " + report.notRecovered().size());
+            System.out.println("[recover] model calls THIS run: " + model.callCount()
+                    + " (every step 1 was substituted from the log; only the step 2s ran live)");
+
+            if (report.resumed().size() != 3) throw new AssertionError("expected 3 resumed, got " + report);
+            if (model.callCount() != 3) throw new AssertionError("expected 3 model calls, got " + model.callCount());
+            if (!java.util.List.copyOf(report.leftAlone().values()).equals(java.util.List.of(Status.PAUSED))) {
+                throw new AssertionError("expected exactly one PAUSED left alone, got " + report.leftAlone());
+            }
+            for (ExecutionId id : report.leftAlone().keySet()) {
+                if (runtime.inspect(id).status() != Status.PAUSED) throw new AssertionError("recovery un-paused " + id);
+            }
+            if (report.notRecovered().size() != 1) throw new AssertionError("expected 1 not recovered, got " + report);
+            System.out.println("[recover] startup-recovery criterion holds: in-flight work finished with zero"
+                    + " duplicate model calls; the paused execution stayed paused.");
         }
     }
 

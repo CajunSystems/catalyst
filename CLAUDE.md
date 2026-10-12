@@ -211,6 +211,18 @@ checkout's pom to `com.github.CajunSystems` before installing.
   same set — a lost/stale one costs a read, never a wrong answer. Executions recorded before the
   index existed are not in it.
 
+- **Startup recovery (Deploy-2)** — `RecoveryTest` (runtime) + `RecoveryAcceptanceTest` +
+  `Demo <dir> crashmany` then `Demo <dir> recover` (two processes, like M0): `runtime.recoverAll()`
+  walks `openExecutions()`, folds each (snapshot-warm) and calls `resume(id)` **only** for
+  crash-interrupted states (`NEW`/`STARTING`/`RUNNING`/`RESUMING`). `PAUSED`/`WAITING` are recorded
+  on purpose (`pause`, `InDoubtPolicy.ASK`) and a restart must not undo them. An execution already
+  in flight here is left alone (reported `RUNNING`), so it is safe on a live runtime. Each decision
+  runs under `byExecution` (reentrant, so it can call `resume` inside). Per-execution failures —
+  unregistered task type, unreadable stream — go to `RecoveryReport.notRecovered`, never thrown: one
+  retired task type must not block every other recovery. `Builder.recoverOnStart(true)` runs it in
+  `build()` (report via `startupRecovery()`) and **refuses** a log without an index rather than start
+  a node that silently recovers nothing. Resumes use no vars (only `argsHash` is persisted).
+
 - **In-doubt model completions** — `ReplayingContextInDoubtCompletionTest`: a `CompletionRequested`
   with no `CompletionReceived` is a provider call that may have been accepted and *billed*, so it
   routes through `InDoubtPolicy` exactly as a dangling `ToolRequested` does (it previously just
