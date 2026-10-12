@@ -1664,8 +1664,10 @@ public final class CatalystRuntime implements AutoCloseable {
          * not distributed.
          */
         public Builder lease(Duration duration, Duration heartbeat) {
-            if (duration == null || heartbeat == null || heartbeat.isNegative() || heartbeat.isZero()) {
-                throw new IllegalArgumentException("lease duration and heartbeat must be positive");
+            if (duration == null || heartbeat == null || heartbeat.toMillis() < 1) {
+                // The heartbeat is scheduled in whole milliseconds; anything shorter would become a
+                // zero delay, which the scheduler rejects inside build().
+                throw new IllegalArgumentException("lease heartbeat must be at least 1ms, and both must be set");
             }
             if (heartbeat.compareTo(duration) >= 0) {
                 throw new IllegalArgumentException("lease heartbeat (" + heartbeat + ") must be shorter than its"

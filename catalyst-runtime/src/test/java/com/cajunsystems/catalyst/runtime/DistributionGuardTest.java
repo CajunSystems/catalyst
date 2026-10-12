@@ -104,6 +104,11 @@ class DistributionGuardTest {
                 .lease(java.time.Duration.ofSeconds(10), java.time.Duration.ofSeconds(10)))
                 .isInstanceOf(IllegalArgumentException.class)
                 .hasMessageContaining("shorter");
+        assertThatThrownBy(() -> CatalystRuntime.builder()
+                .lease(java.time.Duration.ofSeconds(10), java.time.Duration.ofNanos(500_000)))
+                .as("a sub-millisecond heartbeat would schedule a zero delay")
+                .isInstanceOf(IllegalArgumentException.class)
+                .hasMessageContaining("1ms");
     }
 
     /** Nothing changes for a runtime that did not ask: the in-memory log still builds and recovers. */
