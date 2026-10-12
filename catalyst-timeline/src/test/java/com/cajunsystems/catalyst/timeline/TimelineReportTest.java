@@ -224,7 +224,10 @@ class TimelineReportTest {
         assertThat(TimelineReport.bar(T0, 1000, step(com.cajunsystems.catalyst.engine.TimelineStep.Kind.TOOL, 100, 200)))
                 .contains("left:10.00%;width:20.00%").contains("class=\"tool\"");
         assertThat(TimelineReport.bar(T0, 1000, step(com.cajunsystems.catalyst.engine.TimelineStep.Kind.EFFECT, 500, 0)))
-                .as("an instant step is a tick").contains("class=\"tick effect\"").contains("left:50.00%");
+                .as("an instant step is a tick").contains("class=\"tick effect\"").contains("left:min(50.00%, calc(100% - 2px))");
+        assertThat(TimelineReport.bar(T0, 1000, step(com.cajunsystems.catalyst.engine.TimelineStep.Kind.COMPLETED, 1000, 0)))
+                .as("a terminal step's tick at the very end stays visible inside the track")
+                .contains("left:min(100.00%, calc(100% - 2px))");
         assertThat(TimelineReport.bar(T0, 1000, step(com.cajunsystems.catalyst.engine.TimelineStep.Kind.MODEL, 100, 400)))
                 .as("a call that began before the execution's start is clamped to it, and still ends where it ended")
                 .contains("left:0.00%;width:10.00%");

@@ -182,7 +182,10 @@ public final class TimelineReport {
         double width = 100.0 * (to - from) / span;
         String kind = kindClass(step.kind());
         if (latency == 0) {
-            return String.format(Locale.ROOT, "<div class=\"wf\"><span class=\"tick %s\" style=\"left:%.2f%%\"></span></div>",
+            // A tick is 2px wide: at the end of the axis (every terminal step) left:100% would put it
+            // just outside the clipped track, so it is held inside the track's right edge.
+            return String.format(Locale.ROOT,
+                    "<div class=\"wf\"><span class=\"tick %s\" style=\"left:min(%.2f%%, calc(100%% - 2px))\"></span></div>",
                     kind, left);
         }
         return String.format(Locale.ROOT,
