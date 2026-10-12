@@ -726,4 +726,18 @@ class GumboEventLogTest {
         }
         return ids;
     }
+
+    /**
+     * Refused before connecting, so no cluster is needed: FoundationDB refuses values over 100 KB, so a
+     * FoundationDB log without somewhere to offload large payloads would fail on the first big completion.
+     */
+    @Test
+    void aFoundationDBLogWithoutABlobStoreIsRefusedBeforeConnecting() {
+        assertThatThrownBy(() -> GumboEventLog.foundationDB(null, "catalyst", EventCodec.builder().build()))
+                .isInstanceOf(IllegalArgumentException.class)
+                .hasMessageContaining("blob store");
+        assertThatThrownBy(() -> GumboEventLog.foundationDB(null, " ", com.cajunsystems.catalyst.events.BlobStore.inMemory()))
+                .isInstanceOf(IllegalArgumentException.class)
+                .hasMessageContaining("root");
+    }
 }

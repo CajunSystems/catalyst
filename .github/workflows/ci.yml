@@ -19,7 +19,7 @@ jobs:
     name: Build & test (JDK 21)
     runs-on: ubuntu-latest
     env:
-      GUMBO_VERSION: "0.6.0"
+      GUMBO_VERSION: "0.7.0"
     steps:
       - name: Checkout Catalyst
         uses: actions/checkout@v4
@@ -470,3 +470,78 @@ jobs:
           echo "$OUT" | grep -q "CAPTURED_LABELS=\[auto:Instant.now#0, auto:UUID.randomUUID#1\]" \
             || { echo "FAIL: -javaagent launch did not capture through the application's bridge"; exit 1; }
           echo "v0.2 Auto-capture packaging holds: -javaagent works standalone and binds the app's bridge."
+
+  # Dist-0: the multi-writer log, measured. Two logs on one FoundationDB root are two nodes' worth of
+  # connections, sequencers and caches; FoundationDBEventLogTest and FoundationDBAcceptanceTest race
+  # them. Copied from Gumbo's own `fdb` job (0.7.0): the official image as a service container in host
+  # networking mode, the client package on the runner, `configure new single memory`, then the tests.
+  # CATALYST_REQUIRE_FDB makes an unreachable cluster a failure, not a skip — and the last step fails if
+  # any FoundationDB class still reports one, since a skipped suite reads exactly like a passing one.
+  fdb:
+    name: FoundationDB (multi-writer log)
+    runs-on: ubuntu-latest
+    env:
+      FDB_VERSION: "7.3.43"   # matches fdb.version in the root pom; the image tag and client package follow it
+    services:
+      foundationdb:
+        image: foundationdb/foundationdb:7.3.43
+        env:
+          # Advertise 127.0.0.1, not the container's own address: the client is on the runner.
+          FDB_NETWORKING_MODE: host
+        ports:
+          - 4500:4500
+    steps:
+      - name: Checkout Catalyst
+        uses: actions/checkout@v4
+
+      - name: Set up JDK 21
+        uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: "21"
+          cache: maven
+
+      - name: Install the FoundationDB client library
+        run: |
+          set -euo pipefail
+          curl -fsSL "https://github.com/apple/foundationdb/releases/download/${FDB_VERSION}/foundationdb-clients_${FDB_VERSION}-1_amd64.deb" \
+            -o "$RUNNER_TEMP/fdb-clients.deb"
+          sudo dpkg -i "$RUNNER_TEMP/fdb-clients.deb"
+
+      # The image starts fdbserver but does not create a database; that is a one-off fdbcli call,
+      # retried while the server comes up.
+      - name: Create the database
+        run: |
+          set -euo pipefail
+          echo "docker:docker@127.0.0.1:4500" > "$RUNNER_TEMP/fdb.cluster"
+          echo "FDB_CLUSTER_FILE=$RUNNER_TEMP/fdb.cluster" >> "$GITHUB_ENV"
+          for _ in $(seq 1 30); do
+            if fdbcli -C "$RUNNER_TEMP/fdb.cluster" --exec 'configure new single memory' --timeout 5 | grep -q 'Database created'; then
+              break
+            fi
+            sleep 2
+          done
+          for _ in $(seq 1 30); do
+            if fdbcli -C "$RUNNER_TEMP/fdb.cluster" --exec 'status minimal' --timeout 5 | grep -q 'The database is available'; then
+              exit 0
+            fi
+            sleep 2
+          done
+          echo "FoundationDB did not become available"; exit 1
+
+      - name: Run the FoundationDB tests
+        env:
+          CATALYST_REQUIRE_FDB: "true"
+        run: >-
+          mvn -B --no-transfer-progress -pl catalyst-gumbo,catalyst-api -am
+          -Dtest='FoundationDB*Test' -Dsurefire.failIfNoSpecifiedTests=false test
+
+      - name: Confirm nothing was skipped
+        run: |
+          set -euo pipefail
+          REPORTS=$(ls */target/surefire-reports/*FoundationDB*.txt)
+          grep -h "Tests run" $REPORTS
+          [ "$(echo "$REPORTS" | wc -l)" -ge 2 ] || { echo "Expected both FoundationDB test classes to run"; exit 1; }
+          if grep -h "Tests run" $REPORTS | grep -qv "Skipped: 0"; then
+            echo "A FoundationDB test class was skipped"; exit 1
+          fi

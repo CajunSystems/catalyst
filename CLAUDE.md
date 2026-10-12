@@ -14,7 +14,7 @@ mvn install            # full reactor + tests
 mvn -pl catalyst-core -am install   # a single module and its deps
 ```
 
-**Gumbo dependency:** `catalyst-gumbo` depends on **`com.github.CajunSystems:gumbo:0.6.0`**,
+**Gumbo dependency:** `catalyst-gumbo` depends on **`com.github.CajunSystems:gumbo:0.7.0`**,
 resolved from JitPack (declared in the root pom) — an ordinary build needs no setup. The groupId is
 *not* the `com.cajunsystems` that Gumbo's own pom declares; JitPack rewrites it to
 `com.github.{owner}` on publish. So a hand-built `mvn -f /path/to/gumbo/pom.xml install -DskipTests`
@@ -193,8 +193,9 @@ checkout's pom to `com.github.CajunSystems` before installing.
   `supportsConditionalAppend()` and `supportsMultiWriter()`. Read them as a **pair** — a
   file-backed log is fenced (compare and append under its own monitor) and *not* multi-writer, and
   distribution needs both. Note Gumbo composes `multiWriter` from storage **and** its sequencer, so
-  no log Catalyst builds today reports `true`: the default sequencer is a per-process `AtomicLong`,
-  which no storage fence can compensate for since the seqnum never passes through it.
+  only `GumboEventLog.foundationDB(...)` reports `true` (Dist-0, below): the default sequencer is a
+  per-process `AtomicLong`, which no storage fence can compensate for since the seqnum never passes
+  through it.
 - **Fan-out tag cursors (v1 claimable work)** — `GumboEventLogTest.aFanOutTagIsCursoredByItsOwnVersion`:
   since gumbo **0.6.0** every tag an entry carries has its own dense position, so a shared
   `catalyst-tasks/<queue>` fed by dual-tagged appends can be cursored with `readAfterVersion` like
@@ -337,6 +338,28 @@ checkout's pom to `com.github.CajunSystems` before installing.
   refused too. One-shot appends fence on the fold just read under the id lock: create at 0, `pause`,
   `cancel`, `signal`; branch children get their own cursor from -1. Mutation-checked: with the cursor
   forced unfenced, the zombie tests fail.
+
+- **Multi-writer log (Dist-0)** — `FoundationDBEventLogTest` (catalyst-gumbo) +
+  `FoundationDBAcceptanceTest` (catalyst-api), both against a **real FoundationDB cluster**, run by
+  CI's `fdb` job (copied from Gumbo 0.7.0's) and locally by `scripts/fdb-tests.sh` (Docker). They
+  **skip** without a cluster and **fail** instead under `CATALYST_REQUIRE_FDB=true`, which CI sets —
+  plus a step that fails if either class reports a skip. `GumboEventLog.foundationDB(clusterFile,
+  root, blobs|codec)` pairs Gumbo's FDB storage adapter with its FDB sequencer over one `Database`
+  the log owns and closes (Gumbo's service never opens or closes a sequencer, and neither component
+  closes a `Database` it was handed). Every FDB type lives in package-private `FoundationDBLogs`:
+  `fdb-java` is **optional** (it carries `libfdb_c`), so `GumboEventLog` must not reference it. A blob
+  store is **required** — FDB refuses values over 100 KB, and it must be one every node can read.
+  **Two logs on one root are the test fixture for two nodes**: a log opened once only sees its own
+  writes, which hides per-process state. That fixture found two Catalyst-side bugs: `read()` used
+  the tag's `readAll()`, which is **seqnum-ordered** — under two writers seqnum order ≠ version
+  order (a writer claims its seqnum before its transaction, gets its version inside it), so the fold
+  got events out of seq order; every stream read is now version-keyed (`readAfterVersion(-1)`,
+  version-ordered per Gumbo 0.7.0), `wasOpened` included. And `latestSeq`'s per-process cache is
+  bypassed when `multiWriter` (mutation-checked). Per-process state that stays: the `indexed` map
+  (only ever true→removed or false, never wrong for a dual-tag decision) and the open-set checkpoint
+  (any checkpoint is a valid fold prefix). **Fenced, not coordinated:** two runtimes on one root
+  cannot corrupt a stream, but nothing stops both *starting* the same work — leases and the claim
+  loop are Dist-3/4, as is `putKey` (a plain overwrite: two nodes taking one new key both create).
 
 - **In-doubt model completions** — `ReplayingContextInDoubtCompletionTest`: a `CompletionRequested`
   with no `CompletionReceived` is a provider call that may have been accepted and *billed*, so it

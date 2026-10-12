@@ -283,13 +283,25 @@ Labels follow the build order (see *Order* below).
 ### Dist — distributed execution
 The original phasing rationale is in `docs/distribution.md`; **this list is the sequencing of record.**
 
-- **Dist-0. Multi-writer log (mostly Gumbo-side, blocking)** — done when **all** of: the FoundationDB
+- ✅ **Dist-0. Multi-writer log (mostly Gumbo-side, blocking)** — done when **all** of: the FoundationDB
   adapter wired through a `GumboEventLog` factory; a distributed sequencer; Gumbo **D2**
   (non-clobbering index) closed or shown not to apply to the FDB `kvSubspace` index, with the
   measurement; and a **CI-runnable** multi-writer configuration (e.g. a shared in-process adapter with
   a storage-side sequencer) so Dist-4's exit demo can be gated without FDB in CI. `supportsMultiWriter()`
   is only trusted once Gumbo reports it from a measured configuration — asserting it early is the D4
   mistake again.
+  *As shipped* (Gumbo **0.7.0**, which answered [gumbo#38](https://github.com/CajunSystems/gumbo/issues/38)):
+  `GumboEventLog.foundationDB(clusterFile, root, blobs)` pairs FDB storage with the FDB sequencer, so
+  `supportsMultiWriter()` comes from Gumbo, which measures that pairing with two writer JVMs in its CI.
+  D2 is shown not to apply on FDB (the index is written in the entry's transaction). **One deviation:**
+  the CI-runnable configuration is a real FoundationDB in a service container (CI job `fdb`), not an
+  in-process adapter — Gumbo declined that option as less honest than the real thing, and the
+  container is cheap. So Dist-4's exit demo gates in that job. Catalyst's own two-node tests
+  (`FoundationDBEventLogTest`, `FoundationDBAcceptanceTest`) found two Catalyst-side bugs a
+  single-writer fixture hid: stream reads were seqnum-ordered (out of seq order under two writers),
+  and `latestSeq` served a per-process cache. Left for Dist-4: `putKey` is a plain overwrite, so two
+  nodes taking the same new idempotency key both create an execution; keyed `execute` across nodes
+  needs a CAS claim on the key plus attach-or-claim on the execution.
 - ✅ **Dist-1. Fenced runtime writes** — the runtime appends through `append(id, event, expectedSeq)`
   when the log supports it. **Precondition: Gumbo A6 resolved as primary-tag fencing.** Deploy-1 and
   Deploy-6 make Catalyst's lifecycle appends multi-tag (execution tag + queue tag), so the fenced
@@ -317,7 +329,9 @@ The original phasing rationale is in `docs/distribution.md`; **this list is the 
   is not in flight *in this process*, which across nodes is a second writer on a stream another node
   owns. So control ops become lease-gated — a node that does not hold the lease records a control
   request in the tag KV, and the owner observes it at its next boundary and appends the event itself
-  (an unleased execution is claimed first, then controlled). Exit demo `Demo distributed`: two
+  (an unleased execution is claimed first, then controlled). **Keyed submission too:** `putKey` becomes
+  a CAS claim (`setValueIfAbsent`), and a node that loses the claim attaches to the winner's execution
+  rather than creating its own (see Dist-0's note). Exit demo `Demo distributed`: two
   runtimes on the Dist-0 CI multi-writer log, one killed mid-run, the other reclaims and finishes with
   zero duplicate model calls, the zombie's late write is rejected by the fence, and a cancel issued
   from the non-owner lands via the owner.
