@@ -257,6 +257,10 @@ Catalyst can do exactly this: tag `ExecutionCreated` into `catalyst-tasks/<queue
 entry and the history entry are the *same append* — no window in which an execution is recorded but
 not yet claimable.
 
+*Implemented in Deploy-1:* `GumboEventLog` dual-tags `ExecutionCreated` and the terminal events into
+`catalyst-tasks/default`, and `EventLog.openExecutions()` folds the queue into the open set. The one
+SPI addition is that read — a log has to be asked for the set, not just written to.
+
 Better still, Gumbo has **push subscriptions** (`SharedLogService.notifySubscribers`), which Boudin's
 `WorkflowDispatcher` uses to subscribe to its task tag rather than poll. Work delivery is therefore
 push already, which removes polling latency from the design and further reduces what a placement

@@ -457,4 +457,162 @@ class GumboEventLogTest {
             assertThat(events.get(1).event()).isInstanceOf(CatalystEvent.ExecutionCompleted.class);
         }
     }
+
+    // ── Execution index (Deploy-1) ───────────────────────────────────────────────────────────
+
+    /**
+     * Lifecycle events are dual-tagged into the queue, and the execution's own seq must not notice:
+     * still dense from 0, still the execution tag's version — with a second execution interleaving
+     * appends, so a seq read off the queue's numbering or the global seqnum would show.
+     */
+    @Test
+    void dualTaggedLifecycleEventsKeepTheExecutionsSeqDense(@TempDir Path dir) {
+        ExecutionId a = ExecutionId.random();
+        ExecutionId b = ExecutionId.random();
+        try (GumboEventLog log = GumboEventLog.at(dir)) {
+            log.append(b, created());
+            log.append(b, new CatalystEvent.ExecutionStarted(T, 1, "node-0"));
+            assertThat(log.append(a, created())).isEqualTo(0);
+            log.append(b, new CatalystEvent.ExecutionCompleted(T, new TextNode("b")));
+            assertThat(log.append(a, new CatalystEvent.ExecutionStarted(T, 1, "node-0"))).isEqualTo(1);
+            assertThat(log.append(a, new CatalystEvent.ExecutionCompleted(T, new TextNode("a")))).isEqualTo(2);
+        }
+        try (GumboEventLog reopened = GumboEventLog.at(dir)) {
+            assertThat(reopened.read(a)).extracting(SequencedEvent::seq).containsExactly(0L, 1L, 2L);
+            assertThat(reopened.readFrom(a, 0)).extracting(SequencedEvent::seq).containsExactly(1L, 2L);
+            assertThat(reopened.latestSeq(a)).isEqualTo(2);
+            assertThat(reopened.read(b)).extracting(SequencedEvent::seq).containsExactly(0L, 1L, 2L);
+
+            // The queue holds the four open/close events and numbers them itself.
+            assertThat(reopened.service().getView(QUEUE).readAfterVersion(-1).join())
+                    .extracting(e -> e.streamVersion(QUEUE))
+                    .containsExactly(0L, 1L, 2L, 3L);
+        }
+    }
+
+    @Test
+    void theOpenSetListsUnfinishedExecutionsInCreationOrderAcrossAReopen(@TempDir Path dir) {
+        ExecutionId crashed = ExecutionId.random();
+        ExecutionId completed = ExecutionId.random();
+        ExecutionId paused = ExecutionId.random();
+        ExecutionId failed = ExecutionId.random();
+        ExecutionId cancelled = ExecutionId.random();
+        try (GumboEventLog log = GumboEventLog.at(dir)) {
+            assertThat(log.supportsExecutionIndex()).isTrue();
+            assertThat(log.openExecutions()).isEmpty();
+
+            for (ExecutionId id : List.of(crashed, completed, paused, failed, cancelled)) log.append(id, created());
+            log.append(crashed, new CatalystEvent.ExecutionStarted(T, 1, "node-0"));
+            log.append(completed, new CatalystEvent.ExecutionCompleted(T, new TextNode("ok")));
+            log.append(paused, new CatalystEvent.ExecutionPaused(T, "operator"));
+            log.append(failed, new CatalystEvent.ExecutionFailed(T, "boom", 0));
+            log.append(cancelled, new CatalystEvent.ExecutionCancelled(T, "stop", 0));
+
+            assertThat(log.openExecutions()).containsExactly(crashed, paused);
+        }
+        try (GumboEventLog reopened = GumboEventLog.at(dir)) {
+            assertThat(reopened.openExecutions())
+                    .as("rebuilt from the log alone — this is what a restarted runtime sees")
+                    .containsExactly(crashed, paused);
+        }
+    }
+
+    /**
+     * A scan resumes from the checkpoint and reads only the queue after it. Shown by planting a
+     * checkpoint the queue does not support: if the scan refolded from the start, the planted id
+     * would vanish; it survives, so the prefix was not re-read — and the tail still folds onto it.
+     */
+    @Test
+    void aScanFoldsOnlyTheQueueTailAfterItsCheckpoint() {
+        try (GumboEventLog log = GumboEventLog.inMemory()) {
+            ExecutionId first = ExecutionId.random();
+            log.append(first, created());
+            assertThat(log.openExecutions()).containsExactly(first);
+            assertThat(checkpointVersion(log)).isEqualTo(0L);
+
+            ExecutionId planted = ExecutionId.random();
+            log.service().getView(QUEUE).setValue(GumboEventLog.OPEN_SET_KEY,
+                    checkpoint(0L, planted)).join();
+
+            ExecutionId second = ExecutionId.random();
+            log.append(second, created());
+            log.append(second, new CatalystEvent.ExecutionStarted(T, 1, "node-0"));
+
+            assertThat(log.openExecutions()).containsExactly(planted, second);
+            assertThat(checkpointVersion(log)).as("advanced to the queue's tip").isEqualTo(1L);
+        }
+    }
+
+    /**
+     * The checkpoint is an optimization, not a source of truth: lost or rolled back, the scan reads
+     * further back and reaches the same set.
+     */
+    @Test
+    void aLostOrStaleCheckpointCostsAReadNotACorrectAnswer() {
+        try (GumboEventLog log = GumboEventLog.inMemory()) {
+            ExecutionId a = ExecutionId.random();
+            ExecutionId b = ExecutionId.random();
+            log.append(a, created());
+            log.append(b, created());
+            assertThat(log.openExecutions()).containsExactly(a, b);
+            log.append(a, new CatalystEvent.ExecutionCompleted(T, new TextNode("a")));
+            assertThat(log.openExecutions()).containsExactly(b);
+
+            // Rolled back to before a closed: replaying the close from there gives the same answer.
+            log.service().getView(QUEUE).setValue(GumboEventLog.OPEN_SET_KEY, checkpoint(1L, a, b)).join();
+            assertThat(log.openExecutions()).containsExactly(b);
+
+            log.service().getView(QUEUE).deleteValue(GumboEventLog.OPEN_SET_KEY).join();
+            assertThat(log.openExecutions()).containsExactly(b);
+
+            log.service().getView(QUEUE).setValue(GumboEventLog.OPEN_SET_KEY, new byte[] {1, 2}).join();
+            assertThat(log.openExecutions()).as("an unreadable checkpoint is refolded").containsExactly(b);
+        }
+    }
+
+    /**
+     * A fenced lifecycle append is dual-tagged and conditions on the execution tag only. Other
+     * executions advancing the shared queue must not make it look stale, and a genuinely stale
+     * writer is still refused — with nothing reaching the index.
+     */
+    @Test
+    void aFencedLifecycleAppendConditionsOnTheExecutionNotTheQueue() {
+        try (GumboEventLog log = GumboEventLog.inMemory()) {
+            ExecutionId other = ExecutionId.random();
+            log.append(other, created());
+            log.append(other, new CatalystEvent.ExecutionCompleted(T, new TextNode("x")));
+
+            ExecutionId id = ExecutionId.random();
+            assertThat(log.append(id, created(), 0)).isEqualTo(0);
+            assertThat(log.openExecutions()).containsExactly(id);
+
+            assertThatThrownBy(() -> log.append(id, new CatalystEvent.ExecutionCancelled(T, "zombie", 0), 0))
+                    .isInstanceOfSatisfying(StaleWriterException.class, e -> assertThat(e.actualSeq()).isEqualTo(1));
+            assertThat(log.openExecutions()).as("the refused close never reached the index").containsExactly(id);
+
+            assertThat(log.append(id, new CatalystEvent.ExecutionCancelled(T, "stop", 0), 1)).isEqualTo(1);
+            assertThat(log.openExecutions()).isEmpty();
+        }
+    }
+
+    private static CatalystEvent created() {
+        return new CatalystEvent.ExecutionCreated(T, "Task", "h", "cfg", "");
+    }
+
+    private static long checkpointVersion(GumboEventLog log) {
+        byte[] framed = log.service().getView(QUEUE).getValue(GumboEventLog.OPEN_SET_KEY).join();
+        return java.nio.ByteBuffer.wrap(framed).getLong();
+    }
+
+    private static byte[] checkpoint(long through, ExecutionId... open) {
+        java.io.ByteArrayOutputStream bytes = new java.io.ByteArrayOutputStream();
+        try (java.io.DataOutputStream out = new java.io.DataOutputStream(bytes)) {
+            out.writeLong(through);
+            out.writeInt(open.length);
+            for (ExecutionId id : open) out.writeUTF(id.value());
+        } catch (java.io.IOException e) {
+            throw new java.io.UncheckedIOException(e);
+        }
+        return bytes.toByteArray();
+    }
 }

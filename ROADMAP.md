@@ -226,7 +226,7 @@ Dist inherits its queue instead of inventing a second one.
 ### Deploy — one deployable node
 Labels follow the build order (see *Order* below).
 
-- **Deploy-1. Execution index** — dual-tag `ExecutionCreated` **and** the terminal events
+- ✅ **Deploy-1. Execution index** — dual-tag `ExecutionCreated` **and** the terminal events
   (`ExecutionCompleted` / `ExecutionFailed` / `ExecutionCancelled`) into `catalyst-tasks/<queue>`
   (default queue for now), so a fold of the queue yields the *open* set rather than every execution
   ever created. The fold is checkpointed in the tag KV like an execution snapshot (open set + queue
@@ -384,8 +384,8 @@ The substrate becomes a platform. This is where the other CajunSystems component
     `catalyst-tasks/<queue>` fed by dual-tagged appends is cursored with `readAfterVersion` like any
     other stream, and a worker cannot be handed an item numbered below its cursor. It cost a
     record-layout change but no migration — a per-record marker lets both layouts coexist. Pinned
-    from this side by `GumboEventLogTest.aFanOutTagIsCursoredByItsOwnVersion`, because nothing in
-    Catalyst depends on it yet and a regression would otherwise surface as work never claimed.
+    from this side by `GumboEventLogTest.aFanOutTagIsCursoredByItsOwnVersion`; the Deploy-1
+    execution index is its first consumer.
 
 ### In-doubt model completions (found while designing distribution)
 - ✅ **Closed.** A crash between `CompletionRequested` and `CompletionReceived` left the provider call
