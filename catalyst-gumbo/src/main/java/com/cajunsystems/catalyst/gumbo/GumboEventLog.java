@@ -61,8 +61,8 @@ public final class GumboEventLog implements EventLog {
     static final LogTag QUEUE_TAG = LogTag.of("catalyst-tasks", ExecutionIndex.DEFAULT_QUEUE);
     /** Key in the queue tag's KV holding the folded open set and the queue version it covers. */
     static final String OPEN_SET_KEY = "open-set";
-    /** Layout version of the {@link #OPEN_SET_KEY} checkpoint. */
-    static final byte OPEN_SET_FORMAT = 1;
+    /** Layout version of the {@link #OPEN_SET_KEY} checkpoint. 2 adds a trailing CRC32 of the frame. */
+    static final byte OPEN_SET_FORMAT = 2;
 
     private final SharedLogService service;
     private final EventLogSerializer serializer;
@@ -408,28 +408,41 @@ public final class GumboEventLog implements EventLog {
         return null;
     }
 
-    /** Fills {@code into} from the checkpoint and returns the queue version it covers, or -1. */
+    /**
+     * Fills {@code into} from the checkpoint and returns the queue version it covers, or -1 to refold.
+     *
+     * <p>Any checkpoint that does not verify is treated as missing: an unknown format, a CRC
+     * mismatch, a truncated frame, or content that parses into something invalid (a blank id throws
+     * {@code IllegalArgumentException}, not {@code IOException}). Refolding is always correct; a
+     * checkpoint that made this method throw would fail every scan — and every startup with
+     * {@code recoverOnStart} — until someone deleted it by hand. The CRC is what catches corruption
+     * that happens to parse, which would otherwise yield a silently wrong set.
+     */
     private long readOpenSetCheckpoint(LinkedHashSet<ExecutionId> into) {
         byte[] framed = queueView.getValue(OPEN_SET_KEY).join();
         if (framed == null) return -1;
-        try (DataInputStream in = new DataInputStream(new ByteArrayInputStream(framed))) {
-            // A format this reader does not know is treated like a missing checkpoint: refold.
-            if (in.readByte() != OPEN_SET_FORMAT) return -1;
-            long through = in.readLong();
-            int n = in.readInt();
-            for (int i = 0; i < n; i++) into.add(ExecutionId.of(in.readUTF()));
-            return through;
-        } catch (IOException e) {
-            // Unreadable checkpoint: discard it and refold the queue from the start — correct, slower.
+        try {
+            if (framed.length < 1 + Long.BYTES || framed[0] != OPEN_SET_FORMAT) return -1;
+            int body = framed.length - Long.BYTES;
+            java.util.zip.CRC32 crc = new java.util.zip.CRC32();
+            crc.update(framed, 0, body);
+            if (ByteBuffer.wrap(framed, body, Long.BYTES).getLong() != crc.getValue()) return -1;
+            try (DataInputStream in = new DataInputStream(new ByteArrayInputStream(framed, 1, body - 1))) {
+                long through = in.readLong();
+                int n = in.readInt();
+                for (int i = 0; i < n; i++) into.add(ExecutionId.of(in.readUTF()));
+                return through;
+            }
+        } catch (IOException | RuntimeException e) {
             into.clear();
             return -1;
         }
     }
 
     /**
-     * Frames as {@code [1-byte format][8-byte through][4-byte count][count × modified-UTF-8 id]},
-     * creation order. The format byte lets the layout change later without a migration: a reader
-     * that does not recognise it refolds, which is always correct.
+     * Frames as {@code [1-byte format][8-byte through][4-byte count][count × modified-UTF-8 id][8-byte CRC32]},
+     * creation order, the CRC covering everything before it. The format byte lets the layout change
+     * later without a migration: a reader that does not recognise it refolds, which is always correct.
      */
     private void writeOpenSetCheckpoint(long through, LinkedHashSet<ExecutionId> open) {
         ByteArrayOutputStream bytes = new ByteArrayOutputStream();
@@ -438,6 +451,9 @@ public final class GumboEventLog implements EventLog {
             out.writeLong(through);
             out.writeInt(open.size());
             for (ExecutionId id : open) out.writeUTF(id.value());
+            java.util.zip.CRC32 crc = new java.util.zip.CRC32();
+            crc.update(bytes.toByteArray());
+            out.writeLong(crc.getValue());
         } catch (IOException e) {
             throw new UncheckedIOException(e); // in-memory stream; cannot happen
         }

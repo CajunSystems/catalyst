@@ -78,6 +78,16 @@ public final class ReplayingContext implements Context {
     private final boolean appendEnabled;
     /** Nullable: present only for a live attempt the runtime may cancel cooperatively. */
     private final CancellationToken cancellation;
+    /**
+     * Whether this context has raised a stop signal. The runtime cannot rely on the signal unwinding
+     * out of the task: both signals are {@code RuntimeException}s, so a task with a
+     * {@code catch (RuntimeException)} fallback around a boundary swallows them and returns normally.
+     * Recording that return as {@code ExecutionCompleted} would make the execution terminal with a
+     * result produced by the stop, and leave a boundary the log never recorded. See
+     * {@link #raisedCancellation()} / {@link #raisedAbandon()}.
+     */
+    private volatile boolean raisedCancellation;
+    private volatile boolean raisedAbandon;
 
     /** Result-bearing recorded boundaries, in order, consumed as the task replays its prefix. */
     private final Deque<Boundary> boundaries = new ArrayDeque<>();
@@ -646,11 +656,13 @@ public final class ReplayingContext implements Context {
         // Cooperative cancellation is observed only at live boundaries — never mid-replay, so a
         // cancelled resume still substitutes its recorded prefix intact before unwinding here.
         if (cancellation != null && cancellation.isCancelled()) {
+            raisedCancellation = true;
             throw new CancellationSignal(cancellation.reason());
         }
         // Shutdown: checked after cancel so a requested cancel still wins. Raised here — before the
         // boundary records anything — so the unwind leaves no dangling request to be in doubt about.
         if (cancellation != null && cancellation.isAbandoned()) {
+            raisedAbandon = true;
             throw new ExecutionAbandonedSignal("runtime shutting down before " + what + "; execution " + id
                     + " is left RUNNING for the next start to resume");
         }
@@ -672,6 +684,16 @@ public final class ReplayingContext implements Context {
      * yields {@code -1} — and {@code -1} degrades safely to "retry is a no-op for this failure", never to
      * dropping a boundary a substitution still depends on.
      */
+    /** Whether this context raised {@link CancellationSignal} — whether or not the task let it unwind. */
+    public boolean raisedCancellation() {
+        return raisedCancellation;
+    }
+
+    /** Whether this context raised {@link ExecutionAbandonedSignal} — whether or not the task let it unwind. */
+    public boolean raisedAbandon() {
+        return raisedAbandon;
+    }
+
     public long failedBoundarySeq(Throwable propagating) {
         if (lastToolFailureException == null) return -1;
         // Bounded walk: a self- or mutually-referential cause chain would otherwise loop forever.

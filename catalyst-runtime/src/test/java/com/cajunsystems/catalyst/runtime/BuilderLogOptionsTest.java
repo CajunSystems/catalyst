@@ -60,6 +60,25 @@ class BuilderLogOptionsTest {
         assertThat(seenStore.get()).isNull();
     }
 
+    /** The log owns the store only once constructed; if construction fails the builder must release it. */
+    @Test
+    void aSuppliedStoreIsClosedWhenOpeningTheLogFails() {
+        boolean[] closed = {false};
+        BlobStore store = new BlobStore() {
+            final BlobStore bytes = BlobStore.inMemory();
+            public String put(byte[] content) { return bytes.put(content); }
+            public byte[] get(String ref) { return bytes.get(ref); }
+            public boolean has(String ref) { return bytes.has(ref); }
+            @Override public void close() { closed[0] = true; }
+        };
+        assertThatThrownBy(() -> CatalystRuntime.builder()
+                .logFactory((s, threshold) -> { throw new IllegalStateException("directory already open"); })
+                .blobStore(store)
+                .build())
+                .hasMessageContaining("already open");
+        assertThat(closed[0]).isTrue();
+    }
+
     @Test
     void aNonPositiveThresholdIsRejected() {
         assertThatThrownBy(() -> CatalystRuntime.builder().blobStore(BlobStore.inMemory(), 0))

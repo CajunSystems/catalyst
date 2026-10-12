@@ -31,6 +31,7 @@ import java.util.Map;
 import java.util.Optional;
 import java.util.concurrent.CountDownLatch;
 import java.util.concurrent.TimeUnit;
+import java.util.concurrent.atomic.AtomicReference;
 
 import static org.assertj.core.api.Assertions.assertThat;
 import static org.assertj.core.api.Assertions.assertThatThrownBy;
@@ -148,6 +149,76 @@ class RecoveryTest {
                     .isInstanceOf(IllegalStateException.class)
                     .hasMessageContaining("UnindexedLog");
         }
+    }
+
+    /**
+     * recoverAll() on a live runtime, landing between execute()'s ExecutionCreated and its attempt
+     * being scheduled. The execution is already open and STARTING with nothing in flight, so a scan
+     * that could act in that window would resume it — and execute() would then start a second writer
+     * on the same stream. Creating under the id lock closes the window: the scan waits, then finds the
+     * attempt in flight and leaves it alone.
+     */
+    @Test
+    void aScanRacingExecuteNeverStartsASecondWriter() throws Exception {
+        AtomicReference<CatalystRuntime> runtimeRef = new AtomicReference<>();
+        AtomicReference<RecoveryReport> scan = new AtomicReference<>();
+        CountDownLatch scanned = new CountDownLatch(1);
+        InMemoryEventLog delegate = new InMemoryEventLog();
+        EventLog racingLog = new DelegatingLog(delegate) {
+            @Override public long append(ExecutionId id, CatalystEvent event) {
+                long seq = delegate.append(id, event);
+                if (event instanceof CatalystEvent.ExecutionCreated) {
+                    Thread.ofVirtual().start(() -> { scan.set(runtimeRef.get().recoverAll()); scanned.countDown(); });
+                    sleep(200); // hold the window open: before the fix, the scan resumes in here
+                }
+                return seq;
+            }
+        };
+        MockModel model = contentModel();
+        try (CatalystRuntime runtime = CatalystRuntime.builder()
+                .log(racingLog).model(model).task(new TwoStepTask()).build()) {
+            runtimeRef.set(runtime);
+            ExecutionHandle<String> handle = runtime.execute(new TwoStepTask());
+            assertThat(handle.result()).isEqualTo("SUMMARY|FINAL");
+            assertThat(scanned.await(5, TimeUnit.SECONDS)).isTrue();
+
+            assertThat(scan.get().resumed()).as("the scan never resumed it").doesNotContainKey(handle.id());
+            assertThat(model.callCount()).as("one writer: each step called once").isEqualTo(2);
+            assertThat(delegate.read(handle.id())).extracting(SequencedEvent::event)
+                    .filteredOn(e -> e instanceof CatalystEvent.ExecutionStarted || e instanceof CatalystEvent.ExecutionResumed)
+                    .hasSize(1);
+        }
+    }
+
+    /** A failed startup scan must not close a log the caller supplied — it is theirs to retry with. */
+    @Test
+    void aFailedStartupScanLeavesACallerSuppliedLogOpen() {
+        boolean[] closed = {false};
+        EventLog failingIndex = new DelegatingLog(new InMemoryEventLog()) {
+            @Override public List<ExecutionId> openExecutions() { throw new IllegalStateException("index unreadable"); }
+            @Override public boolean supportsExecutionIndex() { return true; }
+            @Override public void close() { closed[0] = true; }
+        };
+        assertThatThrownBy(() -> CatalystRuntime.builder().log(failingIndex).recoverOnStart(true).build())
+                .hasMessageContaining("index unreadable");
+        assertThat(closed[0]).isFalse();
+    }
+
+    private static void sleep(long millis) {
+        try { Thread.sleep(millis); } catch (InterruptedException e) { Thread.currentThread().interrupt(); }
+    }
+
+    private static class DelegatingLog implements EventLog {
+        final EventLog delegate;
+        DelegatingLog(EventLog delegate) { this.delegate = delegate; }
+        public long append(ExecutionId id, CatalystEvent event) { return delegate.append(id, event); }
+        public List<SequencedEvent> read(ExecutionId id) { return delegate.read(id); }
+        public long latestSeq(ExecutionId id) { return delegate.latestSeq(id); }
+        public Optional<ExecutionId> findByKey(String key) { return delegate.findByKey(key); }
+        public void putKey(String key, ExecutionId id) { delegate.putKey(key, id); }
+        @Override public List<ExecutionId> openExecutions() { return delegate.openExecutions(); }
+        @Override public boolean supportsExecutionIndex() { return delegate.supportsExecutionIndex(); }
+        public void close() { delegate.close(); }
     }
 
     /** Durably records step 1 of {@link TwoStepTask} and stops, as a process death would leave it. */

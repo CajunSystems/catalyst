@@ -214,6 +214,71 @@ class ShutdownTest {
         assertThat(runtime.isShuttingDown()).isTrue();
     }
 
+    /**
+     * A task that swallows the abandon signal with a {@code catch (RuntimeException)} fallback and
+     * returns normally must not be recorded as completed: that result came from the shutdown, and
+     * the boundary that raised it was never recorded. It is abandoned like any other.
+     */
+    @Test
+    void aSwallowedAbandonSignalIsNotRecordedAsACompletion() throws Exception {
+        InMemoryEventLog log = new InMemoryEventLog();
+        AtomicReference<CatalystRuntime> current = new AtomicReference<>();
+        CountDownLatch inStep1 = new CountDownLatch(1);
+        MockModel model = model(() -> {
+            inStep1.countDown();
+            while (!current.get().isShuttingDown()) Thread.onSpinWait();
+        });
+        Task<String> withFallback = ctx -> {
+            String summary = ctx.model().complete(STEP1).message();
+            String answer;
+            try {
+                answer = ctx.model().complete(STEP2).message();
+            } catch (RuntimeException e) {
+                answer = "fallback";
+            }
+            return summary + "|" + answer;
+        };
+        CatalystRuntime runtime = CatalystRuntime.builder().log(log).model(model).build();
+        current.set(runtime);
+        ExecutionHandle<String> handle = runtime.execute(withFallback);
+        assertThat(inStep1.await(5, TimeUnit.SECONDS)).isTrue();
+        runtime.close();
+
+        assertThatThrownBy(handle::result).isInstanceOf(ExecutionAbandonedSignal.class);
+        assertThat(fold(log, handle.id()).status()).as("not terminal: the next start resumes it").isEqualTo(Status.RUNNING);
+        assertThat(log.read(handle.id())).extracting(SequencedEvent::event)
+                .noneMatch(e -> e instanceof CatalystEvent.ExecutionCompleted);
+    }
+
+    /** The same for cancel: a swallowed cancel still folds to CANCELLED, not COMPLETED. */
+    @Test
+    void aSwallowedCancelSignalStillFoldsToCancelled() throws Exception {
+        InMemoryEventLog log = new InMemoryEventLog();
+        CountDownLatch entered = new CountDownLatch(1);
+        java.util.concurrent.atomic.AtomicBoolean cancelled = new java.util.concurrent.atomic.AtomicBoolean();
+        Task<String> withFallback = ctx -> {
+            entered.countDown();
+            // Uninterruptible on purpose: cancel() also interrupts, and the case under test is a
+            // task that reaches its boundary and swallows the signal there.
+            while (!cancelled.get()) Thread.onSpinWait();
+            try {
+                return ctx.model().complete(STEP1).message();
+            } catch (RuntimeException e) {
+                return "fallback";
+            }
+        };
+        try (CatalystRuntime runtime = CatalystRuntime.builder()
+                .log(log).model(MockModel.alwaysReturn("x")).build()) {
+            ExecutionHandle<String> handle = runtime.execute(withFallback);
+            assertThat(entered.await(5, TimeUnit.SECONDS)).isTrue();
+            runtime.cancel(handle.id());
+            cancelled.set(true);
+
+            assertThatThrownBy(handle::result).isInstanceOf(java.util.concurrent.CancellationException.class);
+            assertThat(fold(log, handle.id()).status()).isEqualTo(Status.CANCELLED);
+        }
+    }
+
     /** Fails its effect on the first attempt only. */
     static final class FlakyTask implements Task<String> {
         private final AtomicInteger attempts;

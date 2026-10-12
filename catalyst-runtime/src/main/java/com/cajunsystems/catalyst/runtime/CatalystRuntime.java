@@ -183,11 +183,16 @@ public final class CatalystRuntime implements AutoCloseable {
         String taskType = task.getClass().getName();
         Optional<String> key = opts.idempotencyKey();
 
-        // No key → a fresh random id nobody else can name yet, so only the id lock is needed.
+        // No key → a fresh random id no caller can name yet, so only the id lock is needed. Creation
+        // happens UNDER it, not before: ExecutionCreated puts the id in the execution index, and a
+        // concurrent recoverAll() that saw it there — open, STARTING, nothing in flight — would resume
+        // it and leave this FRESH attempt as a second writer on the same stream.
         if (key.isEmpty()) {
             ExecutionId id = ExecutionId.random();
-            createExecution(id, taskType, "", opts);
-            return byExecution.withLock(id, () -> scheduleAttempt(task, id, taskType, opts, Mode.FRESH));
+            return byExecution.withLock(id, () -> {
+                createExecution(id, taskType, "", opts);
+                return scheduleAttempt(task, id, taskType, opts, Mode.FRESH);
+            });
         }
 
         // Keyed: hold the key lock across the whole decision — resolving the key, creating the
@@ -199,8 +204,11 @@ public final class CatalystRuntime implements AutoCloseable {
             if (existing.isEmpty()) {
                 ExecutionId id = ExecutionId.random();
                 log.putKey(key.get(), id);
-                createExecution(id, taskType, key.get(), opts);
-                return byExecution.withLock(id, () -> scheduleAttempt(task, id, taskType, opts, Mode.FRESH));
+                // Created under the id lock for the same reason as the keyless path above.
+                return byExecution.withLock(id, () -> {
+                    createExecution(id, taskType, key.get(), opts);
+                    return scheduleAttempt(task, id, taskType, opts, Mode.FRESH);
+                });
             }
             ExecutionId id = existing.get();
             return byExecution.withLock(id, () -> {
@@ -467,9 +475,10 @@ public final class CatalystRuntime implements AutoCloseable {
      * and resumes it via {@link #resume(ExecutionId)} only if its status is one a crash leaves behind:
      * {@code NEW}, {@code STARTING}, {@code RUNNING} or {@code RESUMING}.
      *
-     * <p>{@code PAUSED} and {@code WAITING} are left alone. Both are recorded on purpose — by
-     * {@link #pause(ExecutionId)}, or by {@code InDoubtPolicy.ASK} holding an execution for a verdict
-     * — and a restart must not undo what an operator or a pending decision is holding. They stay
+     * <p>{@code PAUSED} is left alone: it is recorded on purpose — by {@link #pause(ExecutionId)}, or
+     * by {@code InDoubtPolicy.ASK} holding an execution for a verdict — and a restart must not undo
+     * what an operator or a pending decision is holding. {@code WAITING} (reserved for signals) will
+     * be left alone for the same reason. They stay
      * resumable by id. An execution already running in this process is left alone too, so calling
      * this on a live runtime never schedules a second attempt.
      *
@@ -753,6 +762,19 @@ public final class CatalystRuntime implements AutoCloseable {
                 // auto-capture counter restarts in step with the recorded prefix it replays.
                 try (AutoCapture.Scope captured = AutoCapture.bind(ctx)) {
                     R result = task.execute(ctx);
+                    // A task can swallow a stop signal (catch (RuntimeException) around a boundary) and
+                    // return normally. That return is not a completion: the result came from the stop,
+                    // and the boundary that raised it was never recorded. Honour the stop instead. A
+                    // task that genuinely finishes without reaching another boundary raised nothing,
+                    // and still records its completion.
+                    if (ctx.raisedCancellation()) {
+                        recordCancelled(id, runningAttempt.token.reason(), future);
+                        return;
+                    }
+                    if (ctx.raisedAbandon()) {
+                        abandon(id, future);
+                        return;
+                    }
                     log.append(id, new CatalystEvent.ExecutionCompleted(now(), payloads.toTree(result)));
                     future.complete(result);
                     return;
@@ -765,7 +787,8 @@ public final class CatalystRuntime implements AutoCloseable {
                     // CancellationSignal the context raises at the next live boundary once the token trips
                     // (the task acknowledging cancellation). The interrupt() cancel() raises is only a
                     // best-effort nudge to reach that boundary; it never reclassifies a failure.
-                    if (t instanceof CancellationSignal) {
+                    // ...or the task swallowed that signal and then failed some other way: still a cancel.
+                    if (t instanceof CancellationSignal || ctx.raisedCancellation()) {
                         recordCancelled(id, runningAttempt.token.reason(), future);
                         return;
                     }
@@ -970,6 +993,15 @@ public final class CatalystRuntime implements AutoCloseable {
         } finally {
             closeFinished.countDown();
         }
+    }
+
+    /** Tears down a runtime whose {@code build()} failed after construction. */
+    private void abortStartup(boolean closeLog) {
+        closed.set(true);
+        closing = true;
+        executor.shutdown();
+        closeFinished.countDown();
+        if (closeLog) log.close();
     }
 
     private boolean awaitDrain() {
@@ -1178,7 +1210,16 @@ public final class CatalystRuntime implements AutoCloseable {
             if (log == null && logFactory == null) {
                 throw new IllegalStateException("An EventLog is required (e.g. EventLogs.inMemory() or GumboEventLog.at(path))");
             }
-            EventLog resolved = log != null ? log : logFactory.open(blobStore, blobThresholdBytes);
+            EventLog resolved;
+            try {
+                resolved = log != null ? log : logFactory.open(blobStore, blobThresholdBytes);
+            } catch (RuntimeException e) {
+                // The log takes ownership of the store only once it is constructed. If construction
+                // failed, the store is still ours — and in the one-line usage the caller kept no
+                // reference to it — so release it rather than leak its client.
+                if (blobStore != null) blobStore.close();
+                throw e;
+            }
             if (recoverOnStart && !resolved.supportsExecutionIndex()) {
                 IllegalStateException refused = new IllegalStateException("recoverOnStart needs a log with an"
                         + " execution index; " + resolved.getClass().getSimpleName() + " cannot list its open executions");
@@ -1190,7 +1231,10 @@ public final class CatalystRuntime implements AutoCloseable {
                 try {
                     runtime.startupRecovery = runtime.recoverAll();
                 } catch (RuntimeException e) {
-                    runtime.close();
+                    // Only the index read can get here (per-execution failures are reported), so no
+                    // attempt is running. Stop the runtime, but close the log only if the builder
+                    // opened it — a log the caller supplied is theirs, e.g. to retry build() with.
+                    runtime.abortStartup(log == null);
                     throw e;
                 }
             }
