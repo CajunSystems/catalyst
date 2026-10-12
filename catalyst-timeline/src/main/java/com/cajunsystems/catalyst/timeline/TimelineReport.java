@@ -174,9 +174,12 @@ public final class TimelineReport {
         long at = Duration.between(start, step.at()).toMillis();
         long latency = Math.max(0, step.latencyMillis());
         long from = step.kind() == TimelineStep.Kind.MODEL ? at - latency : at;
+        long to = from + latency;
+        // Clamp both ends to the axis, so a clamped bar still ends where the call ended.
         from = Math.max(0, Math.min(from, span));
+        to = Math.max(from, Math.min(to, span));
         double left = 100.0 * from / span;
-        double width = Math.min(100.0 - left, 100.0 * latency / span);
+        double width = 100.0 * (to - from) / span;
         String kind = kindClass(step.kind());
         if (latency == 0) {
             return String.format(Locale.ROOT, "<div class=\"wf\"><span class=\"tick %s\" style=\"left:%.2f%%\"></span></div>",
