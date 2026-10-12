@@ -234,7 +234,7 @@ Labels follow the build order (see *Order* below).
   recent churn, not history. Exposed through an additive `EventLog` read, default-throwing like
   conditional append so a log that cannot enumerate says so. `InMemoryEventLog` + `GumboEventLog`;
   tests put a second execution in the log.
-- **Deploy-2. Startup recovery** — `runtime.recoverAll()` (and `Catalyst.builder().recoverOnStart(true)`)
+- ✅ **Deploy-2. Startup recovery** — `runtime.recoverAll()` (and `Catalyst.builder().recoverOnStart(true)`)
   folds each open execution (snapshot-warm) and resumes **only crash-interrupted states**
   (`NEW` / `STARTING` / `RUNNING` / `RESUMING`). `PAUSED` and `WAITING` are left alone: `pause(id)`
   and `InDoubtPolicy.ASK` record `ExecutionPaused` on purpose, and a restart must not un-pause what an
