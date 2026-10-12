@@ -317,7 +317,7 @@ class SignalTest {
         ExecutionId child = ExecutionId.random();
         log.append(child, new CatalystEvent.ExecutionBranched(Instant.now(), "parent", 3, "branch@3"));
         log.append(child, new CatalystEvent.ExecutionStarted(Instant.now(), 1, "node-0"));
-        log.append(child, new CatalystEvent.SignalAwaited(Instant.now(), "approval"));
+        log.append(child, new CatalystEvent.SignalAwaited(Instant.now(), "approval", Approval.class.getName()));
         try (CatalystRuntime runtime = runtime(log, model())) {
             assertThat(runtime.inspect(child).awaitingSignal()).contains("approval");
             int before = log.read(child).size();
@@ -358,6 +358,35 @@ class SignalTest {
             Approval approval = ctx.awaitSignal("approval", Approval.class);
             return ticket + ": " + draft + ", approved by " + approval.reviewer();
         }
+    }
+
+    /**
+     * A payload the resume could never accept is refused before it is written — a plain class (refused
+     * by the payload allowlist on read) or a type other than the one awaited. Recorded, either would
+     * fail every resume, terminally. The execution stays waiting and still takes a valid signal.
+     */
+    @Test
+    void anUnacceptablePayloadIsRefusedBeforeItIsRecorded() {
+        InMemoryEventLog log = new InMemoryEventLog();
+        try (CatalystRuntime runtime = runtime(log, model())) {
+            ExecutionId id = parked(runtime);
+            int before = log.read(id).size();
+
+            assertThatThrownBy(() -> runtime.signal(id, "approval", new PlainApproval()))
+                    .isInstanceOf(IllegalArgumentException.class).hasMessageContaining("cannot be recorded");
+            assertThatThrownBy(() -> runtime.signal(id, "approval", "yes please"))
+                    .isInstanceOf(IllegalArgumentException.class).hasMessageContaining(Approval.class.getName());
+            assertThat(log.read(id)).as("nothing written").hasSize(before);
+            assertThat(runtime.inspect(id).status()).isEqualTo(Status.WAITING);
+
+            assertThat(runtime.signal(id, "approval", new Approval("dana", true)).result())
+                    .isEqualTo("DRAFT|FINAL (approved by dana)");
+        }
+    }
+
+    /** Serializable by Jackson, but not a record/enum/value type — refused by the allowlist on read. */
+    public static final class PlainApproval {
+        public String getReviewer() { return "dana"; }
     }
 
     @Test

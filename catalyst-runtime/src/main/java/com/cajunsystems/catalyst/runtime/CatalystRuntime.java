@@ -679,7 +679,18 @@ public final class CatalystRuntime implements AutoCloseable {
                 throw new IllegalStateException("Execution " + id + " has no recorded task type (a branch child)"
                         + " and cannot be resumed, so it cannot accept signal '" + name + "'");
             }
-            log.append(id, new CatalystEvent.SignalReceived(now(), name, payloads.toTree(payload)));
+            // Refuse a payload the resume could never accept — before writing it. Once recorded it would be
+            // substituted into every resume and fail each one, terminally, on an append-only log.
+            com.fasterxml.jackson.databind.JsonNode tree = payloads.toTree(payload);
+            Object decoded;
+            try {
+                decoded = payloads.fromTree(tree); // the allowlist the resume will apply
+            } catch (RuntimeException e) {
+                throw new IllegalArgumentException("Signal '" + name + "' payload cannot be recorded: " + e.getMessage()
+                        + " Use a record, enum, string, number, java.time value or UUID.", e);
+            }
+            requirePayloadType(id, name, state.awaitingSignalType(), decoded);
+            log.append(id, new CatalystEvent.SignalReceived(now(), name, tree));
             if (registry.lookup(state.taskType()).isEmpty()) {
                 return new FutureExecutionHandle<>(id, CompletableFuture.failedFuture(new IllegalStateException(
                         "Signal '" + name + "' recorded for " + id + ", but no task is registered for type '"
@@ -688,6 +699,21 @@ public final class CatalystRuntime implements AutoCloseable {
             }
             return resume(id, opts); // reentrant on the id lock
         });
+    }
+
+    /** Refuses a payload that is not of the type the task awaits; a type not loadable here is not checked. */
+    private static void requirePayloadType(ExecutionId id, String name, Optional<String> typeName, Object payload) {
+        if (payload == null || typeName.isEmpty()) return;
+        Class<?> expected;
+        try {
+            expected = Class.forName(typeName.get(), false, CatalystRuntime.class.getClassLoader());
+        } catch (ClassNotFoundException | LinkageError e) {
+            return; // cannot verify from this process; the resume's own check still applies
+        }
+        if (!expected.isInstance(payload)) {
+            throw new IllegalArgumentException("Execution " + id + " waits for signal '" + name + "' of type "
+                    + expected.getName() + ", not " + payload.getClass().getName());
+        }
     }
 
     /** A handle for an execution parked on a signal: no attempt runs; it completes with the wait. */

@@ -269,8 +269,9 @@ Worth knowing:
 - **Re-submitting the key, or calling `resume(id)`, while it is still waiting runs nothing.** The
   handle fails with `ExecutionWaitingSignal`.
 - **Waits have no timeout yet**, and a waiting execution can be cancelled like any other.
-- The payload must be a recordable type: a record, an enum, a string, number, `java.time` value or
-  `UUID`, or collections of those.
+- The payload must be a recordable type (a record, an enum, a string, number, `java.time` value or
+  `UUID`, or collections of those) **and** the type the task awaits. `signal` refuses anything else
+  with nothing recorded, because a recorded signal is replayed into every resume.
 
 ## Cancel, pause, resume
 

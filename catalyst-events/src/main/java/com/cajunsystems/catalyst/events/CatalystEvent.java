@@ -82,8 +82,12 @@ public sealed interface CatalystEvent {
      * The task is waiting for the named signal: folds the execution to {@code WAITING}. Not a
      * substitutable boundary on its own — the boundary's recorded result is the {@link SignalReceived}
      * that follows it. Recorded with no thread held: the attempt unwinds once it is appended.
+     *
+     * <p>{@code payloadType} is the class name the task awaits, so a signal of another type can be
+     * refused before it is recorded — once recorded, a payload the task cannot accept would fail every
+     * resume, and the log is append-only.
      */
-    record SignalAwaited(Instant at, String name) implements CatalystEvent {}
+    record SignalAwaited(Instant at, String name, String payloadType) implements CatalystEvent {}
 
     /**
      * A signal delivered to an execution waiting for it: the recorded result of its await boundary,

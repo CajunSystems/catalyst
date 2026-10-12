@@ -74,7 +74,8 @@ public final class Reducer {
                 }
                 case SignalAwaited sa -> {
                     status = Status.WAITING;
-                    timeline.add(new TimelineStep(se.seq(), TimelineStep.Kind.WAITING, sa.name(), sa.at(), 0, null));
+                    timeline.add(new TimelineStep(se.seq(), TimelineStep.Kind.WAITING, sa.name(), sa.at(), 0,
+                            sa.payloadType() == null ? null : com.fasterxml.jackson.databind.node.TextNode.valueOf(sa.payloadType())));
                 }
                 case SignalReceived sr -> {
                     status = Status.RESUMING;

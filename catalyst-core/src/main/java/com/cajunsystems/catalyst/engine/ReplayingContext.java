@@ -558,13 +558,13 @@ public final class ReplayingContext implements Context {
                 // WAITING for this name. A pure replay (no appends) just stops here.
                 if (appendEnabled) {
                     requireAppendable("await signal " + name);
-                    append(new SignalAwaited(now(), name));
+                    append(new SignalAwaited(now(), name, type.getName()));
                 }
                 throw raisedWaiting = new ExecutionWaitingSignal(name, "Execution " + id + " is waiting for signal '" + name + "'");
             }
         }
         requireAppendable("await signal " + name);
-        append(new SignalAwaited(now(), name));
+        append(new SignalAwaited(now(), name, type.getName()));
         throw raisedWaiting = new ExecutionWaitingSignal(name, "Execution " + id + " is waiting for signal '" + name + "'");
     }
 

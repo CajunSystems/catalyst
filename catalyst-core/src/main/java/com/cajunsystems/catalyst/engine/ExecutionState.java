@@ -58,6 +58,19 @@ public record ExecutionState(
         return java.util.Optional.empty();
     }
 
+    /** The payload type a {@code WAITING} execution's signal must have (a class name), or empty. */
+    public java.util.Optional<String> awaitingSignalType() {
+        if (status != Status.WAITING) return java.util.Optional.empty();
+        for (int i = timeline.size() - 1; i >= 0; i--) {
+            TimelineStep step = timeline.get(i);
+            if (step.kind() == TimelineStep.Kind.WAITING) {
+                return step.detail() == null || !step.detail().isTextual()
+                        ? java.util.Optional.empty() : java.util.Optional.of(step.detail().asText());
+            }
+        }
+        return java.util.Optional.empty();
+    }
+
     /** The aggregated timeline view: model/tool counts, token usage, cost and latency roll-ups. */
     public Timeline timelineView() {
         return Timeline.from(this);

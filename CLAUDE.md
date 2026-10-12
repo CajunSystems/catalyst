@@ -314,6 +314,12 @@ checkout's pom to `com.github.CajunSystems` before installing.
   diverge. `ExecutionState.awaitingSignal()`
   is **derived from the timeline**, so the state records and snapshot format are unchanged.
   `Context.awaitSignal` is a default method (throws) so other `Context` implementations still compile.
+  **`signal()` refuses before writing** everything a resume could never get past: wrong name, running,
+  branch child (no task type), a payload the allowlist would refuse on read (round-trip `fromTree`
+  first — `toTree` does not check it), and a payload not of the awaited type (`SignalAwaited` records
+  `payloadType`; `ExecutionState.awaitingSignalType()`). A recorded signal is substituted into every
+  resume, so a bad one is terminal on an append-only log. `signal(id, name, payload, opts)` for tasks
+  that read vars.
 
 - **In-doubt model completions** — `ReplayingContextInDoubtCompletionTest`: a `CompletionRequested`
   with no `CompletionReceived` is a provider call that may have been accepted and *billed*, so it
