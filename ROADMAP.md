@@ -317,8 +317,18 @@ The original phasing rationale is in `docs/distribution.md`; **this list is the 
   `StreamCursor` whose expectation is one past what that writer **read** — never the log's tip at write
   time, which would let a writer fence on history it never saw. A rejection fences the cursor out for
   good, and the attempt exits ahead of the stop rule and the retry decision, appending nothing.
-- **Dist-2. Distribution guard** — distributed mode refuses to start unless the log reports **both**
+- ✅ **Dist-2. Distribution guard** — distributed mode refuses to start unless the log reports **both**
   `supportsConditionalAppend()` and `supportsMultiWriter()`.
+  *As shipped:* `Builder.distributed()`; `build()` reads both answers from the log and refuses with
+  both in the message (closing a log the builder opened). It also refuses, before opening anything:
+  a missing `nodeId(...)`, since nodes left at the default would be indistinguishable; `shard(...)`,
+  since sharding is the alternative to a shared log; and `recoverOnStart`. `recoverAll()` refuses on
+  a distributed runtime too. On a shared index the scan would resume work running on *other* nodes
+  mid-call: their dangling `CompletionRequested` becomes in-doubt, which is terminal under
+  `InDoubtPolicy.FAIL`. Dist-3/4 lift that refusal once leases say whose work is whose.
+  `isDistributed()` reports the mode. Tests: `DistributionGuardTest` and
+  `DistributionGuardAcceptanceTest` (the file-backed log is refused and its directory released).
+  `FoundationDBAcceptanceTest`'s nodes run distributed.
 - **Dist-3. Leases** — lease row per execution via the tag KV's CAS (gumbo 0.4.0+): claim, heartbeat,
   expiry. Resolve the open question first: whether `expectedSeq` makes a separate fencing token
   redundant. Lease duration and heartbeat interval get defaults plus a knob. A `WAITING` execution

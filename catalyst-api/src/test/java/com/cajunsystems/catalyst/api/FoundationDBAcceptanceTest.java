@@ -15,7 +15,6 @@ import com.cajunsystems.catalyst.model.CompletionRequest;
 import com.cajunsystems.catalyst.model.Prompt;
 import com.cajunsystems.catalyst.runtime.CatalystRuntime;
 import com.cajunsystems.catalyst.runtime.ExecutionHandle;
-import com.cajunsystems.catalyst.runtime.RecoveryReport;
 import org.junit.jupiter.api.BeforeEach;
 import org.junit.jupiter.api.Test;
 import org.junit.jupiter.api.io.TempDir;
@@ -37,7 +36,8 @@ import static org.junit.jupiter.api.Assumptions.assumeTrue;
  * mid-execution; node B finds the execution through the shared index, resumes it with zero duplicate
  * model calls, and node A's late write is refused by the storage-side fence.
  *
- * <p>This is what Dist-4's claim loop will do automatically; here the test is the claim loop. It
+ * <p>This is what Dist-4's claim loop will do automatically; here the test is the claim loop. Both
+ * runtimes are built {@code distributed()}, so Dist-2's guard passes on this log. It
  * shows the log is ready for it: the index, the idempotency keys, the fence and the blob store all
  * span nodes.
  *
@@ -94,12 +94,12 @@ class FoundationDBAcceptanceTest {
         MockModel modelB = MockModel.alwaysReturn("B");
         GumboEventLog logA = nodeLog();
         GumboEventLog logB = nodeLog();
-        assertThat(logB.supportsConditionalAppend() && logB.supportsMultiWriter())
-                .as("the pair Dist-2 will require").isTrue();
 
-        CatalystRuntime nodeA = Catalyst.builder().log(logA).model(modelA).build();
-        CatalystRuntime nodeB = Catalyst.builder().log(logB).model(modelB)
+        // Both nodes declare distributed(), so each build() checks the log is fenced and multi-writer (Dist-2).
+        CatalystRuntime nodeA = Catalyst.builder().log(logA).model(modelA).nodeId("node-a").distributed().build();
+        CatalystRuntime nodeB = Catalyst.builder().log(logB).model(modelB).nodeId("node-b").distributed()
                 .task(GatedTask.class, GatedTask::new).build();
+        assertThat(nodeA.isDistributed() && nodeB.isDistributed()).isTrue();
         try {
             ExecutionHandle<String> stalled = nodeA.execute(new GatedTask(reachedGate, openGate),
                     ExecutionOptions.withKey("ticket-1042"));
@@ -107,10 +107,11 @@ class FoundationDBAcceptanceTest {
             ExecutionId id = stalled.id();
 
             // Node B holds no id: it finds the work through the index node A wrote, and the key too.
+            // This test plays the claim loop (Dist-4). A distributed runtime refuses recoverAll() until
+            // leases exist, so B resumes the one open execution by id.
             assertThat(logB.findByKey("ticket-1042")).contains(id);
-            RecoveryReport report = nodeB.recoverAll();
-            assertThat(report.resumed()).containsOnlyKeys(id);
-            assertThat(report.resumed().get(id).result()).isEqualTo("A|B");
+            assertThat(logB.openExecutions()).containsExactly(id);
+            assertThat(nodeB.resume(id).result()).isEqualTo("A|B");
             assertThat(modelB.callCount()).as("step 1 substituted from node A's record; only step 2 ran").isEqualTo(1);
             List<SequencedEvent> history = logB.read(id);
 

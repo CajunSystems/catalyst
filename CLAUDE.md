@@ -361,6 +361,17 @@ checkout's pom to `com.github.CajunSystems` before installing.
   cannot corrupt a stream, but nothing stops both *starting* the same work — leases and the claim
   loop are Dist-3/4, as is `putKey` (a plain overwrite: two nodes taking one new key both create).
 
+- **Distribution guard (Dist-2)** — `DistributionGuardTest` (runtime) + `DistributionGuardAcceptanceTest`:
+  `Builder.distributed()` makes `build()` refuse a log that does not **report** both
+  `supportsConditionalAppend()` and `supportsMultiWriter()`. The message gives both answers, and a log
+  the builder opened is closed, so a file-backed log's directory lock is released. Refused before
+  any log is opened: no explicit `nodeId(...)`, `shard(...)` (alternatives: own log vs shared log),
+  and `recoverOnStart`. **`recoverAll()` refuses on a distributed runtime** until leases (Dist-3/4).
+  On a shared index, "open and not in flight *here*" includes work running on another node. Resuming
+  it mid-call fences that node out and leaves its `CompletionRequested` in doubt, which is terminal
+  under `FAIL`. Mutation-checked: dropping either capability check or the `recoverAll` refusal fails
+  a test. `isDistributed()` reports the mode.
+
 - **In-doubt model completions** — `ReplayingContextInDoubtCompletionTest`: a `CompletionRequested`
   with no `CompletionReceived` is a provider call that may have been accepted and *billed*, so it
   routes through `InDoubtPolicy` exactly as a dangling `ToolRequested` does (it previously just

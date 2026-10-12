@@ -212,4 +212,6 @@ nodes can write safely. That is the Dist track (`docs/distribution.md`), and it 
 The log half exists — `GumboEventLog.foundationDB(...)` is a log several nodes can write without
 corrupting a stream — but the coordination half (leases, and a claim loop that hands a dead node's
 work to a live one) does not, so do not point several runtimes at one FoundationDB root in
-production yet.
+production yet. A runtime meant to share a log is built with `.nodeId("node-a").distributed()`.
+`build()` then refuses a log that is not both fenced and multi-writer, and refuses `recoverOnStart`,
+until leases make cross-node recovery safe.
