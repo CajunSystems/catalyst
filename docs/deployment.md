@@ -188,6 +188,20 @@ re-submission of an existing key can arrive, for example after every client has 
 the keys it has issued. Do not remove a shard that still holds executions anyone may address: its
 ids still route to it by their stamp.
 
+### Moving from one node to several
+
+Sharding an existing single node is a change of shard set too, from one implicit shard to N. Two
+things follow:
+
+- **Keys re-route.** Each existing key now routes to whichever shard the ring picks, which is usually
+  not the original node. A re-submission of an old key would create a duplicate there. Make the
+  original node one of the shards, and only switch the router once no re-submission of an existing
+  key can arrive.
+- **Old ids carry no shard.** Ids minted before sharding are unstamped, so `ShardRing.shardOf` returns
+  empty for them and every node accepts them, and on any node but the original they read as unknown.
+  Route them to the original node yourself, for example by keeping a note of which node held the
+  pre-sharding data.
+
 ### What sharding does not give you
 
 Each shard is still a single node. If a shard's node is down, its executions wait until it comes back
