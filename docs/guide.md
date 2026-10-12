@@ -213,8 +213,10 @@ Did the model call get billed? Did the ticket get created? `InDoubtPolicy` decid
 | `RETRY` | the call is made again, completing the original request; right for idempotent calls |
 | `ASK` | the execution is paused, for an operator to decide |
 
-Set it with `Catalyst.builder(dir).inDoubtPolicy(InDoubtPolicy.RETRY)`. A graceful shutdown never
-leaves a call in doubt; only a crash does.
+Set it with `Catalyst.builder(dir).inDoubtPolicy(InDoubtPolicy.RETRY)`. A graceful shutdown leaves
+nothing in doubt as long as every in-flight call finishes within `drainTimeout`. A call still running
+when the drain times out is left exactly as a crash would leave it, and this policy decides what
+happens to it. Size `drainTimeout` above your slowest call (see [deployment.md](deployment.md#shutdown-drain-dont-kill)).
 
 ## Cancel, pause, resume
 
@@ -229,8 +231,9 @@ records `ExecutionCancelled`. A task stuck in a long computation with no `ctx` c
 reaches one.
 
 `close()` shuts the runtime down gracefully. Running executions finish their current call, then stop
-without recording a failure, and the next start resumes them. See
-[deployment.md](deployment.md#shutdown-drain-dont-kill).
+without recording a failure, and the next start resumes them. That holds for calls that finish within
+`drainTimeout` (default 10s). After that, the log is closed under any call still running, which leaves
+what a crash would. See [deployment.md](deployment.md#shutdown-drain-dont-kill).
 
 ## Inspect, replay, branch
 
