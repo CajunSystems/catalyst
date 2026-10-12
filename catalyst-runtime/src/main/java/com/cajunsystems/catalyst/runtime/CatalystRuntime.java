@@ -303,8 +303,8 @@ public final class CatalystRuntime implements AutoCloseable {
                 }
                 // A cancel requested while another node held the lease rides on the row, and this node
                 // took it over: honour it before running anything (Dist-4).
-                if (!now.isTerminal() && leases.carriedCancel(id).isPresent()) {
-                    String reason = leases.carriedCancel(id).get();
+                if (!now.isTerminal() && leases.pendingCancel(id).isPresent()) {
+                    String reason = leases.pendingCancel(id).get();
                     try {
                         StreamCursor.after(log, id, now.lastSeq())
                                 .append(new CatalystEvent.ExecutionCancelled(now(), reason, now.lastSeq()));
@@ -729,7 +729,7 @@ public final class CatalystRuntime implements AutoCloseable {
                     try {
                         underLease(id, () -> {
                             ExecutionState state = leases == null ? unleased : foldState(id);
-                            Optional<String> carried = leases == null ? Optional.empty() : leases.carriedCancel(id);
+                            Optional<String> carried = leases == null ? Optional.empty() : leases.pendingCancel(id);
                             if (!isCrashInterrupted(state.status())) {
                                 leftAlone.put(id, state.status());
                             } else if (carried.isPresent()) {
@@ -771,7 +771,7 @@ public final class CatalystRuntime implements AutoCloseable {
         try {
             return underLease(id, () -> {
                 ExecutionState now = foldState(id);
-                Optional<String> reason = leases.carriedCancel(id);
+                Optional<String> reason = leases.pendingCancel(id);
                 if (now.isTerminal() || reason.isEmpty()) return now.status();
                 StreamCursor.after(log, id, now.lastSeq())
                         .append(new CatalystEvent.ExecutionCancelled(now(), reason.get(), now.lastSeq()));

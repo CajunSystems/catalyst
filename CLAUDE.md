@@ -418,7 +418,8 @@ checkout's pom to `com.github.CajunSystems` before installing.
       once the attempt's future is done. Registering it fires any request already absorbed. A request
       absorbed during a pause, before registration, or after the attempt parked therefore stays for
       the next holder rather than being deleted by the release.
-    - `acquire` carries a request over on takeover. `scheduleAttempt` honours a carried request
+    - `acquire` carries a request over on takeover; `pendingCancel` only peeks at it (marking on read
+      lost a request the scan read and then left alone). `scheduleAttempt` honours a carried request
       before running, and `scan`'s `honourOrphanedCancel` honours one on a lapsed parked execution.
     - `release` keeps an unhonoured request on a lapsed row unless the execution is terminal.
   - **Keys:** `EventLog.claimKey` (CAS; the default is lookup+put). Keyed `execute` decides under the

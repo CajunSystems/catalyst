@@ -26,7 +26,7 @@ import java.util.concurrent.TimeUnit;
  * <p>Cancels cross nodes on the lease row (Dist-4). {@link #requestCancel} adds the request to the
  * holder's row. The holder's next renewal finds its own row plus a request, keeps the lease, and runs
  * the attempt's cancel callback. A node that takes a lease over carries any request on it
- * ({@link #carriedCancel}), and a release never deletes a request this node did not honour. It
+ * ({@link #pendingCancel}), and a release never deletes a request this node did not honour. It
  * leaves the row lapsed instead, for the next claimer. So a request outlives its holder.
  *
  * <p>A lease whose holder is this node's own id is treated as this node's, even if this process did
@@ -152,16 +152,15 @@ final class LeaseKeeper implements AutoCloseable {
 
     /**
      * The cancel request on the lease this process holds for {@code id}: one carried over from the row
-     * it took over, or one absorbed at renewal. Reading it marks the request as being honoured, so a
-     * release will not leave it for another node.
+     * it took over, or one absorbed at renewal. Only a peek. Nothing is marked, because a caller that
+     * reads the request and then decides not to act on it must not cause it to be dropped. Once the
+     * cancel is recorded the execution is terminal, and that is what lets a release drop the request.
      */
-    Optional<String> carriedCancel(ExecutionId id) {
+    Optional<String> pendingCancel(ExecutionId id) {
         Held h = held.get(id);
         if (h == null) return Optional.empty();
         synchronized (h) {
-            Optional<String> reason = h.lease.cancelRequested();
-            if (reason.isPresent()) h.cancelFired = true;
-            return reason;
+            return h.lease.cancelRequested();
         }
     }
 

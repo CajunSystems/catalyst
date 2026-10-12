@@ -234,6 +234,29 @@ class CrossNodeTest {
         }
     }
 
+    /**
+     * The scan sees a crash-interrupted execution carrying a cancel, but before its claim lands the
+     * execution is parked. Left alone, the request must survive for whoever records it, not be
+     * dropped because the scan read it.
+     */
+    @Test
+    void aCancelTheScanReadsButDoesNotActOnSurvives() {
+        ExecutionId id = crashInterrupted();
+        assertThat(log.compareAndSetLease(id, null, new Lease("node-dead",
+                clock.instant().toEpochMilli() - 1, "cancelled by request"))).isTrue();
+        log.beforeReadLease = leased -> {
+            log.beforeReadLease = x -> { };
+            log.append(leased, new CatalystEvent.SignalAwaited(T, "approve", String.class.getName()), 2);
+        };
+        try (CatalystRuntime nodeB = nodeBuilder("node-b", MockModel.alwaysReturn("B"))
+                .claimInterval(Duration.ofMinutes(10)).task(GatedTask.class, GatedTask::new).build()) {
+            nodeB.recoverAll();
+            assertThat(log.readLease(id).flatMap(Lease::cancelRequested)).as("still on the row").contains("cancelled by request");
+            nodeB.recoverAll(); // the orphaned-cancel path now records it
+            assertThat(nodeB.inspect(id).status()).isEqualTo(Status.CANCELLED);
+        }
+    }
+
     /** No node is running it: the cancel is recorded directly, under the lease, as on one node. */
     @Test
     void cancellingAnExecutionNoNodeIsRunningRecordsItDirectly() {
