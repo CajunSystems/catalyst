@@ -44,8 +44,13 @@ final class LeaseKeeper implements AutoCloseable {
         Lease lease;
         boolean released;
         Runnable onLost = () -> { };
-        java.util.function.Consumer<String> onCancel = reason -> { };
-        /** Whether {@link #onCancel} has run for the request on {@link #lease}; a request is honoured once. */
+        /**
+         * The running attempt's cancel, or null while none is registered. Returns whether the cancel took
+         * effect: false for an attempt that has already finished, so the request is not counted as
+         * honoured.
+         */
+        java.util.function.Predicate<String> onCancel;
+        /** Whether the request on {@link #lease} has been honoured; only then may a release drop it. */
         boolean cancelFired;
 
         Held(Lease lease) {
@@ -115,14 +120,32 @@ final class LeaseKeeper implements AutoCloseable {
     }
 
     /**
-     * Runs {@code onCancel} with the reason when a renewal finds a cancel request on the lease for
-     * {@code id}. Replaces any earlier callback.
+     * Registers the running attempt's cancel for {@code id}. It runs when a renewal finds a cancel
+     * request on the lease, or now, if one was absorbed while no attempt was registered (during a
+     * pause, say, or just before the attempt registered). The request counts as honoured only if
+     * {@code onCancel} returns true. Replaces any earlier callback.
      */
-    void onCancel(ExecutionId id, java.util.function.Consumer<String> onCancel) {
+    void onCancel(ExecutionId id, java.util.function.Predicate<String> onCancel) {
         Held h = held.get(id);
-        if (h != null) {
+        if (h == null) return;
+        String pending;
+        synchronized (h) {
+            h.onCancel = onCancel;
+            pending = h.cancelFired ? null : h.lease.cancelRequest();
+        }
+        if (pending != null) fireCancel(h, pending);
+    }
+
+    /** Runs the registered cancel outside the lock, and marks the request honoured only if it took effect. */
+    private void fireCancel(Held h, String reason) {
+        java.util.function.Predicate<String> callback;
+        synchronized (h) {
+            if (h.cancelFired || h.onCancel == null) return;
+            callback = h.onCancel;
+        }
+        if (callback.test(reason)) {
             synchronized (h) {
-                h.onCancel = onCancel;
+                h.cancelFired = true;
             }
         }
     }
@@ -205,7 +228,7 @@ final class LeaseKeeper implements AutoCloseable {
             ExecutionId id = entry.getKey();
             Held h = entry.getValue();
             Runnable lost = null;
-            Runnable cancel = null;
+            String cancel = null;
             synchronized (h) {
                 if (h.released) continue;
                 Lease next = h.lease.cancelRequested().map(fresh()::withCancelRequest).orElseGet(this::fresh);
@@ -220,11 +243,7 @@ final class LeaseKeeper implements AutoCloseable {
                         if (reason != null && row.get().equals(h.lease.withCancelRequest(reason))) {
                             Lease renewed = fresh().withCancelRequest(reason);
                             h.lease = log.compareAndSetLease(id, row.get(), renewed) ? renewed : row.get();
-                            if (!h.cancelFired) {
-                                h.cancelFired = true;
-                                java.util.function.Consumer<String> onCancel = h.onCancel;
-                                cancel = () -> onCancel.accept(reason);
-                            }
+                            if (!h.cancelFired) cancel = reason;
                         } else {
                             h.released = true;
                             held.remove(id, h);
@@ -239,7 +258,7 @@ final class LeaseKeeper implements AutoCloseable {
             }
             if (cancel != null) {
                 LOG.info("cancel of {} requested by another node; cancelling it here", id);
-                cancel.run();
+                fireCancel(h, cancel); // with no attempt to take it, the request stays for a later holder
             }
             if (lost != null) {
                 LOG.warn("lost the lease on {} to another node; stopping its attempt here", id);

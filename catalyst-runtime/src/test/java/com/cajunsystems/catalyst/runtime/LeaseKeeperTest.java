@@ -59,8 +59,8 @@ class LeaseKeeperTest {
         try (LeaseKeeper keeper = keeper(false)) {
             keeper.acquire(id);
             requestCancelBehindItsBack(id);
-            keeper.renewAll(); // absorbs the request
-            assertThat(keeper.carriedCancel(id)).contains("stop");
+            keeper.onCancel(id, reason -> true);
+            keeper.renewAll(); // absorbs the request, and the attempt takes it
             keeper.release(id);
         }
         assertThat(log.readLease(id)).isEmpty();
@@ -72,7 +72,10 @@ class LeaseKeeperTest {
         String[] cancelled = {null};
         try (LeaseKeeper keeper = keeper(false)) {
             keeper.acquire(id);
-            keeper.onCancel(id, reason -> cancelled[0] = reason);
+            keeper.onCancel(id, reason -> {
+                cancelled[0] = reason;
+                return true;
+            });
             requestCancelBehindItsBack(id);
             clock.advance(Duration.ofSeconds(5));
             keeper.renewAll();
@@ -100,5 +103,54 @@ class LeaseKeeperTest {
         Lease left = log.readLease(id).orElseThrow();
         assertThat(left.cancelRequested()).contains("stop");
         assertThat(left.liveAt(clock.instant())).isFalse();
+    }
+
+    /**
+     * Absorbed while no attempt is registered (a pause holding the lease, say): not honoured, so the
+     * release keeps it. Before, the renewal counted it as honoured and the release deleted it.
+     */
+    @Test
+    void aRequestAbsorbedWithNoAttemptToTakeItIsKeptOnRelease() {
+        ExecutionId id = ExecutionId.random();
+        try (LeaseKeeper keeper = keeper(false)) {
+            keeper.acquire(id);
+            requestCancelBehindItsBack(id);
+            keeper.renewAll();
+            keeper.release(id);
+        }
+        assertThat(log.readLease(id).orElseThrow().cancelRequested()).contains("stop");
+    }
+
+    /** An attempt that registers after the request was absorbed is cancelled at registration. */
+    @Test
+    void anAttemptRegisteringAfterTheRequestWasAbsorbedIsCancelledAtOnce() {
+        ExecutionId id = ExecutionId.random();
+        String[] cancelled = {null};
+        try (LeaseKeeper keeper = keeper(false)) {
+            keeper.acquire(id);
+            requestCancelBehindItsBack(id);
+            keeper.renewAll();
+            keeper.onCancel(id, reason -> {
+                cancelled[0] = reason;
+                return true;
+            });
+            assertThat(cancelled[0]).isEqualTo("stop");
+            keeper.release(id);
+        }
+        assertThat(log.readLease(id)).as("honoured, so released").isEmpty();
+    }
+
+    /** A finished attempt cannot take a cancel: it is not counted as honoured, and the release keeps it. */
+    @Test
+    void aFinishedAttemptDeclinesTheCancelAndTheRequestIsKept() {
+        ExecutionId id = ExecutionId.random();
+        try (LeaseKeeper keeper = keeper(false)) {
+            keeper.acquire(id);
+            keeper.onCancel(id, reason -> false);
+            requestCancelBehindItsBack(id);
+            keeper.renewAll();
+            keeper.release(id);
+        }
+        assertThat(log.readLease(id).orElseThrow().cancelRequested()).contains("stop");
     }
 }

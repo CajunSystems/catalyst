@@ -328,7 +328,12 @@ public final class CatalystRuntime implements AutoCloseable {
         if (leases != null) {
             leases.onLost(id, () -> attempt.leaseLost = true);
             // A cancel another node asked for arrives with this node's next renewal (Dist-4).
-            leases.onCancel(id, reason -> tripCancel(attempt, reason));
+            // An attempt that already finished cannot take it, so the request stays for a later holder.
+            leases.onCancel(id, reason -> {
+                if (future.isDone()) return false;
+                tripCancel(attempt, reason);
+                return true;
+            });
         }
         // Every caller — this handle, and anyone who attaches via inFlight — sees `visible`, which
         // completes only AFTER the attempt is deregistered. Completing the attempt's own future first
