@@ -369,7 +369,9 @@ checkout's pom to `com.github.CajunSystems` before installing.
   and `recoverOnStart`. **`recoverAll()` refuses on a distributed runtime** until leases (Dist-3/4).
   On a shared index, "open and not in flight *here*" includes work running on another node. Resuming
   it mid-call fences that node out and leaves its `CompletionRequested` in doubt, which is terminal
-  under `FAIL`. Mutation-checked: dropping either capability check or the `recoverAll` refusal fails
+  under `FAIL`. The by-id paths (keyed `execute`, `resume(id)`) carry the same hazard and are *not*
+  refused, since `liveAttempt` only sees this process. That is the operator's call until Dist-3/4.
+  Mutation-checked: dropping either capability check or the `recoverAll` refusal fails
   a test. `isDistributed()` reports the mode.
 
 - **In-doubt model completions** — `ReplayingContextInDoubtCompletionTest`: a `CompletionRequested`

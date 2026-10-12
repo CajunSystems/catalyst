@@ -325,7 +325,10 @@ The original phasing rationale is in `docs/distribution.md`; **this list is the 
   since sharding is the alternative to a shared log; and `recoverOnStart`. `recoverAll()` refuses on
   a distributed runtime too. On a shared index the scan would resume work running on *other* nodes
   mid-call: their dangling `CompletionRequested` becomes in-doubt, which is terminal under
-  `InDoubtPolicy.FAIL`. Dist-3/4 lift that refusal once leases say whose work is whose.
+  `InDoubtPolicy.FAIL`. Dist-3/4 lift that refusal once leases say whose work is whose. The same
+  hazard remains on the by-id paths, which are not refused: a keyed `execute` or `resume(id)` of an
+  execution running on another node (`liveAttempt` only sees this process). Until leases exist, the
+  operator must know the execution is not running elsewhere.
   `isDistributed()` reports the mode. Tests: `DistributionGuardTest` and
   `DistributionGuardAcceptanceTest` (the file-backed log is refused and its directory released).
   `FoundationDBAcceptanceTest`'s nodes run distributed.

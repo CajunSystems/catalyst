@@ -626,7 +626,8 @@ public final class CatalystRuntime implements AutoCloseable {
     private static final String DISTRIBUTED_RECOVERY_REFUSED = "A distributed runtime cannot run the recovery"
             + " scan yet: the execution index is shared, so the scan would resume executions running on other"
             + " nodes, fencing them out and leaving their in-flight calls in doubt. Cross-node recovery needs"
-            + " leases (Dist-3/4); until then resume executions by id.";
+            + " leases (Dist-3/4); until then resume by id only executions you know are not running on"
+            + " another node (a keyed execute or resume(id) of one that is has the same effect).";
 
     /** The states a process death leaves an execution in — as opposed to ones recorded deliberately. */
     private static boolean isCrashInterrupted(Status status) {
