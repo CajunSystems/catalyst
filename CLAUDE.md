@@ -235,6 +235,21 @@ checkout's pom to `com.github.CajunSystems` before installing.
   `build()` (report via `startupRecovery()`) and **refuses** a log without an index rather than start
   a node that silently recovers nothing. Resumes use no vars (only `argsHash` is persisted).
 
+- **Graceful shutdown (Deploy-4)** — `ShutdownTest` (runtime) + `ShutdownAcceptanceTest` + `Demo shutdown`:
+  `close()` **abandons** running attempts instead of failing them. One runtime-wide `volatile closing`
+  is every attempt's abandon flag (`CancellationToken(BooleanSupplier)`), so a single write covers
+  attempts scheduled concurrently with shutdown. `ReplayingContext.requireAppendable` raises
+  `ExecutionAbandonedSignal` (after the cancel check — cancel wins) **before** a boundary records
+  anything; `runAttempt` handles it in its own branch before the retry decision and appends
+  **nothing**, so the execution stays `RUNNING` and Deploy-2 recovery resumes it. Any throwable while
+  abandoned is treated as abandon (a log closed under a late worker must not become `ExecutionFailed`).
+  **Abandon never interrupts**: interrupting mid-provider-call leaves a dangling `CompletionRequested`
+  → in-doubt on resume. The in-flight call finishes and records; the unwind happens at the next
+  boundary. So the retry backoff sleep polls the token in 50ms slices rather than relying on an
+  interrupt. `close()` refuses new work (`requireOpen`, plus `RejectedExecutionException` handling for
+  the race), waits `drainTimeout` (default 10s), then closes the log (releasing the Gumbo dir lock);
+  idempotent. `isShuttingDown()` for readiness probes.
+
 - **In-doubt model completions** — `ReplayingContextInDoubtCompletionTest`: a `CompletionRequested`
   with no `CompletionReceived` is a provider call that may have been accepted and *billed*, so it
   routes through `InDoubtPolicy` exactly as a dangling `ToolRequested` does (it previously just

@@ -648,6 +648,12 @@ public final class ReplayingContext implements Context {
         if (cancellation != null && cancellation.isCancelled()) {
             throw new CancellationSignal(cancellation.reason());
         }
+        // Shutdown: checked after cancel so a requested cancel still wins. Raised here — before the
+        // boundary records anything — so the unwind leaves no dangling request to be in doubt about.
+        if (cancellation != null && cancellation.isAbandoned()) {
+            throw new ExecutionAbandonedSignal("runtime shutting down before " + what + "; execution " + id
+                    + " is left RUNNING for the next start to resume");
+        }
     }
 
     private long append(CatalystEvent event) {
