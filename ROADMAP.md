@@ -258,7 +258,7 @@ Labels follow the build order (see *Order* below).
   and Deploy-2 resumes it on the next start. `close()` stops accepting submissions, trips abandon,
   waits up to a drain timeout, then closes the log and releases the directory lock. Exit demo: shut
   down mid-run, restart, the execution finishes with zero duplicate model calls.
-- **Deploy-5. Deployment guide + sharding** — `docs/deployment.md`: single active node on a
+- ✅ **Deploy-5. Deployment guide + sharding** — `docs/deployment.md`: single active node on a
   `ReadWriteOnce` block volume (not NFS — the directory lock is the single-writer guarantee),
   `InDoubtPolicy` and `RetryPolicy` choices for node loss, volume snapshots for DR. For scale, shard
   across independent nodes **by idempotency key**: the id is minted inside `execute()`, so a client
