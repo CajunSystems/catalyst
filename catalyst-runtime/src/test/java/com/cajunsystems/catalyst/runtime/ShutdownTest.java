@@ -279,6 +279,40 @@ class ShutdownTest {
         }
     }
 
+    /**
+     * A cancel issued while the runtime is shutting down must stay a cancel. cancel() interrupts the
+     * worker; here the interrupt surfaces as an ordinary exception inside an effect boundary, which
+     * neither cancel check catches. If shutdown abandoned it, the execution would be left RUNNING and
+     * the next start would resume and complete work the user cancelled.
+     */
+    @Test
+    void aCancelDuringShutdownIsNotUndoneByTheNextStart() throws Exception {
+        InMemoryEventLog log = new InMemoryEventLog();
+        CountDownLatch inEffect = new CountDownLatch(1);
+        Task<String> blocking = ctx -> ctx.effect("slow-io", () -> {
+            inEffect.countDown();
+            try {
+                Thread.sleep(Duration.ofMinutes(5));
+            } catch (InterruptedException e) {
+                throw new IllegalStateException("I/O interrupted", e);
+            }
+            return "never";
+        });
+        CatalystRuntime runtime = CatalystRuntime.builder()
+                .log(log).model(MockModel.alwaysReturn("x")).drainTimeout(Duration.ofSeconds(10)).build();
+        ExecutionHandle<String> handle = runtime.execute(blocking);
+        assertThat(inEffect.await(5, TimeUnit.SECONDS)).isTrue();
+
+        Thread closer = Thread.ofVirtual().start(runtime::close);
+        waitFor(runtime::isShuttingDown);
+        runtime.cancel(handle.id());
+        closer.join(10_000);
+
+        assertThatThrownBy(handle::result).isNotInstanceOf(ExecutionAbandonedSignal.class);
+        assertThat(fold(log, handle.id()).isTerminal()).as("recorded terminal, not left for recovery").isTrue();
+        assertThat(log.openExecutions()).doesNotContain(handle.id());
+    }
+
     /** Fails its effect on the first attempt only. */
     static final class FlakyTask implements Task<String> {
         private final AtomicInteger attempts;

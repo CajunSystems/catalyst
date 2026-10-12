@@ -798,7 +798,13 @@ public final class CatalystRuntime implements AutoCloseable {
                     // terminal ExecutionFailed, and recovery never resumes a terminal execution. This
                     // costs nothing even if the failure was genuine: nothing past the last recorded
                     // boundary was kept, so the next start re-runs it and meets the failure again.
-                    if (runningAttempt.token.isAbandoned()) {
+                    //
+                    // Not if a cancel is pending, though: cancel() interrupts, and an interrupt that
+                    // surfaces as an ordinary exception inside a boundary matches neither check above.
+                    // Abandoning it would leave the execution RUNNING for the next start to resume and
+                    // complete — undoing the cancel. Falling through gives it exactly the handling it
+                    // gets outside a shutdown (a terminal record), so cancel still wins.
+                    if (runningAttempt.token.isAbandoned() && !runningAttempt.token.isCancelled()) {
                         abandon(id, future);
                         return;
                     }
