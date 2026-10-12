@@ -128,6 +128,14 @@ checkout's pom to `com.github.CajunSystems` before installing.
   runtime (`isRetryable`: excludes `NonDeterministicReplayException`, `InDoubtException`,
   `InterruptedException`, `Error`) before the policy is consulted. Whole-task, not per-tool. A retried
   log still replays exactly.
+  **A recorded tool failure is a fact, never in doubt, even at the log tail.** A crash between
+  `ToolCompleted(error)` and the retry decision leaves it last. `call()` substitutes it as
+  `RecordedToolFailureException` and **attributes it to its seq** (`lastToolFailureSeq`, exactly as
+  `runToolLive` does for a live failure). So a retry names that boundary and the next attempt runs
+  the tool live, and a task that handled the failure (an agent) carries on identically. This
+  replaced an older rule that routed a tail failure through `InDoubtPolicy`, which was a workaround
+  for unattributed substituted failures (`RetryRequested(-1)` burning the budget). It made an agent
+  that crashed right after a tool failure end FAILED under the default policy.
 - **v0.2 Auto-capture** — `AutoCaptureAcceptanceTest` + `Demo autocapture`: a task containing plain
   `Instant.now()` / `UUID.randomUUID()` / `Random` calls and **no** `ctx.effect` is recorded and
   replayed exactly, because `catalyst-agent` rewrote those call sites into `AutoCapture` calls that

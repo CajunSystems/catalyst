@@ -146,7 +146,7 @@ class AgentTest {
 
     static final class SwappableTask implements Task<String> {
         @Override public String execute(Context ctx) {
-            return CURRENT.get().run(ctx, ctx.effect("ticket", () -> "T-1")).answer();
+            return CURRENT.get().run(ctx, ctx.effect("ticket", () -> "input")).answer();
         }
     }
 
@@ -190,6 +190,50 @@ class AgentTest {
         assertThat(survivorModel.calls).as("turns 2 and 3 only").hasValue(2);
         assertThat(lookup.calls).as("the lookup is not repeated").hasValue(1);
         assertThat(pager.calls).hasValue(1);
+    }
+
+    /**
+     * The node dies right after a tool failed, so the recorded failure is the last event. That is a
+     * fact the agent already handled, not a doubt: the resumed run hands the model the same error and
+     * carries on. Before, the trailing failure was routed through InDoubtPolicy, and the default FAIL
+     * ended the agent FAILED.
+     */
+    @Test
+    void aCrashRightAfterAToolFailureResumesAndTheAgentCarriesOn() {
+        EventLog log = EventLogs.inMemory();
+        PolicyModel first = new PolicyModel();
+        first.ticket = "DOWN";
+        CatalystRuntime dying = CatalystRuntime.builder().log(log).model(first)
+                .drainTimeout(java.time.Duration.ofSeconds(5)).build();
+        Tool<TicketQuery, Ticket> failThenDie = new Tool<>() {
+            @Override public String name() { return "lookup"; }
+            @Override public Class<TicketQuery> inputType() { return TicketQuery.class; }
+            @Override public Ticket apply(TicketQuery q) {
+                new Thread(dying::close).start();
+                while (!dying.isShuttingDown()) Thread.onSpinWait();
+                return lookup.apply(q); // throws: the failure is recorded, then the next turn abandons
+            }
+        };
+        // The same agent definition as the survivor's (instructions, tool names, schemas), as two nodes
+        // running one service would have; only the lookup's behaviour differs.
+        CURRENT.set(Agent.builder().instructions("You triage support tickets.")
+                .tool(failThenDie, "Look up a ticket by its id").tool(pager, "Page a team's on-call engineer").maxSteps(5).build());
+        var crashed = dying.execute(new SwappableTask(), ExecutionOptions.none());
+        assertThatThrownBy(crashed::result).hasMessageContaining("shut down");
+        List<com.cajunsystems.catalyst.events.SequencedEvent> events = log.read(crashed.id());
+        assertThat(events.get(events.size() - 1).event())
+                .as("the recorded failure is the last event").isInstanceOfSatisfying(
+                        com.cajunsystems.catalyst.events.CatalystEvent.ToolCompleted.class, tc -> assertThat(tc.error()).isNotNull());
+
+        CURRENT.set(agent);
+        PolicyModel survivorModel = new PolicyModel();
+        survivorModel.ticket = "DOWN";
+        try (CatalystRuntime survivor = CatalystRuntime.builder().log(log).model(survivorModel)
+                .task(SwappableTask.class, SwappableTask::new).build()) {
+            assertThat(survivor.resume(crashed.id()).result())
+                    .isEqualTo("done: error: java.lang.IllegalStateException: ticketing system unavailable");
+        }
+        assertThat(lookup.calls).as("the failed lookup is not re-run").hasValue(1);
     }
 
     /**

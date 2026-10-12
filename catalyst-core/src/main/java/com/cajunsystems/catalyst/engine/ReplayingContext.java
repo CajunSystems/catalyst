@@ -198,7 +198,6 @@ public final class ReplayingContext implements Context {
                 retriedFailures.add(rr.failedSeq());
             }
         }
-        long lastRecordedSeq = recorded.isEmpty() ? -1 : recorded.get(recorded.size() - 1).seq();
 
         String pendingRequestHash = null;
         CompletionRequested pendingCompletionRequest = null; // unmatched (in-doubt) if non-null at end
@@ -241,19 +240,13 @@ public final class ReplayingContext implements Context {
                         pendingToolRequest = null;
                         pendingToolRequestSeq = -1;
                         pendingToolInputHash = null;
-                    } else if (tc.error() != null && se.seq() == lastRecordedSeq && pendingToolRequest != null) {
-                        // An errored tool at the very tail with no RetryRequested naming it: the process
-                        // crashed between recording the failure and deciding whether to retry. Its side
-                        // effect is in-doubt on resume — route recovery through InDoubtPolicy (which may
-                        // re-run it) exactly as for a tool with no recorded completion, rather than
-                        // replaying the recorded failure (which would burn the retry budget on a boundary
-                        // that can never succeed by substitution).
-                        this.danglingTool = pendingToolRequest;
-                        this.danglingToolSeq = pendingToolRequestSeq;
-                        pendingToolRequest = null;
-                        pendingToolRequestSeq = -1;
-                        pendingToolInputHash = null;
                     } else {
+                        // A recorded failure is a fact, not a doubt: the tool ran and threw. That holds
+                        // even at the very tail, where a crash cut off the retry-or-fail decision. It is
+                        // substituted like any result: a task that handles failures (an agent feeding it
+                        // to the model) continues exactly as it did live, and one that does not throws it
+                        // again, so the interrupted decision is made now. A retry of it names its seq
+                        // (call() attributes substituted failures), which drops it here next attempt.
                         String name = pendingToolRequest != null ? pendingToolRequest.toolName() : null;
                         boundaries.add(new Boundary(se.seq(), e, name, pendingToolInputHash));
                         pendingToolRequest = null;
@@ -470,7 +463,13 @@ public final class ReplayingContext implements Context {
                 }
                 ToolCompleted tc = (ToolCompleted) b.event();
                 if (tc.error() != null) {
-                    throw new RecordedToolFailureException(tool.name(), tc.error());
+                    // Attributed to its recorded boundary, exactly as a live failure is (runToolLive), so a
+                    // retry of it names this seq. The next attempt then drops the recorded failure and
+                    // re-runs the tool live, instead of substituting the same failure every attempt.
+                    RecordedToolFailureException failure = new RecordedToolFailureException(tool.name(), tc.error());
+                    lastToolFailureSeq = b.seq();
+                    lastToolFailureException = failure;
+                    throw failure;
                 }
                 if (isDeterministic(tool)) {
                     return applyUnchecked(tool, input); // re-execute rather than deserialize (spec §4)

@@ -23,6 +23,7 @@ import java.util.concurrent.atomic.AtomicInteger;
 
 import static org.assertj.core.api.Assertions.assertThat;
 import static org.assertj.core.api.Assertions.assertThatThrownBy;
+import static org.assertj.core.api.Assertions.catchThrowable;
 
 /**
  * Seeding behaviour for retry-as-attempt: a {@code RetryRequested} declines to substitute the failed
@@ -88,19 +89,23 @@ class ReplayingContextRetrySeedTest {
     }
 
     @Test
-    void aTrailingErroredToolWithNoRetryIsInDoubtNotSubstituted() {
+    void aTrailingErroredToolIsSubstitutedAndAttributedToItsBoundary() {
         // A crash between recording the tool failure and deciding whether to retry leaves the errored
-        // ToolCompleted as the last event, with no RetryRequested naming it. Its side effect is in-doubt:
-        // it must route through InDoubtPolicy (FAIL here) rather than replay the recorded failure — which
-        // would otherwise burn the retry budget on a boundary that can never succeed by substitution.
+        // ToolCompleted as the last event. It is a recorded fact, not a doubt: the tool ran and threw.
+        // It is substituted (the tool is not re-run, and a task that handles failures continues as it
+        // did live) and attributed to its seq, so a retry of it re-runs the tool live next attempt
+        // rather than substituting the same failure every attempt.
         List<SequencedEvent> recorded = seq(
                 new ToolRequested(T, "flaky", new TextNode("in")),
                 new ToolCompleted(T, null, "boom", 1));
 
         CountingTool tool = new CountingTool();
-        assertThatThrownBy(() -> newContext(recorded).call(tool, "in"))
-                .isInstanceOf(InDoubtException.class);
-        assertThat(tool.invocations).as("in-doubt under FAIL — tool not re-run").hasValue(0);
+        ReplayingContext ctx = newContext(recorded);
+        Throwable thrown = catchThrowable(() -> ctx.call(tool, "in"));
+        assertThat(thrown).isInstanceOfSatisfying(RecordedToolFailureException.class,
+                e -> assertThat(e.recordedError()).isEqualTo("boom"));
+        assertThat(tool.invocations).as("substituted, not re-run").hasValue(0);
+        assertThat(ctx.failedBoundarySeq(thrown)).as("attributed to the recorded boundary").isEqualTo(1);
     }
 
     private ReplayingContext newContext(List<SequencedEvent> recorded) {
