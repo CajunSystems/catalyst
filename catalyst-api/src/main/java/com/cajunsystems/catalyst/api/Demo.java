@@ -102,6 +102,8 @@ public final class Demo {
             Runtime.getRuntime().halt(137);
         } else if (args.length >= 2 && args[1].equals("recover")) {
             recoverDemo(Path.of(args[0]));
+        } else if (args.length >= 1 && args[0].equals("shutdown")) {
+            shutdownDemo(Files.createTempDirectory("catalyst-shutdown-"));
         } else if (args.length >= 1 && args[0].equals("recover")) {
             Path dir = Files.createTempDirectory("catalyst-recover-");
             crashMany(dir);
@@ -708,6 +710,61 @@ public final class Demo {
             if (report.notRecovered().size() != 1) throw new AssertionError("expected 1 not recovered, got " + report);
             System.out.println("[recover] startup-recovery criterion holds: in-flight work finished with zero"
                     + " duplicate model calls; the paused execution stayed paused.");
+        }
+    }
+
+    /**
+     * Deploy-4: graceful shutdown. A runtime is closed while its task is inside step 1's model call.
+     * The call is allowed to finish and record; the task unwinds at step 2's boundary having appended
+     * nothing, so the execution is left {@code RUNNING} rather than {@code FAILED}. A new runtime on
+     * the same directory — which opens only because {@code close()} released the directory lock —
+     * resumes it with {@code recoverOnStart}, making one model call: step 2.
+     */
+    private static void shutdownDemo(Path dir) throws Exception {
+        java.util.concurrent.atomic.AtomicReference<CatalystRuntime> current = new java.util.concurrent.atomic.AtomicReference<>();
+        java.util.concurrent.CountDownLatch inStep1 = new java.util.concurrent.CountDownLatch(1);
+        MockModel slow = MockModel.builder().respond(req -> {
+            boolean step1 = req.prompt().messages().stream().anyMatch(m -> m.content().contains("summarize"));
+            if (step1) {
+                inStep1.countDown();
+                while (!current.get().isShuttingDown()) Thread.onSpinWait(); // a call still in flight at shutdown
+            }
+            return new Completion(step1 ? "SUMMARY" : "FINAL", java.util.List.of(),
+                    new com.cajunsystems.catalyst.model.Usage(1, 1), "stop");
+        }).build();
+
+        ExecutionId id;
+        CatalystRuntime first = Catalyst.builder(dir).model(slow).build();
+        current.set(first);
+        ExecutionHandle<String> handle = first.execute(new TwoStepTask());
+        id = handle.id();
+        if (!inStep1.await(10, java.util.concurrent.TimeUnit.SECONDS)) throw new AssertionError("task never reached step 1");
+        System.out.println("[shutdown] closing the runtime while " + id.value() + " is inside step 1's model call...");
+        first.close();
+        try {
+            handle.result();
+            throw new AssertionError("expected the attempt to be abandoned");
+        } catch (com.cajunsystems.catalyst.engine.ExecutionAbandonedSignal expected) {
+            System.out.println("[shutdown] attempt abandoned: " + expected.getMessage());
+        }
+
+        MockModel model = summarizerModel();
+        try (CatalystRuntime restarted = Catalyst.builder(dir)
+                .model(model)
+                .task(new TwoStepTask())
+                .recoverOnStart(true)
+                .build()) {
+            var report = restarted.startupRecovery().orElseThrow();
+            if (!report.resumed().containsKey(id)) throw new AssertionError("not resumed: " + report);
+            Object result = report.resumed().get(id).result();
+            System.out.println("[shutdown] restarted and resumed " + id.value() + " -> "
+                    + restarted.inspect(id).status() + " result: " + result);
+            System.out.println("[shutdown] model calls THIS run: " + model.callCount()
+                    + " (step 1 finished before shutdown and was substituted; only step 2 ran live)");
+            if (!"SUMMARY|FINAL".equals(result)) throw new AssertionError("unexpected result " + result);
+            if (model.callCount() != 1) throw new AssertionError("expected 1 model call, got " + model.callCount());
+            System.out.println("[shutdown] graceful-shutdown criterion holds: abandoned, not failed;"
+                    + " resumed on restart with zero duplicate model calls.");
         }
     }
 

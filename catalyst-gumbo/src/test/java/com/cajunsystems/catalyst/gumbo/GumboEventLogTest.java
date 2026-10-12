@@ -574,6 +574,31 @@ class GumboEventLogTest {
             future[0] = (byte) (GumboEventLog.OPEN_SET_FORMAT + 1);
             log.service().getView(QUEUE).setValue(GumboEventLog.OPEN_SET_KEY, future).join();
             assertThat(log.openExecutions()).as("an unknown format is refolded").containsExactly(b);
+
+            // Well-formed, CRC-valid, but holding a blank id: ExecutionId.of throws
+            // IllegalArgumentException, not IOException. Must refold, not fail every scan forever.
+            java.io.ByteArrayOutputStream blank = new java.io.ByteArrayOutputStream();
+            try (java.io.DataOutputStream out = new java.io.DataOutputStream(blank)) {
+                out.writeByte(GumboEventLog.OPEN_SET_FORMAT);
+                out.writeLong(1L);
+                out.writeInt(1);
+                out.writeUTF("");
+                out.flush();
+                java.util.zip.CRC32 crc = new java.util.zip.CRC32();
+                crc.update(blank.toByteArray());
+                out.writeLong(crc.getValue());
+            } catch (java.io.IOException e) {
+                throw new java.io.UncheckedIOException(e);
+            }
+            log.service().getView(QUEUE).setValue(GumboEventLog.OPEN_SET_KEY, blank.toByteArray()).join();
+            assertThat(log.openExecutions()).as("an invalid id is refolded, not thrown").containsExactly(b);
+
+            // Corruption that still parses: a flipped bit in `through` would silently skip the tail.
+            // The CRC catches it and the scan refolds.
+            byte[] flipped = checkpoint(0L, a, b);
+            flipped[1 + Long.BYTES - 1] ^= 0x7F;
+            log.service().getView(QUEUE).setValue(GumboEventLog.OPEN_SET_KEY, flipped).join();
+            assertThat(log.openExecutions()).as("a CRC mismatch is refolded").containsExactly(b);
         }
     }
 
@@ -619,6 +644,10 @@ class GumboEventLogTest {
             out.writeLong(through);
             out.writeInt(open.length);
             for (ExecutionId id : open) out.writeUTF(id.value());
+            out.flush();
+            java.util.zip.CRC32 crc = new java.util.zip.CRC32();
+            crc.update(bytes.toByteArray());
+            out.writeLong(crc.getValue());
         } catch (java.io.IOException e) {
             throw new java.io.UncheckedIOException(e);
         }

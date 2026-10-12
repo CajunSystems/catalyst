@@ -13,6 +13,7 @@ import com.cajunsystems.catalyst.engine.BranchSpec;
 import com.cajunsystems.catalyst.engine.CancellationSignal;
 import com.cajunsystems.catalyst.engine.CancellationToken;
 import com.cajunsystems.catalyst.engine.CostModel;
+import com.cajunsystems.catalyst.engine.ExecutionAbandonedSignal;
 import com.cajunsystems.catalyst.engine.ExecutionFailedException;
 import com.cajunsystems.catalyst.engine.ExecutionPausedSignal;
 import com.cajunsystems.catalyst.engine.ExecutionState;
@@ -54,8 +55,12 @@ import java.util.Optional;
 import java.util.concurrent.CancellationException;
 import java.util.concurrent.CompletableFuture;
 import java.util.concurrent.ConcurrentHashMap;
+import java.util.concurrent.CountDownLatch;
 import java.util.concurrent.ExecutorService;
 import java.util.concurrent.Executors;
+import java.util.concurrent.RejectedExecutionException;
+import java.util.concurrent.TimeUnit;
+import java.util.concurrent.atomic.AtomicBoolean;
 
 /**
  * The Catalyst runtime: owns scheduling (virtual threads), event persistence, resume and lifecycle
@@ -66,6 +71,11 @@ import java.util.concurrent.Executors;
 public final class CatalystRuntime implements AutoCloseable {
 
     private static final Logger LOG = LoggerFactory.getLogger(CatalystRuntime.class);
+    private static final Duration DEFAULT_DRAIN_TIMEOUT = Duration.ofSeconds(10);
+    /** How often a retry backoff checks whether it was cancelled or abandoned. */
+    private static final long BACKOFF_POLL_MILLIS = 50;
+    /** How many still-running ids a drain-timeout warning names before summarising the rest. */
+    private static final int DRAIN_WARNING_SAMPLE = 10;
 
     private final EventLog log;
     private final Model defaultModel;
@@ -82,6 +92,17 @@ public final class CatalystRuntime implements AutoCloseable {
     private final ExecutorService executor;
     /** Set once by {@code build()} when {@code recoverOnStart} is on, before the runtime is handed out. */
     private RecoveryReport startupRecovery;
+    private final Duration drainTimeout;
+
+    /**
+     * True once {@link #close()} has begun. Every attempt's token reads it as its abandon flag, so this
+     * one write unwinds all running attempts at their next live boundary — and any attempt scheduled
+     * concurrently with the shutdown, which a per-attempt trip could miss. New submissions are refused.
+     */
+    private volatile boolean closing;
+    private final AtomicBoolean closed = new AtomicBoolean();
+    /** Released when the first close() finishes, so a concurrent close() returns only once the log is closed. */
+    private final CountDownLatch closeFinished = new CountDownLatch(1);
 
     /**
      * Attempts currently running in this process, keyed by execution. Guards against scheduling a
@@ -125,8 +146,8 @@ public final class CatalystRuntime implements AutoCloseable {
     private final KeyedLock<String> byIdempotencyKey = new KeyedLock<>();
 
     /** A running attempt's cancellation token plus its worker thread (set once the worker starts). */
-    private static final class RunningAttempt {
-        final CancellationToken token = new CancellationToken();
+    private final class RunningAttempt {
+        final CancellationToken token = new CancellationToken(() -> closing);
         volatile Thread thread;
     }
 
@@ -145,6 +166,7 @@ public final class CatalystRuntime implements AutoCloseable {
         this.nodeId = b.nodeId;
         this.snapshotInterval = b.snapshotInterval;
         this.registry = b.registry;
+        this.drainTimeout = b.drainTimeout;
         this.executor = Executors.newThreadPerTaskExecutor(
                 Thread.ofVirtual().name("catalyst-exec-", 0).factory());
     }
@@ -157,14 +179,20 @@ public final class CatalystRuntime implements AutoCloseable {
 
     /** Starts a new execution, or attaches/resumes an existing one when an idempotency key matches. */
     public <R> ExecutionHandle<R> execute(Task<R> task, ExecutionOptions opts) {
+        requireOpen();
         String taskType = task.getClass().getName();
         Optional<String> key = opts.idempotencyKey();
 
-        // No key → a fresh random id nobody else can name yet, so only the id lock is needed.
+        // No key → a fresh random id no caller can name yet, so only the id lock is needed. Creation
+        // happens UNDER it, not before: ExecutionCreated puts the id in the execution index, and a
+        // concurrent recoverAll() that saw it there — open, STARTING, nothing in flight — would resume
+        // it and leave this FRESH attempt as a second writer on the same stream.
         if (key.isEmpty()) {
             ExecutionId id = ExecutionId.random();
-            createExecution(id, taskType, "", opts);
-            return byExecution.withLock(id, () -> scheduleAttempt(task, id, taskType, opts, Mode.FRESH));
+            return byExecution.withLock(id, () -> {
+                createExecution(id, taskType, "", opts);
+                return scheduleAttempt(task, id, taskType, opts, Mode.FRESH);
+            });
         }
 
         // Keyed: hold the key lock across the whole decision — resolving the key, creating the
@@ -176,8 +204,11 @@ public final class CatalystRuntime implements AutoCloseable {
             if (existing.isEmpty()) {
                 ExecutionId id = ExecutionId.random();
                 log.putKey(key.get(), id);
-                createExecution(id, taskType, key.get(), opts);
-                return byExecution.withLock(id, () -> scheduleAttempt(task, id, taskType, opts, Mode.FRESH));
+                // Created under the id lock for the same reason as the keyless path above.
+                return byExecution.withLock(id, () -> {
+                    createExecution(id, taskType, key.get(), opts);
+                    return scheduleAttempt(task, id, taskType, opts, Mode.FRESH);
+                });
             }
             ExecutionId id = existing.get();
             return byExecution.withLock(id, () -> {
@@ -201,6 +232,13 @@ public final class CatalystRuntime implements AutoCloseable {
      */
     private <R> ExecutionHandle<R> scheduleAttempt(Task<R> task, ExecutionId id, String taskType,
                                                    ExecutionOptions opts, Mode mode) {
+        // Callers checked requireOpen() before writing anything; close() can still land between that
+        // check and here, by which point execute() may have recorded ExecutionCreated. Return a failed
+        // handle — the same result as the RejectedExecutionException race below — rather than throw
+        // for an execution that now exists in the log and will be recovered on the next start.
+        if (closing) {
+            return new FutureExecutionHandle<>(id, CompletableFuture.failedFuture(notStartedHere(id, null)));
+        }
         CompletableFuture<R> future = new CompletableFuture<>();
         RunningAttempt attempt = new RunningAttempt();
         inFlight.put(id, future);
@@ -209,8 +247,32 @@ public final class CatalystRuntime implements AutoCloseable {
             inFlight.remove(id, future);
             running.remove(id, attempt);
         });
-        executor.execute(() -> runAttempt(task, id, taskType, opts, mode, future, attempt));
+        try {
+            executor.execute(() -> runAttempt(task, id, taskType, opts, mode, future, attempt));
+        } catch (RejectedExecutionException e) {
+            // Lost a race with close(): the executor stopped between requireOpen and here. Nothing ran
+            // and nothing was appended for this attempt, so the execution is as recoverable as any
+            // other open one — the next start resumes it.
+            future.completeExceptionally(notStartedHere(id, e));
+        }
         return new FutureExecutionHandle<>(id, future);
+    }
+
+    private static IllegalStateException notStartedHere(ExecutionId id, Throwable cause) {
+        return new IllegalStateException("Runtime is shutting down; " + id + " was not started here and"
+                + " will be resumed on the next start if its task type is registered", cause);
+    }
+
+    private void requireOpen() {
+        if (closing) throw new IllegalStateException("Runtime is shutting down; not accepting new work");
+    }
+
+    /**
+     * Whether {@link #close()} has begun: new work is refused, and running attempts unwind at their
+     * next boundary. A readiness probe can report not-ready from this.
+     */
+    public boolean isShuttingDown() {
+        return closing;
     }
 
     @SuppressWarnings("unchecked")
@@ -375,6 +437,7 @@ public final class CatalystRuntime implements AutoCloseable {
      *                                  its recorded task type (a terminal execution needs no registration)
      */
     public ExecutionHandle<?> resume(ExecutionId id, ExecutionOptions opts) {
+        requireOpen();
         return byExecution.withLock(id, () -> {
             // Already running here → attach to the in-flight attempt rather than scheduling a duplicate
             // that would interleave events and corrupt the stream (same guard as execute()).
@@ -412,9 +475,10 @@ public final class CatalystRuntime implements AutoCloseable {
      * and resumes it via {@link #resume(ExecutionId)} only if its status is one a crash leaves behind:
      * {@code NEW}, {@code STARTING}, {@code RUNNING} or {@code RESUMING}.
      *
-     * <p>{@code PAUSED} and {@code WAITING} are left alone. Both are recorded on purpose — by
-     * {@link #pause(ExecutionId)}, or by {@code InDoubtPolicy.ASK} holding an execution for a verdict
-     * — and a restart must not undo what an operator or a pending decision is holding. They stay
+     * <p>{@code PAUSED} is left alone: it is recorded on purpose — by {@link #pause(ExecutionId)}, or
+     * by {@code InDoubtPolicy.ASK} holding an execution for a verdict — and a restart must not undo
+     * what an operator or a pending decision is holding. {@code WAITING} (reserved for signals) will
+     * be left alone for the same reason. They stay
      * resumable by id. An execution already running in this process is left alone too, so calling
      * this on a live runtime never schedules a second attempt.
      *
@@ -671,6 +735,12 @@ public final class CatalystRuntime implements AutoCloseable {
                     recorded = log.read(id);
                     state = Reducer.fold(id, recorded);
                 }
+                // Shutting down before this attempt began: don't record a start for work this
+                // process will not do. The execution stays as it is for the next start.
+                if (runningAttempt.token.isAbandoned()) {
+                    abandon(id, future);
+                    return;
+                }
                 int attempt = state.attempt() + 1;
                 if (firstIteration && mode == Mode.FRESH) {
                     log.append(id, new CatalystEvent.ExecutionStarted(now(), attempt, nodeId));
@@ -692,6 +762,21 @@ public final class CatalystRuntime implements AutoCloseable {
                 // auto-capture counter restarts in step with the recorded prefix it replays.
                 try (AutoCapture.Scope captured = AutoCapture.bind(ctx)) {
                     R result = task.execute(ctx);
+                    // A task can swallow a stop signal (catch (RuntimeException) around a boundary) and
+                    // return normally. That return is not a completion: the result came from the stop,
+                    // and the boundary that raised it was never recorded. Honour the stop instead. A
+                    // task that genuinely finishes without reaching another boundary raised nothing,
+                    // and still records its completion.
+                    // The same stop rule as the failure path below: a stopped attempt with a cancel
+                    // pending is a cancel, whichever signal stopped it and in whatever order they came.
+                    if (ctx.raisedCancellation() || (ctx.raisedAbandon() && runningAttempt.token.isCancelled())) {
+                        recordCancelled(id, runningAttempt.token.reason(), future);
+                        return;
+                    }
+                    if (ctx.raisedAbandon()) {
+                        abandon(id, future);
+                        return;
+                    }
                     log.append(id, new CatalystEvent.ExecutionCompleted(now(), payloads.toTree(result)));
                     future.complete(result);
                     return;
@@ -700,12 +785,33 @@ public final class CatalystRuntime implements AutoCloseable {
                     future.completeExceptionally(pause);
                     return;
                 } catch (Throwable t) {
-                    // A cancelled attempt folds to CANCELLED only via the cooperative unwind itself: the
-                    // CancellationSignal the context raises at the next live boundary once the token trips
-                    // (the task acknowledging cancellation). The interrupt() cancel() raises is only a
-                    // best-effort nudge to reach that boundary; it never reclassifies a failure.
-                    if (t instanceof CancellationSignal) {
+                    // The stop rule — one decision for every ordering of cancel and shutdown:
+                    //   1. stopped by a signal (raised here, or unwound by one) with a cancel pending
+                    //      → record CANCELLED. Cancel wins, whichever signal actually stopped the task:
+                    //      a cancel that arrives after the abandon signal (the task swallowed it and was
+                    //      still running its fallback) must not be undone by the next start's recovery.
+                    //   2. otherwise stopped by the abandon signal → abandon: append nothing. That signal
+                    //      is raised before a boundary records anything, so no request is left in doubt.
+                    //   3. otherwise → the normal retry/fail decision below.
+                    // "Stopped" is checked, not merely "token tripped". A cancel's interrupt that
+                    // surfaces as an ordinary exception inside a boundary stopped nothing cooperatively;
+                    // it gets the handling it always had (an interrupt never reclassifies a failure),
+                    // which is terminal, so recovery cannot resume it either. And a GENUINE failure
+                    // during the drain also falls to (3) — essential for model calls: the boundary
+                    // records CompletionRequested before calling the provider, and only the
+                    // RetryRequested or ExecutionFailed written below closes that request as a verdict.
+                    // Abandoned instead, the restart would see it in doubt and, under
+                    // InDoubtPolicy.FAIL, fail terminally over a known, unbilled failure. A retryable
+                    // one writes its RetryRequested and is then abandoned instead of sleeping (the
+                    // backoff wakes on shutdown), so the retry runs on the next start.
+                    boolean stoppedByCancel = t instanceof CancellationSignal || ctx.raisedCancellation();
+                    boolean stoppedByAbandon = t instanceof ExecutionAbandonedSignal || ctx.raisedAbandon();
+                    if (stoppedByCancel || (stoppedByAbandon && runningAttempt.token.isCancelled())) {
                         recordCancelled(id, runningAttempt.token.reason(), future);
+                        return;
+                    }
+                    if (stoppedByAbandon) {
+                        abandon(id, future);
                         return;
                     }
                     // Decide retry vs. terminal failure. isRetryable gates out failures a retry can never
@@ -730,8 +836,14 @@ public final class CatalystRuntime implements AutoCloseable {
                         recordFailed(id, t, future);
                         return;
                     }
-                    if (!sleepUnlessCancelled(backoffMillis, runningAttempt.token)) {
-                        recordCancelled(id, runningAttempt.token.reason(), future);
+                    if (!sleepUnlessStopped(backoffMillis, runningAttempt.token)) {
+                        // RetryRequested is already durable, so an abandoned backoff resumes — with its
+                        // retry budget intact — on the next start.
+                        if (runningAttempt.token.isCancelled()) {
+                            recordCancelled(id, runningAttempt.token.reason(), future);
+                        } else {
+                            abandon(id, future);
+                        }
                         return;
                     }
                     // Clear any stray interrupt so it cannot leak a spurious InterruptedException into the
@@ -783,6 +895,15 @@ public final class CatalystRuntime implements AutoCloseable {
         future.completeExceptionally(t);
     }
 
+    /**
+     * The shutdown unwind: completes the handle and appends <strong>nothing</strong>, leaving the
+     * execution non-terminal in the log for the next start's recovery scan.
+     */
+    private <R> void abandon(ExecutionId id, CompletableFuture<R> future) {
+        future.completeExceptionally(new ExecutionAbandonedSignal(
+                "Runtime shut down; " + id + " is left for the next start to resume"));
+    }
+
     /** Best-effort {@code ExecutionCancelled} append (terminal), then completes with CancellationException. */
     private <R> void recordCancelled(ExecutionId id, String reason, CompletableFuture<R> future) {
         try {
@@ -799,15 +920,22 @@ public final class CatalystRuntime implements AutoCloseable {
      * interrupts the worker), not via the interrupt flag. A spurious interrupt with no cancel is treated
      * as "keep going"; the caller then clears the flag so it cannot leak into the next attempt.
      */
-    private boolean sleepUnlessCancelled(long millis, CancellationToken token) {
-        if (token.isCancelled()) return false;
-        try {
-            if (millis > 0) Thread.sleep(millis);
-        } catch (InterruptedException e) {
-            // fall through: the token is the source of truth for whether this was a cancel
+    private boolean sleepUnlessStopped(long millis, CancellationToken token) {
+        // Sliced so a shutdown wakes it too: abandon does not interrupt (an interrupt mid-boundary
+        // would leave the boundary in doubt), so the sleep has to look for it.
+        long deadline = System.nanoTime() + TimeUnit.MILLISECONDS.toNanos(Math.max(0, millis));
+        while (!token.isCancelled() && !token.isAbandoned()) {
+            long remaining = TimeUnit.NANOSECONDS.toMillis(deadline - System.nanoTime());
+            if (remaining <= 0) return true;
+            try {
+                Thread.sleep(Math.min(remaining, BACKOFF_POLL_MILLIS));
+            } catch (InterruptedException e) {
+                // fall through: the token is the source of truth for whether this was a cancel
+            }
         }
-        return !token.isCancelled();
+        return false;
     }
+
 
     /** Completes a handle from an already-terminal execution's recorded outcome, without re-running. */
     @SuppressWarnings("unchecked")
@@ -825,10 +953,100 @@ public final class CatalystRuntime implements AutoCloseable {
         return clock.instant();
     }
 
+    /**
+     * Shuts down without turning in-flight work into failures. New submissions are refused, every
+     * running attempt is told to abandon, and the runtime waits up to the drain timeout
+     * ({@link Builder#drainTimeout}) for them to unwind before closing the log — which releases a
+     * file log's directory lock for the next process.
+     *
+     * <p>Abandoning is not interrupting. A worker inside a model or tool call is allowed to finish it
+     * and record the result; it unwinds at its <em>next</em> boundary, before recording anything,
+     * appending nothing on the way out. The execution therefore stays {@code RUNNING} with a clean
+     * tail, and a restart with {@code recoverOnStart} resumes it with zero duplicate calls.
+     * (Interrupting instead would cut a provider call off after its request was recorded, leaving
+     * a boundary that is in doubt on resume.)
+     *
+     * <p>A worker still busy when the drain timeout expires — a call slower than the timeout, or task
+     * code that reaches no boundary — has the log closed under it. Its late writes fail and are
+     * discarded; what it leaves behind is what a {@code kill -9} at that moment would, which recovery
+     * already handles (a call in flight is governed by {@code InDoubtPolicy}). Size the timeout
+     * above your slowest boundary.
+     *
+     * <p>Two consequences worth knowing. "The next start resumes it" assumes the task type is
+     * registered there (as for any {@link #resume(ExecutionId)}); an unregistered one is reported in
+     * {@link RecoveryReport#notRecovered()}. And only what the shutdown itself unwound is abandoned:
+     * a call that fails for a genuine reason during the drain is recorded exactly as it would be
+     * outside a shutdown — a {@code RetryRequested} if the retry policy allows (the retry then runs on
+     * the next start), otherwise {@code ExecutionFailed} — so a failed model call is never left as an
+     * in-doubt request.
+     *
+     * <p>Idempotent, and a barrier: a concurrent second call returns only once the first has closed
+     * the log. Called from one of this runtime's own task threads, it cannot wait — the drain includes
+     * the caller, which would be waiting on itself — so it hands the drain and the log close to
+     * another thread and returns. Every attempt, the caller included, still gets the full drain: the
+     * log is not closed under a task that is mid-call, which would leave its request in doubt.
+     */
     @Override
     public void close() {
-        executor.close();
-        log.close();
+        if (!closed.compareAndSet(false, true)) {
+            awaitFirstClose();
+            return;
+        }
+        closing = true;
+        executor.shutdown();
+        if (calledFromTaskThread()) {
+            Thread.ofVirtual().name("catalyst-close").start(this::drainAndCloseLog);
+            return;
+        }
+        drainAndCloseLog();
+    }
+
+    /** Waits up to the drain timeout for running attempts, then closes the log and releases waiters. */
+    private void drainAndCloseLog() {
+        try {
+            if (!awaitDrain()) {
+                List<String> sample = running.keySet().stream()
+                        .limit(DRAIN_WARNING_SAMPLE).map(ExecutionId::value).toList();
+                LOG.warn("Shutdown drain timed out after {} with {} attempt(s) still running (e.g. {}); closing"
+                        + " the log under them — they will be recovered on the next start",
+                        drainTimeout, running.size(), sample);
+            }
+            log.close();
+        } finally {
+            closeFinished.countDown();
+        }
+    }
+
+    /** Tears down a runtime whose {@code build()} failed after construction. */
+    private void abortStartup(boolean closeLog) {
+        closed.set(true);
+        closing = true;
+        executor.shutdown();
+        closeFinished.countDown();
+        if (closeLog) log.close();
+    }
+
+    private boolean awaitDrain() {
+        try {
+            return executor.awaitTermination(drainTimeout.toMillis(), TimeUnit.MILLISECONDS);
+        } catch (InterruptedException e) {
+            Thread.currentThread().interrupt();
+            return false;
+        }
+    }
+
+    private void awaitFirstClose() {
+        if (calledFromTaskThread()) return; // the first close() may be waiting on this very thread
+        try {
+            closeFinished.await();
+        } catch (InterruptedException e) {
+            Thread.currentThread().interrupt();
+        }
+    }
+
+    private boolean calledFromTaskThread() {
+        Thread current = Thread.currentThread();
+        return running.values().stream().anyMatch(a -> a.thread == current);
     }
 
     // ── Builder ──────────────────────────────────────────────────────────────
@@ -849,6 +1067,7 @@ public final class CatalystRuntime implements AutoCloseable {
         private EventLogFactory logFactory;
         private BlobStore blobStore;
         private int blobThresholdBytes = EventCodec.DEFAULT_BLOB_THRESHOLD_BYTES;
+        private Duration drainTimeout = DEFAULT_DRAIN_TIMEOUT;
 
         /** Uses a log the caller already built. Exclusive with {@link #logFactory}. */
         public Builder log(EventLog log) {
@@ -973,6 +1192,20 @@ public final class CatalystRuntime implements AutoCloseable {
         }
 
         /**
+         * How long {@link CatalystRuntime#close()} waits for running attempts to unwind before it
+         * closes the log under them (default 10s). Set it above your slowest model/tool call, and
+         * below the platform's kill deadline (Kubernetes' {@code terminationGracePeriodSeconds}
+         * defaults to 30s) so the log is closed cleanly rather than by {@code SIGKILL}.
+         */
+        public Builder drainTimeout(Duration drainTimeout) {
+            if (drainTimeout == null || drainTimeout.isNegative()) {
+                throw new IllegalArgumentException("drainTimeout must be zero or positive");
+            }
+            this.drainTimeout = drainTimeout;
+            return this;
+        }
+
+        /**
          * Runs {@link CatalystRuntime#recoverAll()} as part of {@code build()}, so a restarted node
          * resumes the executions its predecessor was running before it accepts new work. Register
          * every task type first — the scan reconstructs tasks from the registry. The report is
@@ -999,7 +1232,16 @@ public final class CatalystRuntime implements AutoCloseable {
             if (log == null && logFactory == null) {
                 throw new IllegalStateException("An EventLog is required (e.g. EventLogs.inMemory() or GumboEventLog.at(path))");
             }
-            EventLog resolved = log != null ? log : logFactory.open(blobStore, blobThresholdBytes);
+            EventLog resolved;
+            try {
+                resolved = log != null ? log : logFactory.open(blobStore, blobThresholdBytes);
+            } catch (RuntimeException e) {
+                // The log takes ownership of the store only once it is constructed. If construction
+                // failed, the store is still ours — and in the one-line usage the caller kept no
+                // reference to it — so release it rather than leak its client.
+                if (blobStore != null) blobStore.close();
+                throw e;
+            }
             if (recoverOnStart && !resolved.supportsExecutionIndex()) {
                 IllegalStateException refused = new IllegalStateException("recoverOnStart needs a log with an"
                         + " execution index; " + resolved.getClass().getSimpleName() + " cannot list its open executions");
@@ -1011,7 +1253,10 @@ public final class CatalystRuntime implements AutoCloseable {
                 try {
                     runtime.startupRecovery = runtime.recoverAll();
                 } catch (RuntimeException e) {
-                    runtime.close();
+                    // Only the index read can get here (per-execution failures are reported), so no
+                    // attempt is running. Stop the runtime, but close the log only if the builder
+                    // opened it — a log the caller supplied is theirs, e.g. to retry build() with.
+                    runtime.abortStartup(log == null);
                     throw e;
                 }
             }

@@ -220,20 +220,59 @@ checkout's pom to `com.github.CajunSystems` before installing.
   is dual-tagged only if its execution was **opened** (`GumboEventLog.wasOpened`: an in-process map
   of open/branched ids, else the stream's first event) — so a branch child's terminal event stays
   out of the queue. Only `ExecutionBranched` at **seq 0** marks a branch child; the BRANCH-replay
-  divergence marker appears mid-stream of an indexed execution. Executions recorded before the
-  index existed are not in it.
+  divergence marker appears mid-stream of an indexed execution. Checkpoint format 2 adds a trailing
+  **CRC32**; any checkpoint that doesn't verify or parse — including a `RuntimeException` like a blank
+  id — is refolded, never thrown (a throwing checkpoint would fail every scan and every
+  `recoverOnStart`). Executions recorded before the index existed are not in it.
 
 - **Startup recovery (Deploy-2)** — `RecoveryTest` (runtime) + `RecoveryAcceptanceTest` +
   `Demo <dir> crashmany` then `Demo <dir> recover` (two processes, like M0): `runtime.recoverAll()`
   walks `openExecutions()`, folds each (snapshot-warm) and calls `resume(id)` **only** for
-  crash-interrupted states (`NEW`/`STARTING`/`RUNNING`/`RESUMING`). `PAUSED`/`WAITING` are recorded
+  crash-interrupted states (`NEW`/`STARTING`/`RUNNING`/`RESUMING`). **`execute()` creates the
+  execution under the id lock** — `ExecutionCreated` makes it visible in the index, so creating it
+  before the lock let a concurrent `recoverAll()` resume it and `execute` start a second writer
+  (`RecoveryTest.aScanRacingExecuteNeverStartsASecondWriter`, verified to fail without the fix). `PAUSED`/`WAITING` are recorded
   on purpose (`pause`, `InDoubtPolicy.ASK`) and a restart must not undo them. An execution already
   in flight here is left alone (reported `RUNNING`), so it is safe on a live runtime. Each decision
   runs under `byExecution` (reentrant, so it can call `resume` inside). Per-execution failures —
   unregistered task type, unreadable stream — go to `RecoveryReport.notRecovered`, never thrown: one
   retired task type must not block every other recovery. `Builder.recoverOnStart(true)` runs it in
   `build()` (report via `startupRecovery()`) and **refuses** a log without an index rather than start
-  a node that silently recovers nothing. Resumes use no vars (only `argsHash` is persisted).
+  a node that silently recovers nothing; if the scan itself throws, `build()` closes the log only if
+  the builder opened it. Resumes use no vars (only `argsHash` is persisted).
+
+- **Graceful shutdown (Deploy-4)** — `ShutdownTest` (runtime) + `ShutdownAcceptanceTest` + `Demo shutdown`:
+  `close()` **abandons** running attempts instead of failing them. One runtime-wide `volatile closing`
+  is every attempt's abandon flag (`CancellationToken(BooleanSupplier)`), so a single write covers
+  attempts scheduled concurrently with shutdown. `ReplayingContext.requireAppendable` raises
+  `ExecutionAbandonedSignal` (after the cancel check — cancel wins) **before** a boundary records
+  anything; `runAttempt` handles it in its own branch before the retry decision and appends
+  **nothing**, so the execution stays `RUNNING` and Deploy-2 recovery resumes it. **One stop rule** at both
+  exits of an attempt: stopped by a signal (raised, or unwound by one) with a cancel pending →
+  `CANCELLED`, whichever signal stopped it and in whatever order (a cancel arriving while a task runs
+  the fallback for a swallowed abandon must not be undone by recovery); else stopped by abandon →
+  abandon. A *genuine* failure during the drain goes through the normal retry/fail
+  decision — essential for model calls: `CompletionRequested` is appended before the provider call,
+  so an abandoned provider failure would leave it dangling → in-doubt on restart → terminal under
+  `InDoubtPolicy.FAIL`. A retryable one writes `RetryRequested`, then abandons instead of sleeping. A
+  late worker whose appends fail on a closed log still writes nothing (`recordFailed` is best-effort).
+  **Abandon never interrupts**: interrupting mid-provider-call leaves a dangling `CompletionRequested`
+  → in-doubt on resume. The in-flight call finishes and records; the unwind happens at the next
+  boundary. So the retry backoff sleep polls the token in 50ms slices rather than relying on an
+  interrupt. `close()` refuses new work (`requireOpen`, plus `RejectedExecutionException` handling for
+  the race), waits `drainTimeout` (default 10s), then closes the log (releasing the Gumbo dir lock);
+  idempotent **and a barrier** (a concurrent second `close()` waits on a latch until the log is closed).
+  From a task thread of the same runtime it can't wait (the drain includes the caller), so it hands
+  the drain + `log.close()` to another thread and returns — every attempt still gets the full drain.
+  Test such paths with a log that refuses writes after close; `InMemoryEventLog.close()` is a no-op
+  and hides log-closed-too-early bugs. If
+  `close()` lands after `execute` recorded `ExecutionCreated`, `scheduleAttempt` returns a *failed
+  handle* (never throws) — the same result as the `RejectedExecutionException` race.
+  `isShuttingDown()` for readiness probes. **Swallowed stop signals:** both signals are
+  `RuntimeException`s, so a task with `catch (RuntimeException)` around a boundary can swallow them
+  and return normally. `ReplayingContext` records that it raised one (`raisedCancellation()` /
+  `raisedAbandon()`), and `runAttempt` honours that on the success path (and the failure path, for
+  cancel) instead of recording `ExecutionCompleted` with a result the stop produced.
 
 - **In-doubt model completions** — `ReplayingContextInDoubtCompletionTest`: a `CompletionRequested`
   with no `CompletionReceived` is a provider call that may have been accepted and *billed*, so it

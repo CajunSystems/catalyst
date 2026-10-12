@@ -247,7 +247,7 @@ Labels follow the build order (see *Order* below).
   applies when the builder constructs the log itself (the `embedded(path)` path); combined with
   `.log(...)` — a log the caller already built — it is **rejected** at `build()`, never silently
   ignored.
-- **Deploy-4. Graceful shutdown** — needs a new engine path, not just a better `close()`. Today
+- ✅ **Deploy-4. Graceful shutdown** — needs a new engine path, not just a better `close()`. Today
   `close()` calls `executor.close()`, which blocks until every in-flight attempt finishes (a task
   waiting on a slow provider holds the pod, and the Gumbo directory lock, indefinitely), and
   interrupting a worker without the cancel token folds to `ExecutionFailed` — terminal, so Deploy-2
