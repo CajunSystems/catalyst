@@ -99,7 +99,8 @@ and `InDoubtPolicy` decides:
 | `RETRY` | re-issued, completing the original request | the call is idempotent, or a duplicate model call is an acceptable cost |
 | `ASK` | paused, for an operator to decide | a duplicate side effect is unacceptable and someone is on call |
 
-A graceful shutdown (above) never creates an in-flight call; only a crash or an expired drain does.
+A graceful shutdown (above) leaves a call in flight only if it outlives `drainTimeout`; otherwise only a
+crash does.
 
 `RetryPolicy` is separate. It governs calls that **failed**, such as a provider 503 or a tool
 exception: `none()` (default), `maxRetries(n, backoff)`, or `exponential(...)`. A retry's budget is

@@ -6,347 +6,228 @@
 
 [![CI](https://github.com/CajunSystems/catalyst/actions/workflows/ci.yml/badge.svg)](https://github.com/CajunSystems/catalyst/actions/workflows/ci.yml)
 
-**The Durable AI Execution Runtime for the JVM.**
+**A durable execution runtime for AI work on the JVM.** You write an AI task as plain Java. Catalyst
+records every model call, tool call and side effect to an append-only log, so the task can:
 
-Catalyst lets you build AI-powered systems that are reliable, resumable, replayable, and
-observable. It focuses on **execution semantics**, not prompt engineering — *Temporal meets Git, for
-AI execution*, embedded in your JVM process.
+- **survive a crash.** Kill the process mid-task, restart, and it continues from the exact step it
+  reached, with **zero duplicate model calls**.
+- **be replayed exactly.** Re-run a recorded execution with no external calls, and have Catalyst
+  verify that your code still makes the same decisions.
+- **be branched and diffed.** Fork a past run at any step, swap the model or a tool result, and
+  compare the trajectories.
+- **be inspected.** Timelines, token usage and cost are computed from the log, so there is nothing
+  extra to instrument.
 
-Applications don't call models; they **execute AI tasks**. Every important state transition is an
-event appended to a durable log, so an execution can crash and resume at the exact step it left off,
-be replayed deterministically, and (later) be branched. The log *is* the trace: timelines, token
-usage, and cost are folds over events, not a separate instrumentation layer.
+It runs embedded in your process. There's no server to operate; the durable log is a directory on
+disk. Think *Temporal meets Git, for AI execution*.
 
-Built on the [CajunSystems](https://github.com/CajunSystems) stack: **Gumbo** (a shared, append-only
-log) provides durability.
-
-> **Status: v0.1 feature-complete (M0 + M1 + M2).** Durable execute/record/resume; strict,
-> self-verifying replay with canonical hashing and a typed token/cost timeline; and branch + diff
-> (fork a recorded run, swap the model or a tool result, and diff the trajectories).
+> **Status:** pre-1.0, not yet published to a Maven repository; build it from source (below). The
+> single-node runtime is complete and deployable. Multi-node failover is in design. See
+> [ROADMAP.md](ROADMAP.md).
 
 ---
 
-## What works today (M0 + M1 + M2)
+## Quickstart
 
-- **`Task` / `Context` API** — a task is a unit of AI work; everything it needs (model, tools,
-  memory, effects) comes from the `Context` passed to `execute`.
-- **Durable, event-sourced execution** — every boundary (model completion, tool call, effect,
-  memory read/write) becomes an event in an append-only log.
-- **Crash recovery** — `kill -9` mid-task, re-submit with the same idempotency key, and the
-  execution resumes at the exact event and completes with **zero duplicate model calls**.
-- **Two storage backends behind one SPI** — an in-memory log for tests, and a durable
-  **Gumbo**-backed file log (the flagship embedded mode).
-- **`MockModel`** (deterministic, for tests/demos) and built-in **`ClockTool`** / **`CalculatorTool`**.
-- **In-doubt tool policy** — a tool call caught mid-flight by a crash is surfaced via a pluggable
-  `InDoubtPolicy` (`RETRY` / `FAIL` / `ASK`) instead of being silently re-executed.
-- **Strict, self-verifying replay (M1)** — `runtime.replay(id, task)` re-runs a recorded execution
-  with every boundary substituted and **zero external calls**. Each boundary is checked against the
-  log's canonical request hash / tool-input hash / effect label / memory key; a mismatch under
-  `ReplayMode.STRICT` throws `NonDeterministicReplayException(seq, expected, actual)`, catching
-  nondeterministic task code.
-- **Typed timeline + token/cost accounting (M1)** — `runtime.inspect(id).timelineView()` folds the
-  log into model/tool call counts, token usage, latency, and cost. Cost is priced by a pluggable
-  `CostModel` (e.g. `CostModel.perMillionTokens(in, out)`).
-- **Real providers via LangChain4j (M1)** — `LangChain4jModel.of(chatModel)` wraps any LangChain4j
-  `ChatModel`, which buys OpenAI, Anthropic, Gemini, Ollama and local models. Catalyst keeps no
-  provider HTTP client of its own; the completion flows through `ctx.model()` and is recorded and
-  replayed like any other.
-- **Branch + diff (M2)** — `runtime.branch(id, atSeq).withModel(other).withRecordedToolResult(name,
-  value).run(task)` forks a recorded execution: it substitutes the prefix up to `atSeq` (swapping in
-  counterfactual tool results), then runs forward with the new model. Under `ReplayMode.BRANCH` a
-  divergence forks (appends `ExecutionBranched`, continues live) instead of throwing.
-  `Trajectory.diff(base, fork)` gives the step-by-step difference.
-- **Streaming completions (v0.2)** — `ctx.model().stream(request, sink)` delivers a completion's text
-  incrementally while recording the assembled result, so a streamed execution writes the same log a
-  non-streaming one does and replays with zero provider calls. See
-  [Streaming](#streaming-completions).
-- **Timeline report (v0.2)** — `TimelineReport.html(runtime.inspect(id))` renders an execution as a
-  self-contained HTML page: status, token/cost roll-ups, and the step-by-step trajectory. Read-only and
-  post-hoc, so any recorded execution renders. See [Timeline reports](#timeline-reports).
-- **Auto-capture (v0.2)** — attach `catalyst-agent` and task code no longer has to wrap its
-  nondeterminism: `Instant.now()`, `UUID.randomUUID()`, `Math.random()` and `Random` draws are
-  rewritten at their call sites into recorded boundaries, so a task written with plain JDK calls
-  replays exactly. See [Auto-capture](#auto-capture-nondeterminism-without-the-ceremony).
-
-Deferred to later milestones (schema slots already reserved so no breaking change is needed):
-`WAITING`/signal APIs and human-in-the-loop, snapshots and blob store, distributed execution (v0.2+/v1).
-
-## Module layout
-
-| Module | Responsibility |
-|---|---|
-| `catalyst-events` | Sealed `CatalystEvent` hierarchy + Jackson serialization (isolated for schema stability) |
-| `catalyst-core` | `Task`, `Context`, `Model`/`Tool`/`Memory`/`EventLog` SPIs, the reducer fold, and `ReplayingContext` (record/substitute engine) |
-| `catalyst-runtime` | `CatalystRuntime`, virtual-thread scheduler, lifecycle, idempotency, in-memory `EventLog` |
-| `catalyst-gumbo` | `GumboEventLog`: durable `EventLog` over the Gumbo shared log |
-| `catalyst-tools` | `ClockTool`, `CalculatorTool` |
-| `catalyst-langchain4j` | `LangChain4jModel`: adapts any LangChain4j `ChatModel` to Catalyst's `Model` |
-| `catalyst-otel` | `CatalystTracer`: folds an execution's log into an OpenTelemetry trace (API-only; app supplies the SDK) |
-| `catalyst-timeline` | `TimelineReport`: renders a folded execution as a self-contained HTML timeline (no deps beyond core) |
-| `catalyst-agent` | `AutoCaptureAgent`: rewrites the JDK's nondeterministic call sites in task code into recorded boundaries |
-| `catalyst-api` | Thin facade: `Catalyst.embedded(path)`, builders, `Serializers` |
-
-Coordinates: `com.cajunsystems:catalyst-*`. Root package `com.cajunsystems.catalyst`. Java 21.
-
-## How Catalyst maps onto Gumbo
-
-Each execution is one Gumbo `LogTag` (`catalyst-exec/<id>`). Gumbo's per-tag `streamVersion` is
-Catalyst's dense per-execution `seq` — so every tail read is version-keyed (`readAfterVersion`), never
-keyed on the log's global `seqnum`, which only coincides with a stream's own numbering while the log
-holds a single execution; a `TypedLogView<CatalystEvent>` handles serialization; and the
-idempotency-key → execution index is a durable, tag-scoped key-value store. Swapping the Gumbo
-persistence adapter switches between file-backed durability and in-memory — the same SPI a future
-Gumbo *cluster* backend will use.
-
-## Building
-
-Requires **JDK 21** and Maven.
-
-Catalyst depends on Gumbo, resolved from [JitPack](https://jitpack.io) — declared in the root pom, so
-an ordinary build needs no setup:
+**1. Build and install** (JDK 21 and Maven):
 
 ```bash
-mvn install
+git clone https://github.com/CajunSystems/catalyst.git
+cd catalyst
+mvn install -DskipTests
 ```
 
-The coordinate is **`com.github.CajunSystems:gumbo:0.3.0`**, not the `com.cajunsystems:gumbo` that
-Gumbo's own pom declares: JitPack rewrites the groupId to `com.github.{owner}` when it publishes, so
-which string resolves depends on where the jar came from. Building Gumbo by hand
-(`mvn -f gumbo/pom.xml install -DskipTests`) installs it into `~/.m2` under `com.cajunsystems`, which
-**this build does not reference** — a local install alone will not satisfy the dependency. If you
-need to work from a local Gumbo build (an unreleased change, or an environment that blocks
-`jitpack.io`), rewrite the project groupId in your Gumbo checkout's pom to `com.github.CajunSystems`
-before installing, so the artifact lands under the coordinate Catalyst asks for.
+**2. Add the dependency.** `catalyst-api` brings the runtime, the durable log, the built-in tools and
+the observability exporters:
 
-## The M0 exit demo (crash & resume)
-
-`Demo` tells the `kill -9` story across two real processes:
-
-```bash
-CP=$(find . -name 'classes' -type d | tr '\n' ':')$(find ~/.m2 -name 'gumbo-0.3.0.jar' -o -name 'jackson-*-2.17.2.jar' -o -name 'slf4j-*-2.0.12.jar' -o -name 'kryo-*.jar' | tr '\n' ':')
-
-# 1) record the first step, then die abruptly (exit 137 = kill -9), leaving a durable partial log
-java -cp "$CP" com.cajunsystems.catalyst.api.Demo /tmp/catalyst-demo record
-
-# 2) resume from the durable log — step 1 is substituted, only step 2 runs live
-java -cp "$CP" com.cajunsystems.catalyst.api.Demo /tmp/catalyst-demo resume
+```xml
+<dependency>
+    <groupId>com.cajunsystems</groupId>
+    <artifactId>catalyst-api</artifactId>
+    <version>0.1.0-SNAPSHOT</version>
+</dependency>
 ```
 
-```
-[record] step 1 result: SUMMARY (model calls this run: 1)
-[record] simulating kill -9 (exit 137)...
-[resume] execution ... -> COMPLETED
-[resume] result: SUMMARY|FINAL
-[resume] model calls THIS run: 1 (step 1 was substituted from the log; only step 2 ran live)
-```
+Catalyst's log library, Gumbo (`com.github.CajunSystems:gumbo`), comes from JitPack. Step 1 already
+put it in your local Maven repository, which is enough on the same machine. Anywhere else, for
+example your CI, add the repository:
 
-The same scenario is asserted automatically in `M0ResumeAcceptanceTest`.
-
-## The M1 exit demo (strict replay)
-
-`Demo replay` records a complete execution, then replays it with substitution and shows divergence
-detection:
-
-```bash
-java -cp "$CP" com.cajunsystems.catalyst.api.Demo replay
+```xml
+<repositories>
+    <repository>
+        <id>jitpack.io</id>
+        <url>https://jitpack.io</url>
+    </repository>
+</repositories>
 ```
 
-```
-[replay] timeline: 2 model call(s), 15 tokens, $0.000069
-[replay] replayed -> COMPLETED; external calls during replay: 0
-[replay] divergence correctly detected at seq 4
-```
-
-Asserted automatically in `M1ReplayAcceptanceTest`.
-
-## The M2 exit demo (branch + diff)
-
-`Demo branch` records a run, forks it at step 1 with a different model, and prints the diff:
-
-```bash
-java -cp "$CP" com.cajunsystems.catalyst.api.Demo branch
-```
-
-```
-[branch] parent ... -> SUMMARY|FINAL
-[branch] fork   ... (model swapped from step at seq 4)
-[branch] diff (1 step(s) changed):
-  [0] PROMPT  SAME
-  [1] MODEL  SAME
-  [2] PROMPT  SAME
-~ [3] MODEL  CHANGED  base={"message":"FINAL",...}  fork={"message":"FINAL-B",...}
-```
-
-Asserted automatically in `M2BranchAcceptanceTest`.
-
-## A taste of the API
+**3. Write a task and run it:**
 
 ```java
-CatalystRuntime runtime = Catalyst.builder()
-        .log(GumboEventLog.at(Path.of("./catalyst-log")))   // durable, embedded
-        .model(myModel)
-        .build();
+import com.cajunsystems.catalyst.Context;
+import com.cajunsystems.catalyst.ExecutionOptions;
+import com.cajunsystems.catalyst.Task;
+import com.cajunsystems.catalyst.api.Catalyst;
+import com.cajunsystems.catalyst.engine.Timeline;
+import com.cajunsystems.catalyst.mock.MockModel;
+import com.cajunsystems.catalyst.model.CompletionRequest;
+import com.cajunsystems.catalyst.model.Prompt;
+import com.cajunsystems.catalyst.runtime.CatalystRuntime;
+import com.cajunsystems.catalyst.runtime.ExecutionHandle;
 
-Task<String> task = ctx -> {
-    String summary = ctx.model().complete(
-            CompletionRequest.of(Prompt.builder().user("summarize the document").build())).message();
-    return summary.toUpperCase();
-};
+import java.nio.file.Path;
+import java.time.Instant;
 
-String result = runtime.execute(task, ExecutionOptions.withKey("doc:42")).result();
-```
+public class Quickstart {
 
-Re-submitting the same key resumes/attaches to the existing execution instead of starting a new one.
+    /** A task is a unit of AI work. Anything that talks to the outside world goes through ctx. */
+    static final class TriageTask implements Task<String> {
+        @Override
+        public String execute(Context ctx) {
+            String summary = ctx.model().complete(CompletionRequest.of(Prompt.builder()
+                    .system("You triage support tickets.")
+                    .user("Summarize: the printer on floor 3 is offline")
+                    .build())).message();
+            String receivedAt = ctx.effect("received-at", () -> Instant.now().toString());
+            return summary + " (received " + receivedAt + ")";
+        }
+    }
 
-Plug in a real provider by wrapping any LangChain4j `ChatModel` (add `catalyst-langchain4j` and a
-LangChain4j provider such as `langchain4j-open-ai`):
+    public static void main(String[] args) {
+        try (CatalystRuntime runtime = Catalyst.builder(Path.of("catalyst-data"))
+                .model(MockModel.alwaysReturn("Printer offline, floor 3"))   // a real model: see below
+                .task(new TriageTask())
+                .recoverOnStart(true)
+                .build()) {
 
-```java
-ChatModel chat = OpenAiChatModel.builder().apiKey(key).modelName("gpt-4o").build();
-CatalystRuntime runtime = Catalyst.builder()
-        .log(GumboEventLog.at(Path.of("./catalyst-log")))
-        .model(LangChain4jModel.of(chat))
-        .costModel(CostModel.perMillionTokens(2.50, 10.00))
-        .build();
-```
-
-## Streaming completions
-
-A task that wants tokens as they arrive asks for a sink instead of a return value:
-
-```java
-Task<String> task = ctx -> {
-    StringBuilder assembled = new StringBuilder();
-    ctx.model().stream(
-            CompletionRequest.of(Prompt.builder().user("describe streaming").build()),
-            chunk -> {
-                ui.append(chunk);          // incremental delivery
-                assembled.append(chunk);
-            });
-    return assembled.toString();
-};
-```
-
-Streaming is a **delivery** concern, not a durability one. Whatever the provider does on the wire, the
-boundary Catalyst records is the assembled `Completion` — the same single `CompletionReceived` event a
-non-streaming call writes. So nothing about resume, replay or branch had to change: a streamed
-execution and a non-streamed one are indistinguishable in the log, and the two are interchangeable on
-replay. On replay the recorded text is re-emitted to the sink and no provider is contacted.
-
-`Model.stream` is a **default method** — every existing `Model` keeps working, and one that cannot
-stream hands the sink the whole message as one chunk. `LangChain4jModel.streaming(streamingChatModel)`
-adapts a real streaming provider.
-
-Two things to know:
-
-- **Chunk boundaries are not recorded.** A replay delivers the recorded text in a single chunk.
-  Accumulating chunks is safe; branching on *how many* arrived is not, and is the one way streaming can
-  make a task nondeterministic. (Token-level replay is deliberately left to a later phase.)
-- **The sink runs on the task's thread**, before the boundary is recorded. It must not call
-  `ctx.effect`, `ctx.call`, or another completion — that would append an event between this boundary's
-  request and its result, which no replay can match.
-
-Asserted automatically in `StreamingAcceptanceTest` and gated in CI by `Demo streaming`.
-## Timeline reports
-
-The log already contains everything an execution did, so a timeline is a fold, not an instrumentation
-layer. `catalyst-timeline` renders that fold as a page:
-
-```java
-ExecutionState state = runtime.inspect(id);
-TimelineReport.writeTo(state, Path.of("build/reports/" + id.value() + ".html"));
-```
-
-You get a status header, the roll-ups from `timelineView()` (model/tool calls, prompt and completion
-tokens, cost, boundary latency, wall clock), and the step-by-step trajectory — each boundary with its
-kind, label, offset from start, latency, and recorded payload in a collapsed block.
-
-The design constraints are the interesting part:
-
-- **Read-only and post-hoc**, exactly like the OTel exporter. It consumes an `ExecutionState` and
-  installs no runtime hook, so an execution recorded months ago renders just as well as a fresh one.
-- **A pure function of the log.** Two renders of the same execution are byte-identical, which is what
-  makes a report safe to diff or commit as a build artifact.
-- **Self-contained.** Inline CSS, no scripts, no fonts, no images — it opens from a `file://` URL with
-  nothing else present, so you can attach one to a ticket.
-- **Everything is escaped.** Tool names, effect labels and recorded payloads are log content, and a
-  report is likely to be opened by someone other than whoever produced the execution.
-
-The module depends on `catalyst-core` and nothing else: no templating engine, no web server.
-
-Asserted automatically in `TimelineAcceptanceTest` and gated in CI by `Demo timeline`.
-
-## Auto-capture: nondeterminism without the ceremony
-
-Catalyst's determinism contract asks that task code produce the same values on every run. The manual
-way to honour it is to route each nondeterministic call through `ctx.effect(...)`:
-
-```java
-Task<String> task = ctx -> {
-    String stamp = ctx.effect("stamp", () -> Instant.now().toString());
-    String id = ctx.effect("id", () -> UUID.randomUUID().toString());
-    return stamp + "|" + id;
-};
-```
-
-Add the `catalyst-agent` module and you can write the same task the way you would write any Java:
-
-```java
-public final class StampedReport implements Task<String> {
-    @Override public String execute(Context ctx) {
-        return Instant.now() + "|" + UUID.randomUUID();   // no ctx.effect, still replayable
+            ExecutionHandle<String> run =
+                    runtime.execute(new TriageTask(), ExecutionOptions.withKey("ticket-1042"));
+            String result = run.result();
+            Timeline timeline = runtime.inspect(run.id()).timelineView();
+            System.out.println(result);
+            System.out.println(timeline.modelCalls() + " model call(s), " + timeline.totalTokens() + " tokens");
+        }
     }
 }
 ```
 
-Point the agent at the packages holding your task code, either at launch — using the self-contained
-`javaagent`-classified artifact, since a `-javaagent` jar does not get its Maven dependencies:
-
-```bash
-java -javaagent:catalyst-agent-<version>-javaagent.jar=packages=com.acme.tasks -cp ... com.acme.Main
+```
+Printer offline, floor 3 (received 2026-10-12T08:04:52.451055Z)
+1 model call(s), 14 tokens
 ```
 
-or from inside the process, which also retransforms classes that are already loaded — this path uses
-the ordinary `catalyst-agent` dependency:
+**Run it again.** You get the identical line, the same timestamp included, and the model is not
+called. The key `ticket-1042` names an execution that already exists in `catalyst-data/`, so Catalyst
+hands back its recorded result instead of running it again. If the first run had crashed halfway, the
+second would have resumed from the last recorded step.
+
+To use a real model, add `catalyst-langchain4j` and wrap any LangChain4j `ChatModel` (OpenAI,
+Anthropic, Gemini, Ollama, …):
 
 ```java
-AutoCaptureAgent.install(AutoCaptureConfig.forPackages("com.acme.tasks"));
+.model(LangChain4jModel.of(OpenAiChatModel.builder().apiKey(key).modelName("gpt-4o").build()))
 ```
 
-Each rewritten call site records its value as an ordinary effect boundary (`auto:Instant.now#0`,
-`auto:UUID.randomUUID#1`, …), so resume, replay and branch substitute it like any other. Captured
-sources are `Instant.now()` and the other no-argument `java.time` factories,
-`System.currentTimeMillis()` / `nanoTime()`, `UUID.randomUUID()`, `Math.random()`, and draws from
-`Random` and its relatives (including `ThreadLocalRandom` and `SplittableRandom`). Narrow that with
-`sources=time,identity` when a source is not something your task treats as data.
+## See it survive a crash
 
-Worth knowing:
+The repo has runnable demos for every feature. This one records the first step of a two-step task,
+kills its own process with the equivalent of `kill -9`, and then a second process finishes the job:
 
-- **Packages are opt-in, with no default.** Instrumenting a whole classpath would rewrite library
-  internals whose `nanoTime` calls are none of Catalyst's business.
-- **Without the agent, nothing changes.** An instrumented class calls the plain JDK method when no
-  execution is bound to the thread, so it behaves normally in unit tests and ordinary code.
-- **Nondeterminism already inside a boundary is left alone.** A `ctx.effect` supplier or a tool body
-  is covered by that boundary's own recorded result.
-- **The contract still holds.** Auto-capture removes the bookkeeping, not the discipline: a task
-  whose *sequence* of calls varies between runs still diverges, and strict replay still says so.
+```bash
+scripts/demo.sh /tmp/catalyst-demo record   # step 1 recorded, then the process dies (exit 137)
+scripts/demo.sh /tmp/catalyst-demo resume   # a new process resumes it
+```
 
-Asserted automatically in `AutoCaptureAcceptanceTest` and gated in CI by `Demo autocapture`.
+```
+[resume] result: SUMMARY|FINAL
+[resume] model calls THIS run: 1 (step 1 was substituted from the log; only step 2 ran live)
+```
 
-## Specification
+Other demos: `scripts/demo.sh replay`, `branch`, `retry`, `cancel`, `shutdown`, `streaming`,
+`timeline`, `otel`, `autocapture`, and more. The full list is at the top of `scripts/demo.sh`, and CI
+runs every one of them as a gate.
 
-The full v0.1 design lives in the project spec (Catalyst v0.1 Specification). This repository
-implements all three v0.1 milestones — **M0** (execute + record + resume), **M1** (replay + inspect),
-and **M2** (branch + diff).
+## The ideas you need
 
-## Roadmap
+- **Task:** your code, `Task<R>`, a unit of AI work. Make it a named class if it may be resumed by
+  another process.
+- **Context (`ctx`):** the only way a task touches the outside world: `ctx.model()`,
+  `ctx.call(tool, input)`, `ctx.effect(label, supplier)`, `ctx.memory()`, `ctx.var(name)`. Each call is
+  a **boundary**, and its result is recorded.
+- **Execution:** one run of a task, with an `ExecutionId` and an event log. Give it an **idempotency
+  key** (`ExecutionOptions.withKey(...)`) and resubmitting that key never runs the work twice.
+- **Resume, replay, branch:** a task always re-runs from the top. Boundaries already in the log are
+  **substituted** with their recorded results instead of executed, which is what makes all three work.
+- **The one rule:** between boundaries, task code must be deterministic. Read the clock, generate ids
+  and call external systems through `ctx`, or let the [auto-capture agent](docs/guide.md#auto-capture-nondeterminism-without-the-ceremony)
+  rewrite the clock, random and UUID calls for you. A strict replay tells you if you broke the rule.
 
-v0.1 is complete, and v0.2 with it. See [ROADMAP.md](ROADMAP.md) for what's next — v0.2 (shipped:
-snapshots, blob store, retry semantics, the OTel exporter, built-in tools, the auto-capture agent,
-streaming completions, the timeline report) and v1 (agents, the
-`WAITING`/signal APIs and human-in-the-loop via Boudin, distributed execution over a Gumbo cluster,
-and the replay-driven eval harness).
+## Common tasks
+
+| I want to… | Use | Details |
+|---|---|---|
+| call a real LLM | `LangChain4jModel.of(chatModel)` | [Models](docs/guide.md#models) |
+| call an API or system with side effects | implement `Tool`, then `ctx.call(tool, input)` | [Tools](docs/guide.md#tools) |
+| use the clock, random values or config safely | `ctx.effect("label", () -> …)` | [Effects](docs/guide.md#effects-memory-and-vars) |
+| retry transient failures | `.retryPolicy(RetryPolicy.exponential(…))` | [Failures](docs/guide.md#failures-retries-and-in-doubt-calls) |
+| decide what happens to a call cut off by a crash | `.inDoubtPolicy(…)` | [Failures](docs/guide.md#failures-retries-and-in-doubt-calls) |
+| resume crashed work after a restart | `.task(...)` + `.recoverOnStart(true)` | [Resuming](docs/guide.md#idempotency-keys-and-resuming) |
+| cancel or pause an execution | `runtime.cancel(id)`, `pause(id)`, `resume(id)` | [Control](docs/guide.md#cancel-pause-resume) |
+| check that my task code is deterministic | `runtime.replay(id, task)` | [Replay](docs/guide.md#inspect-replay-branch) |
+| try a different model on a past run | `runtime.branch(id, seq).withModel(m).run(task)` | [Branch](docs/guide.md#inspect-replay-branch) |
+| stream tokens to a UI | `ctx.model().stream(request, sink)` | [Streaming](docs/guide.md#streaming-completions) |
+| see what an execution did, and what it cost | `TimelineReport.writeTo(...)`, `CatalystTracer` (OTel) | [Observability](docs/guide.md#timeline-reports-and-opentelemetry) |
+
+## Running in production
+
+[docs/deployment.md](docs/deployment.md) covers:
+- running a node on a persistent volume (and why not a shared filesystem)
+- recovery on startup, graceful shutdown and drain timeouts
+- choosing failure policies, and backups
+- scaling out by sharding on idempotency key
+
+## Modules
+
+Most applications need only `catalyst-api`, plus `catalyst-langchain4j` for real models.
+
+| Module | What it is |
+|---|---|
+| `catalyst-api` | The `Catalyst` entry point; depends on everything below except `catalyst-langchain4j` |
+| `catalyst-core` | `Task`, `Context`, the `Model`/`Tool`/`Memory`/`EventLog` interfaces, and the record/replay engine |
+| `catalyst-runtime` | `CatalystRuntime`: scheduling, lifecycle, idempotency, recovery, shutdown; in-memory log |
+| `catalyst-gumbo` | The durable, file-backed log, built on [Gumbo](https://github.com/CajunSystems/gumbo) |
+| `catalyst-events` | The event schema and its serialization (kept stable; changes are additive) |
+| `catalyst-tools` | Built-in tools: clock, calculator, HTTP, sandboxed filesystem |
+| `catalyst-langchain4j` | Adapter for any LangChain4j chat model, streaming included |
+| `catalyst-timeline` | Renders an execution as a self-contained HTML report |
+| `catalyst-otel` | Exports an execution as an OpenTelemetry trace (API only; you bring the SDK) |
+| `catalyst-agent` | Optional Java agent that records clock, random and UUID calls automatically |
+
+Java package root: `com.cajunsystems.catalyst`.
+
+## Building and testing
+
+```bash
+mvn install                          # everything, with tests
+mvn -pl catalyst-core -am install    # one module and what it depends on
+```
+
+The acceptance tests in `catalyst-api` (`*AcceptanceTest`) are each feature's end-to-end proof, and
+each has a matching `scripts/demo.sh` demo that CI runs. On **macOS**, `FilesystemToolTest`,
+`ToolsAcceptanceTest` and `TimelineAcceptanceTest` fail by design: `FilesystemTool` refuses to run
+without the JDK's `SecureDirectoryStream`, which macOS lacks. They pass on Linux and in CI.
+
+Working on Catalyst itself? [CLAUDE.md](CLAUDE.md) is the contributor's map: architecture, the
+invariants the engine must keep, and the reasoning behind each feature.
+
+## Documentation
+
+- [Developer guide](docs/guide.md): writing tasks, models and tools, failures, replay and branch,
+  streaming, observability, auto-capture, how the log works
+- [Deployment](docs/deployment.md): running and scaling Catalyst as a service
+- [Roadmap](ROADMAP.md): what's done and what's next
+- [Schema evolution](docs/schema-evolution.md) and [Distribution design](docs/distribution.md)
 
 ## License
 
-MIT — see [LICENSE](LICENSE).
+MIT; see [LICENSE](LICENSE).
