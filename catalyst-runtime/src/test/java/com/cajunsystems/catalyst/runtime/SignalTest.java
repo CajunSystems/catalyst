@@ -384,6 +384,30 @@ class SignalTest {
         }
     }
 
+    /** A primitive await type is boxed, so its signal is type-checked before writing and accepted on resume. */
+    @Test
+    void aPrimitiveAwaitTypeIsCheckedAndDelivered() {
+        InMemoryEventLog log = new InMemoryEventLog();
+        try (CatalystRuntime runtime = CatalystRuntime.builder().log(log).model(model())
+                .task(CountingTask.class, CountingTask::new).build()) {
+            ExecutionHandle<String> handle = runtime.execute(new CountingTask());
+            assertThatThrownBy(handle::result).isInstanceOf(ExecutionWaitingSignal.class);
+            assertThat(runtime.inspect(handle.id()).awaitingSignalType()).contains(Integer.class.getName());
+
+            assertThatThrownBy(() -> runtime.signal(handle.id(), "count", "five"))
+                    .isInstanceOf(IllegalArgumentException.class);
+            assertThat(runtime.signal(handle.id(), "count", 5).result()).isEqualTo("count=5");
+        }
+    }
+
+    /** Awaits a primitive int. */
+    static final class CountingTask implements Task<String> {
+        @Override public String execute(Context ctx) {
+            int count = ctx.awaitSignal("count", int.class);
+            return "count=" + count;
+        }
+    }
+
     /** Serializable by Jackson, but not a record/enum/value type — refused by the allowlist on read. */
     public static final class PlainApproval {
         public String getReviewer() { return "dana"; }

@@ -533,7 +533,12 @@ public final class ReplayingContext implements Context {
     // ── Signals ────────────────────────────────────────────────────────────────
 
     @Override
-    public <T> T awaitSignal(String name, Class<T> type) {
+    @SuppressWarnings("unchecked")
+    public <T> T awaitSignal(String name, Class<T> requested) {
+        // Box a primitive (int.class -> Integer.class) before recording or checking anything: a payload
+        // is always an object, Class.isInstance is false for every primitive class, and the recorded
+        // name of a primitive ("int") cannot be loaded for signal()'s pre-write type check.
+        Class<T> type = (Class<T>) java.lang.invoke.MethodType.methodType(requested).wrap().returnType();
         Optional<Boundary> recorded = pollExpected(SignalReceived.class, "signal " + name);
         if (recorded.isPresent() && identityMatchesOrFork(recorded.get(), "signal", name)) {
             Object payload = payloads.fromTree(((SignalReceived) recorded.get().event()).payload());
