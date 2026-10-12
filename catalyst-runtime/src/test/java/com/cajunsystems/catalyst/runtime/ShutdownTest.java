@@ -172,6 +172,48 @@ class ShutdownTest {
         }
     }
 
+    /**
+     * close() is a barrier for every caller: a second, concurrent close() must not return while the
+     * first is still draining with the log open — try-with-resources plus a shutdown hook would
+     * otherwise race the directory lock.
+     */
+    @Test
+    void aConcurrentCloseReturnsOnlyOnceTheLogIsClosed() throws Exception {
+        CloseableLog log = new CloseableLog();
+        CountDownLatch entered = new CountDownLatch(1);
+        CountDownLatch release = new CountDownLatch(1);
+        CatalystRuntime runtime = CatalystRuntime.builder()
+                .log(log).model(MockModel.alwaysReturn("x")).drainTimeout(Duration.ofSeconds(1)).build();
+        runtime.execute(ctx -> { entered.countDown(); release.await(); return "done"; });
+        assertThat(entered.await(5, TimeUnit.SECONDS)).isTrue();
+
+        Thread first = Thread.ofVirtual().start(runtime::close);
+        waitFor(runtime::isShuttingDown);
+        runtime.close();
+        assertThat(log.closed).as("the second close() waited for the first to close the log").isTrue();
+
+        release.countDown();
+        first.join(5_000);
+    }
+
+    /** A task that closes its own runtime would otherwise wait out the whole drain on itself. */
+    @Test
+    void closeFromATaskThreadDoesNotWaitOnItself() throws Exception {
+        AtomicReference<CatalystRuntime> self = new AtomicReference<>();
+        CatalystRuntime runtime = CatalystRuntime.builder()
+                .log(new InMemoryEventLog()).model(MockModel.alwaysReturn("x"))
+                .drainTimeout(Duration.ofSeconds(30)).build();
+        self.set(runtime);
+        ExecutionHandle<Long> handle = runtime.execute(ctx -> {
+            long t0 = System.nanoTime();
+            self.get().close();
+            return System.nanoTime() - t0;
+        });
+        assertThat(Duration.ofNanos(handle.result(Duration.ofSeconds(10))))
+                .as("returned without sitting out the 30s drain").isLessThan(Duration.ofSeconds(5));
+        assertThat(runtime.isShuttingDown()).isTrue();
+    }
+
     /** Fails its effect on the first attempt only. */
     static final class FlakyTask implements Task<String> {
         private final AtomicInteger attempts;

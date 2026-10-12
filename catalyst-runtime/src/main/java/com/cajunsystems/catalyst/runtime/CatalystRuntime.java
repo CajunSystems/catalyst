@@ -55,6 +55,7 @@ import java.util.Optional;
 import java.util.concurrent.CancellationException;
 import java.util.concurrent.CompletableFuture;
 import java.util.concurrent.ConcurrentHashMap;
+import java.util.concurrent.CountDownLatch;
 import java.util.concurrent.ExecutorService;
 import java.util.concurrent.Executors;
 import java.util.concurrent.RejectedExecutionException;
@@ -71,6 +72,10 @@ public final class CatalystRuntime implements AutoCloseable {
 
     private static final Logger LOG = LoggerFactory.getLogger(CatalystRuntime.class);
     private static final Duration DEFAULT_DRAIN_TIMEOUT = Duration.ofSeconds(10);
+    /** How often a retry backoff checks whether it was cancelled or abandoned. */
+    private static final long BACKOFF_POLL_MILLIS = 50;
+    /** How many still-running ids a drain-timeout warning names before summarising the rest. */
+    private static final int DRAIN_WARNING_SAMPLE = 10;
 
     private final EventLog log;
     private final Model defaultModel;
@@ -96,6 +101,8 @@ public final class CatalystRuntime implements AutoCloseable {
      */
     private volatile boolean closing;
     private final AtomicBoolean closed = new AtomicBoolean();
+    /** Released when the first close() finishes, so a concurrent close() returns only once the log is closed. */
+    private final CountDownLatch closeFinished = new CountDownLatch(1);
 
     /**
      * Attempts currently running in this process, keyed by execution. Guards against scheduling a
@@ -217,7 +224,13 @@ public final class CatalystRuntime implements AutoCloseable {
      */
     private <R> ExecutionHandle<R> scheduleAttempt(Task<R> task, ExecutionId id, String taskType,
                                                    ExecutionOptions opts, Mode mode) {
-        requireOpen();
+        // Callers checked requireOpen() before writing anything; close() can still land between that
+        // check and here, by which point execute() may have recorded ExecutionCreated. Return a failed
+        // handle — the same result as the RejectedExecutionException race below — rather than throw
+        // for an execution that now exists in the log and will be recovered on the next start.
+        if (closing) {
+            return new FutureExecutionHandle<>(id, CompletableFuture.failedFuture(notStartedHere(id, null)));
+        }
         CompletableFuture<R> future = new CompletableFuture<>();
         RunningAttempt attempt = new RunningAttempt();
         inFlight.put(id, future);
@@ -232,10 +245,14 @@ public final class CatalystRuntime implements AutoCloseable {
             // Lost a race with close(): the executor stopped between requireOpen and here. Nothing ran
             // and nothing was appended for this attempt, so the execution is as recoverable as any
             // other open one — the next start resumes it.
-            future.completeExceptionally(new IllegalStateException("Runtime is shutting down; " + id
-                    + " was not started here and will be resumed on the next start", e));
+            future.completeExceptionally(notStartedHere(id, e));
         }
         return new FutureExecutionHandle<>(id, future);
+    }
+
+    private static IllegalStateException notStartedHere(ExecutionId id, Throwable cause) {
+        return new IllegalStateException("Runtime is shutting down; " + id + " was not started here and"
+                + " will be resumed on the next start if its task type is registered", cause);
     }
 
     private void requireOpen() {
@@ -784,7 +801,7 @@ public final class CatalystRuntime implements AutoCloseable {
                         recordFailed(id, t, future);
                         return;
                     }
-                    if (!sleepUnlessCancelled(backoffMillis, runningAttempt.token)) {
+                    if (!sleepUnlessStopped(backoffMillis, runningAttempt.token)) {
                         // RetryRequested is already durable, so an abandoned backoff resumes — with its
                         // retry budget intact — on the next start.
                         if (runningAttempt.token.isCancelled()) {
@@ -868,7 +885,7 @@ public final class CatalystRuntime implements AutoCloseable {
      * interrupts the worker), not via the interrupt flag. A spurious interrupt with no cancel is treated
      * as "keep going"; the caller then clears the flag so it cannot leak into the next attempt.
      */
-    private boolean sleepUnlessCancelled(long millis, CancellationToken token) {
+    private boolean sleepUnlessStopped(long millis, CancellationToken token) {
         // Sliced so a shutdown wakes it too: abandon does not interrupt (an interrupt mid-boundary
         // would leave the boundary in doubt), so the sleep has to look for it.
         long deadline = System.nanoTime() + TimeUnit.MILLISECONDS.toNanos(Math.max(0, millis));
@@ -884,7 +901,6 @@ public final class CatalystRuntime implements AutoCloseable {
         return false;
     }
 
-    private static final long BACKOFF_POLL_MILLIS = 50;
 
     /** Completes a handle from an already-terminal execution's recorded outcome, without re-running. */
     @SuppressWarnings("unchecked")
@@ -919,26 +935,64 @@ public final class CatalystRuntime implements AutoCloseable {
      * code that reaches no boundary — has the log closed under it. Its late writes fail and are
      * discarded; what it leaves behind is what a {@code kill -9} at that moment would, which recovery
      * already handles (a call in flight is governed by {@code InDoubtPolicy}). Size the timeout
-     * above your slowest boundary. Idempotent.
+     * above your slowest boundary.
+     *
+     * <p>Two consequences worth knowing. "The next start resumes it" assumes the task type is
+     * registered there (as for any {@link #resume(ExecutionId)}); an unregistered one is reported in
+     * {@link RecoveryReport#notRecovered()}. And a task that fails for a genuine reason while the
+     * runtime is closing is abandoned, not recorded as {@code ExecutionFailed} — so the next start
+     * re-runs it from its last recorded boundary and meets the failure again, recording it then.
+     *
+     * <p>Idempotent, and a barrier: a concurrent second call returns only once the first has closed
+     * the log. Called from one of this runtime's own task threads, it does not wait for the drain
+     * (the caller would be waiting on itself); the calling task is abandoned at its next boundary
+     * like the rest.
      */
     @Override
     public void close() {
-        if (!closed.compareAndSet(false, true)) return;
-        closing = true;
-        executor.shutdown();
-        boolean drained;
+        if (!closed.compareAndSet(false, true)) {
+            awaitFirstClose();
+            return;
+        }
         try {
-            drained = executor.awaitTermination(drainTimeout.toMillis(), TimeUnit.MILLISECONDS);
+            closing = true;
+            executor.shutdown();
+            if (calledFromTaskThread()) {
+                LOG.warn("close() called from a task thread of this runtime; not waiting for the drain");
+            } else if (!awaitDrain()) {
+                List<String> sample = running.keySet().stream()
+                        .limit(DRAIN_WARNING_SAMPLE).map(ExecutionId::value).toList();
+                LOG.warn("Shutdown drain timed out after {} with {} attempt(s) still running (e.g. {}); closing"
+                        + " the log under them — they will be recovered on the next start",
+                        drainTimeout, running.size(), sample);
+            }
+            log.close();
+        } finally {
+            closeFinished.countDown();
+        }
+    }
+
+    private boolean awaitDrain() {
+        try {
+            return executor.awaitTermination(drainTimeout.toMillis(), TimeUnit.MILLISECONDS);
         } catch (InterruptedException e) {
             Thread.currentThread().interrupt();
-            drained = false;
+            return false;
         }
-        if (!drained) {
-            LOG.warn("Shutdown drain timed out after {} with {} attempt(s) still running {}; closing the log"
-                    + " under them — they will be recovered on the next start", drainTimeout,
-                    running.size(), running.keySet());
+    }
+
+    private void awaitFirstClose() {
+        if (calledFromTaskThread()) return; // the first close() may be waiting on this very thread
+        try {
+            closeFinished.await();
+        } catch (InterruptedException e) {
+            Thread.currentThread().interrupt();
         }
-        log.close();
+    }
+
+    private boolean calledFromTaskThread() {
+        Thread current = Thread.currentThread();
+        return running.values().stream().anyMatch(a -> a.thread == current);
     }
 
     // ── Builder ──────────────────────────────────────────────────────────────

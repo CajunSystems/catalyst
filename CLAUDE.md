@@ -248,7 +248,11 @@ checkout's pom to `com.github.CajunSystems` before installing.
   boundary. So the retry backoff sleep polls the token in 50ms slices rather than relying on an
   interrupt. `close()` refuses new work (`requireOpen`, plus `RejectedExecutionException` handling for
   the race), waits `drainTimeout` (default 10s), then closes the log (releasing the Gumbo dir lock);
-  idempotent. `isShuttingDown()` for readiness probes.
+  idempotent **and a barrier** (a concurrent second `close()` waits on a latch until the log is closed).
+  From a task thread of the same runtime it skips the drain wait (it would wait on itself). If
+  `close()` lands after `execute` recorded `ExecutionCreated`, `scheduleAttempt` returns a *failed
+  handle* (never throws) — the same result as the `RejectedExecutionException` race.
+  `isShuttingDown()` for readiness probes.
 
 - **In-doubt model completions** — `ReplayingContextInDoubtCompletionTest`: a `CompletionRequested`
   with no `CompletionReceived` is a provider call that may have been accepted and *billed*, so it
