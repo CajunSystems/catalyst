@@ -302,8 +302,14 @@ checkout's pom to `com.github.CajunSystems` before installing.
   registered). `replay` of a waiting execution ends cleanly at the wait. A **live** attempt that reaches a still-recorded
   wait (only possible after something folded it out of `WAITING`, e.g. `pause` then `resume`)
   **re-records** `SignalAwaited` so the fold returns to `WAITING` — otherwise it stays `RUNNING`, refused by
-  `signal()` and re-resumed by every recovery. `signal()` treats a *done* in-flight future as not running
-  (`inFlight` is cleared by a `whenComplete` that runs after the handle completes). `ExecutionState.awaitingSignal()`
+  `signal()` and re-resumed by every recovery. **Handles complete only after deregistration:**
+  `scheduleAttempt` returns (and registers in `inFlight`) a stage chained *behind* the deregistering
+  `whenComplete`, so no caller can observe a finished attempt still in flight — before this, an
+  immediate `signal()` after `ExecutionWaitingSignal` could be refused, or its `resume()` attach to the
+  dead attempt and schedule nothing. `liveAttempt(id)` (ignores done futures) is the second layer.
+  A **swallowed wait** re-raises at every later boundary (`requireAppendable`, after cancel/abandon), so
+  nothing is recorded after `SignalAwaited` — a fallback's events there would make the signalled resume
+  diverge. `ExecutionState.awaitingSignal()`
   is **derived from the timeline**, so the state records and snapshot format are unchanged.
   `Context.awaitSignal` is a default method (throws) so other `Context` implementations still compile.
 

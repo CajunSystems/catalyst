@@ -222,7 +222,7 @@ public final class CatalystRuntime implements AutoCloseable {
             return byExecution.withLock(id, () -> {
                 // If an attempt for this execution is already running in this process, attach to it
                 // rather than scheduling a duplicate attempt that would corrupt the event stream.
-                CompletableFuture<?> live = inFlight.get(id);
+                CompletableFuture<?> live = liveAttempt(id);
                 if (live != null) {
                     return new FutureExecutionHandle<>(id, CatalystRuntime.<R>cast(live));
                 }
@@ -249,14 +249,19 @@ public final class CatalystRuntime implements AutoCloseable {
         if (closing) {
             return new FutureExecutionHandle<>(id, CompletableFuture.failedFuture(notStartedHere(id, null)));
         }
-        CompletableFuture<R> future = new CompletableFuture<>();
+        CompletableFuture<R> future = new CompletableFuture<>(); // completed by runAttempt
         RunningAttempt attempt = new RunningAttempt();
-        inFlight.put(id, future);
-        running.put(id, attempt);
-        future.whenComplete((r, t) -> {
-            inFlight.remove(id, future);
-            running.remove(id, attempt);
+        // Every caller — this handle, and anyone who attaches via inFlight — sees `visible`, which
+        // completes only AFTER the attempt is deregistered. Completing the attempt's own future first
+        // and deregistering in a dependent let a caller observe the result while the attempt still
+        // looked in flight: an immediate signal() was refused, or its resume() attached to the finished
+        // attempt and scheduled nothing. The unconditional inFlight.remove is safe: no other attempt
+        // for this id can be scheduled while `visible` is not yet done.
+        CompletableFuture<R> visible = future.whenComplete((r, t) -> {
+            if (running.remove(id, attempt)) inFlight.remove(id);
         });
+        inFlight.put(id, visible);
+        running.put(id, attempt);
         try {
             executor.execute(() -> runAttempt(task, id, taskType, opts, mode, future, attempt));
         } catch (RejectedExecutionException e) {
@@ -265,7 +270,13 @@ public final class CatalystRuntime implements AutoCloseable {
             // other open one — the next start resumes it.
             future.completeExceptionally(notStartedHere(id, e));
         }
-        return new FutureExecutionHandle<>(id, future);
+        return new FutureExecutionHandle<>(id, visible);
+    }
+
+    /** The attempt running for {@code id} in this process, or null; a finished one does not count. */
+    private CompletableFuture<?> liveAttempt(ExecutionId id) {
+        CompletableFuture<?> live = inFlight.get(id);
+        return live != null && !live.isDone() ? live : null;
     }
 
     private static IllegalStateException notStartedHere(ExecutionId id, Throwable cause) {
@@ -497,7 +508,7 @@ public final class CatalystRuntime implements AutoCloseable {
         return byExecution.withLock(id, () -> {
             // Already running here → attach to the in-flight attempt rather than scheduling a duplicate
             // that would interleave events and corrupt the stream (same guard as execute()).
-            CompletableFuture<?> live = inFlight.get(id);
+            CompletableFuture<?> live = liveAttempt(id);
             if (live != null) {
                 return new FutureExecutionHandle<>(id, live);
             }
@@ -564,7 +575,7 @@ public final class CatalystRuntime implements AutoCloseable {
         for (ExecutionId id : log.openExecutions()) {
             try {
                 byExecution.withLock(id, () -> {
-                    if (inFlight.containsKey(id)) {
+                    if (liveAttempt(id) != null) {
                         leftAlone.put(id, Status.RUNNING);
                         return;
                     }
@@ -637,11 +648,7 @@ public final class CatalystRuntime implements AutoCloseable {
         requireOwned(id);
         java.util.Objects.requireNonNull(name, "name");
         return byExecution.withLock(id, () -> {
-            // A completed future is not in flight: inFlight is cleared by a whenComplete that runs after
-            // the handle completes, so a caller that saw ExecutionWaitingSignal and signals at once can
-            // still find the attempt registered for an instant.
-            CompletableFuture<?> live = inFlight.get(id);
-            if (live != null && !live.isDone()) {
+            if (liveAttempt(id) != null) {
                 throw new IllegalStateException("Execution " + id + " is running, not waiting for signal '" + name + "'");
             }
             ExecutionState state = foldState(id);
@@ -762,7 +769,7 @@ public final class CatalystRuntime implements AutoCloseable {
         requireOwned(id);
         byExecution.withLock(id, () -> {
             if (inspect(id).isTerminal()) return;  // terminal (incl. just-completed) → no-op
-            if (inFlight.containsKey(id)) {
+            if (liveAttempt(id) != null) {
                 throw new IllegalStateException("Cannot pause an execution running in this process: " + id);
             }
             log.append(id, new CatalystEvent.ExecutionPaused(now(), "paused by request"));

@@ -269,6 +269,39 @@ class SignalTest {
         }
     }
 
+    /**
+     * A task that swallows the wait and then calls the model must record nothing after the wait — or
+     * the delivered signal could never be substituted where the task waits, and the resume would
+     * diverge. The fallback's call re-raises the wait instead of running.
+     */
+    @Test
+    void aSwallowedWaitRecordsNothingAfterItAndStillResumes() {
+        InMemoryEventLog log = new InMemoryEventLog();
+        MockModel model = model();
+        Task<String> fallback = new SwallowingFallback();
+        try (CatalystRuntime runtime = CatalystRuntime.builder().log(log).model(model)
+                .task(SwallowingFallback.class, SwallowingFallback::new).build()) {
+            ExecutionHandle<String> handle = runtime.execute(fallback);
+            assertThatThrownBy(handle::result).isInstanceOf(ExecutionWaitingSignal.class);
+            assertThat(log.read(handle.id()).getLast().event()).isInstanceOf(CatalystEvent.SignalAwaited.class);
+            assertThat(model.callCount()).as("the fallback's model call never ran").isZero();
+
+            assertThat(runtime.signal(handle.id(), "approval", new Approval("dana", true)).result())
+                    .isEqualTo("approved by dana");
+        }
+    }
+
+    /** Catches the wait and tries to carry on with the model. */
+    static final class SwallowingFallback implements Task<String> {
+        @Override public String execute(Context ctx) {
+            try {
+                return "approved by " + ctx.awaitSignal("approval", Approval.class).reviewer();
+            } catch (RuntimeException e) {
+                return ctx.model().complete(DRAFT).message();
+            }
+        }
+    }
+
     @Test
     void aWaitingExecutionCanBeCancelled() {
         InMemoryEventLog log = new InMemoryEventLog();
