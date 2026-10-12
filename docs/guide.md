@@ -263,6 +263,9 @@ Worth knowing:
   (to `RESUMING`), so if the process dies before it resumes, startup recovery finishes it.
 - **The task type must be registered** (`Catalyst.builder().task(...)`) for `signal` to resume it. If
   it isn't, the signal is still recorded and you resume by re-submitting the task with its key.
+- **A task that reads `ctx.var(...)`** (or ran with its own retry policy) must be signalled with the
+  options it was submitted with: `runtime.signal(id, name, payload, opts)`. Vars aren't persisted, and
+  the resume re-enters the task from the top.
 - **Re-submitting the key, or calling `resume(id)`, while it is still waiting runs nothing.** The
   handle fails with `ExecutionWaitingSignal`.
 - **Waits have no timeout yet**, and a waiting execution can be cancelled like any other.

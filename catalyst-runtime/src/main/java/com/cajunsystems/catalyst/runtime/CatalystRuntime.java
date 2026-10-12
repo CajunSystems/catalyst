@@ -640,10 +640,24 @@ public final class CatalystRuntime implements AutoCloseable {
      * not registered, the signal is still recorded and the returned handle fails — resume it by
      * re-submitting the task with its idempotency key.
      *
+     * <p>The resume runs with no task input vars or per-execution options, as {@link #resume(ExecutionId)}
+     * does. A task that reads {@code ctx.var(...)}, or ran with its own retry policy, must be signalled
+     * with {@link #signal(ExecutionId, String, Object, ExecutionOptions)} and the same options it was
+     * submitted with — otherwise its re-entry takes a different path and fails the replay check.
+     *
      * @return the resumed execution's handle
      * @throws IllegalStateException if the execution is not waiting for {@code name}
      */
     public ExecutionHandle<?> signal(ExecutionId id, String name, Object payload) {
+        return signal(id, name, payload, ExecutionOptions.none());
+    }
+
+    /**
+     * As {@link #signal(ExecutionId, String, Object)}, resuming with {@code opts} — the task input vars
+     * and retry policy the execution was submitted with, which the log does not persist.
+     */
+    public ExecutionHandle<?> signal(ExecutionId id, String name, Object payload, ExecutionOptions opts) {
+        java.util.Objects.requireNonNull(opts, "opts");
         requireOpen();
         requireOwned(id);
         java.util.Objects.requireNonNull(name, "name");
@@ -672,7 +686,7 @@ public final class CatalystRuntime implements AutoCloseable {
                                 + state.taskType() + "' to resume it here; re-submit the task with its"
                                 + " idempotency key, or register it with Catalyst.builder().task(...)")));
             }
-            return resume(id); // reentrant on the id lock
+            return resume(id, opts); // reentrant on the id lock
         });
     }
 

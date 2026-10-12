@@ -329,6 +329,37 @@ class SignalTest {
         }
     }
 
+    /**
+     * Vars aren't persisted, so a task that reads one before its wait must be signalled with the same
+     * options it was submitted with — the resume re-enters the task from the top.
+     */
+    @Test
+    void aTaskThatReadsVarsIsSignalledWithItsOptions() {
+        InMemoryEventLog log = new InMemoryEventLog();
+        MockModel model = model();
+        ExecutionOptions opts = ExecutionOptions.withKey("ticket-42").var("ticket", "printer offline");
+        try (CatalystRuntime runtime = CatalystRuntime.builder().log(log).model(model)
+                .task(VarReadingTask.class, VarReadingTask::new).build()) {
+            ExecutionHandle<String> handle = runtime.execute(new VarReadingTask(), opts);
+            assertThatThrownBy(handle::result).isInstanceOf(ExecutionWaitingSignal.class);
+
+            assertThat(runtime.signal(handle.id(), "approval", new Approval("dana", true), opts).result())
+                    .isEqualTo("printer offline: DRAFT, approved by dana");
+            assertThat(model.callCount()).as("the draft was substituted").isEqualTo(1);
+        }
+    }
+
+    /** Builds its prompt from a var, then waits. */
+    static final class VarReadingTask implements Task<String> {
+        @Override public String execute(Context ctx) {
+            String ticket = ctx.var("ticket");
+            String draft = ctx.model().complete(CompletionRequest.of(
+                    Prompt.builder().user("summarize: " + ticket).build())).message();
+            Approval approval = ctx.awaitSignal("approval", Approval.class);
+            return ticket + ": " + draft + ", approved by " + approval.reviewer();
+        }
+    }
+
     @Test
     void aWaitingExecutionCanBeCancelled() {
         InMemoryEventLog log = new InMemoryEventLog();
