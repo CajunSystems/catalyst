@@ -100,6 +100,8 @@ public final class CatalystRuntime implements AutoCloseable {
     /** This node's shard and the ring it belongs to; both null for an unsharded runtime. */
     private final String shard;
     private final ShardRing shardRing;
+    /** Built with {@link Builder#distributed()}: the log is shared with runtimes in other processes. */
+    private final boolean distributed;
 
     /**
      * True once {@link #close()} has begun. Every attempt's token reads it as its abandon flag, so this
@@ -176,6 +178,7 @@ public final class CatalystRuntime implements AutoCloseable {
         this.drainTimeout = b.drainTimeout;
         this.shard = b.shard;
         this.shardRing = b.shardRing;
+        this.distributed = b.distributed;
         this.executor = Executors.newThreadPerTaskExecutor(
                 Thread.ofVirtual().name("catalyst-exec-", 0).factory());
     }
@@ -337,6 +340,15 @@ public final class CatalystRuntime implements AutoCloseable {
      */
     public boolean isShuttingDown() {
         return closing;
+    }
+
+    /**
+     * Whether this runtime was built with {@link Builder#distributed()}, sharing its log with runtimes
+     * in other processes. When true, {@code build()} has already checked that the log is fenced and
+     * multi-writer.
+     */
+    public boolean isDistributed() {
+        return distributed;
     }
 
     @SuppressWarnings("unchecked")
@@ -563,9 +575,16 @@ public final class CatalystRuntime implements AutoCloseable {
      * {@link #resume(ExecutionId, ExecutionOptions)}. Executions recorded before the log kept an
      * index are not listed by it, and so are not recovered here.
      *
-     * @throws IllegalStateException if the log keeps no execution index
+     * <p><strong>Refused on a {@linkplain Builder#distributed() distributed} runtime</strong>, until
+     * leases exist (Dist-3/4). The index is shared, so "open and not running here" includes work
+     * running on another node. Resuming that would append {@code ExecutionResumed} while the other
+     * node is mid-call. Its result would then be refused by the fence, and the call it had started
+     * would be left in doubt, which is terminal under the default {@code InDoubtPolicy.FAIL}.
+     *
+     * @throws IllegalStateException if the log keeps no execution index, or this runtime is distributed
      */
     public RecoveryReport recoverAll() {
+        if (distributed) throw new IllegalStateException(DISTRIBUTED_RECOVERY_REFUSED);
         if (!log.supportsExecutionIndex()) {
             throw new IllegalStateException(log.getClass().getSimpleName()
                     + " keeps no execution index, so open executions cannot be found after a restart");
@@ -603,6 +622,12 @@ public final class CatalystRuntime implements AutoCloseable {
         notRecovered.forEach((id, reason) -> LOG.warn("Not recovered: {} ({})", id.value(), reason));
         return report;
     }
+
+    private static final String DISTRIBUTED_RECOVERY_REFUSED = "A distributed runtime cannot run the recovery"
+            + " scan yet: the execution index is shared, so the scan would resume executions running on other"
+            + " nodes, fencing them out and leaving their in-flight calls in doubt. Cross-node recovery needs"
+            + " leases (Dist-3/4); until then resume by id only executions you know are not running on"
+            + " another node (a keyed execute or resume(id) of one that is has the same effect).";
 
     /** The states a process death leaves an execution in — as opposed to ones recorded deliberately. */
     private static boolean isCrashInterrupted(Status status) {
@@ -1324,6 +1349,8 @@ public final class CatalystRuntime implements AutoCloseable {
         private Duration drainTimeout = DEFAULT_DRAIN_TIMEOUT;
         private String shard;
         private ShardRing shardRing;
+        private boolean distributed;
+        private boolean nodeIdSet;
 
         /** Uses a log the caller already built. Exclusive with {@link #logFactory}. */
         public Builder log(EventLog log) {
@@ -1403,8 +1430,14 @@ public final class CatalystRuntime implements AutoCloseable {
             return this;
         }
 
+        /**
+         * This runtime's node id, recorded in {@code ExecutionStarted} (default {@code "node-0"}). A
+         * {@linkplain #distributed() distributed} runtime must set it, and every node needs a different one.
+         */
         public Builder nodeId(String nodeId) {
+            if (nodeId == null || nodeId.isBlank()) throw new IllegalArgumentException("nodeId must be non-blank");
             this.nodeId = nodeId;
+            this.nodeIdSet = true;
             return this;
         }
 
@@ -1494,7 +1527,45 @@ public final class CatalystRuntime implements AutoCloseable {
             return this;
         }
 
+        /**
+         * Declares that this runtime shares its log with runtimes in other processes (the Dist
+         * track). {@code build()} then refuses to start unless all of these hold:
+         * <ul>
+         *   <li>The log reports {@link EventLog#supportsConditionalAppend()}, so a stale writer is
+         *       refused rather than appended.</li>
+         *   <li>The log reports {@link EventLog#supportsMultiWriter()}, so writers in different
+         *       processes are safe at all. A file-backed log is fenced but not multi-writer.</li>
+         *   <li>A {@link #nodeId(String)} was set. Two nodes left at the default would be
+         *       indistinguishable in the log.</li>
+         *   <li>Neither {@link #shard} nor {@link #recoverOnStart} is set. Sharding is the
+         *       alternative to sharing a log: each shard has its own. The recovery scan is not yet
+         *       safe on a shared index (see {@link CatalystRuntime#recoverAll()}).</li>
+         * </ul>
+         * The capabilities are read from the log, never assumed. A log that does not report them is
+         * refused even if it could in fact handle several writers.
+         *
+         * <p>What this mode gives today: every append is fenced (Dist-1), so runtimes sharing the log
+         * cannot corrupt a stream. Leases and the claim loop, which hand a dead node's work to a live
+         * one, are Dist-3/4.
+         */
+        public Builder distributed() {
+            this.distributed = true;
+            return this;
+        }
+
         public CatalystRuntime build() {
+            // Refusals that need no log come first, so nothing is opened only to be closed again.
+            if (distributed) {
+                if (shardRing != null) {
+                    throw new IllegalStateException("distributed() and shard(...) are alternatives: a sharded"
+                            + " deployment gives each node its own log, a distributed one shares one log");
+                }
+                if (recoverOnStart) throw new IllegalStateException(DISTRIBUTED_RECOVERY_REFUSED);
+                if (!nodeIdSet) {
+                    throw new IllegalStateException("A distributed runtime needs nodeId(...), unique per node:"
+                            + " nodes left at the default '" + nodeId + "' are indistinguishable in a shared log");
+                }
+            }
             if (log != null && logFactory != null) {
                 throw new IllegalStateException("Set either log(...) or logFactory(...), not both");
             }
@@ -1516,6 +1587,15 @@ public final class CatalystRuntime implements AutoCloseable {
                 // reference to it — so release it rather than leak its client.
                 if (blobStore != null) blobStore.close();
                 throw e;
+            }
+            if (distributed && !(resolved.supportsConditionalAppend() && resolved.supportsMultiWriter())) {
+                IllegalStateException refused = new IllegalStateException("distributed() needs a log that is"
+                        + " fenced and multi-writer; " + resolved.getClass().getSimpleName() + " reports"
+                        + " supportsConditionalAppend()=" + resolved.supportsConditionalAppend()
+                        + ", supportsMultiWriter()=" + resolved.supportsMultiWriter()
+                        + ". Use a multi-writer log such as GumboEventLog.foundationDB(...).");
+                if (log == null) resolved.close(); // the builder opened it, so the builder releases it
+                throw refused;
             }
             if (recoverOnStart && !resolved.supportsExecutionIndex()) {
                 IllegalStateException refused = new IllegalStateException("recoverOnStart needs a log with an"
