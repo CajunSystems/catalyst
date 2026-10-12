@@ -227,9 +227,14 @@ runtime.pause(id);     // only for an execution not running in this process; fol
 runtime.resume(id);    // continues a paused (or crashed) execution
 ```
 
-`cancel` on a running execution interrupts its worker and stops it at the next `ctx` call, which
-records `ExecutionCancelled`. A task stuck in a long computation with no `ctx` calls runs until it
-reaches one.
+`cancel` on a running execution trips a flag and interrupts its worker. The task stops at its **next
+`ctx` call**, which records `ExecutionCancelled`. Two cases where you get something else:
+
+- **The task returns without making another `ctx` call.** It completes normally and the cancel has no
+  effect, exactly like cancelling an execution that has already finished. A long stretch of local
+  work after the last call is not interrupted.
+- **The interrupt lands inside a call** and surfaces as an ordinary exception, for example from an
+  interrupted HTTP request. The execution is recorded `FAILED`, not `CANCELLED`. It is not retried, because a cancel is pending.
 
 `close()` shuts the runtime down gracefully. Running executions finish their current call, then stop
 without recording a failure, and the next start resumes them. That holds for calls that finish within
