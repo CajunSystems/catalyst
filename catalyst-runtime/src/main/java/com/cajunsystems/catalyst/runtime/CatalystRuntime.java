@@ -906,15 +906,16 @@ public final class CatalystRuntime implements AutoCloseable {
                         return;
                     }
                     if (ctx.raisedWaiting()) {
-                        future.completeExceptionally(ctx.waitingSignal());
+                        parkUnlessCancelled(id, future, runningAttempt, ctx.waitingSignal());
                         return;
                     }
                     log.append(id, new CatalystEvent.ExecutionCompleted(now(), payloads.toTree(result)));
                     future.complete(result);
                     return;
                 } catch (ExecutionPausedSignal pause) {
-                    // ExecutionPaused already recorded by the context; leave the execution paused.
-                    future.completeExceptionally(pause);
+                    // ExecutionPaused already recorded by the context; leave the execution paused —
+                    // unless a cancel landed meanwhile (see parkUnlessCancelled).
+                    parkUnlessCancelled(id, future, runningAttempt, pause);
                     return;
                 } catch (Throwable t) {
                     // The stop rule — one decision for every ordering of cancel and shutdown:
@@ -951,11 +952,8 @@ public final class CatalystRuntime implements AutoCloseable {
                     // pending: cancel() saw this attempt still registered as running and only tripped
                     // the token, so parking would leave nobody to record the cancel.
                     if (t instanceof ExecutionWaitingSignal || ctx.raisedWaiting()) {
-                        if (runningAttempt.token.isCancelled()) {
-                            recordCancelled(id, runningAttempt.token.reason(), future);
-                        } else {
-                            future.completeExceptionally(t instanceof ExecutionWaitingSignal w ? w : ctx.waitingSignal());
-                        }
+                        parkUnlessCancelled(id, future, runningAttempt,
+                                t instanceof ExecutionWaitingSignal w ? w : ctx.waitingSignal());
                         return;
                     }
                     // Decide retry vs. terminal failure. isRetryable gates out failures a retry can never
@@ -1037,6 +1035,29 @@ public final class CatalystRuntime implements AutoCloseable {
             // best-effort failure record; the future still completes exceptionally below
         }
         future.completeExceptionally(t);
+    }
+
+    /**
+     * Ends an attempt that parked — waiting for a signal, or paused — leaving the execution
+     * non-terminal, unless a cancel is pending, which wins.
+     *
+     * <p>The check and the deregistration are made atomic with respect to {@code cancel()} by holding
+     * the id lock {@code cancel()} decides under. Deregistration runs synchronously inside
+     * {@code completeExceptionally} (the dependent was registered when the attempt was scheduled), so
+     * it happens under the lock too. Without that, a {@code cancel()} landing between the check and the
+     * deregistration would see the attempt still registered, only trip its token, and return — and
+     * nothing would ever record the cancel. Now it lands either before (seen here, recorded) or after
+     * (the attempt is gone, so {@code cancel()} appends {@code ExecutionCancelled} itself).
+     */
+    private <R> void parkUnlessCancelled(ExecutionId id, CompletableFuture<R> future,
+                                         RunningAttempt attempt, RuntimeException parked) {
+        byExecution.withLock(id, () -> {
+            if (attempt.token.isCancelled()) {
+                recordCancelled(id, attempt.token.reason(), future);
+            } else {
+                future.completeExceptionally(parked);
+            }
+        });
     }
 
     /**

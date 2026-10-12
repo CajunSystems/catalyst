@@ -307,7 +307,9 @@ checkout's pom to `com.github.CajunSystems` before installing.
   `whenComplete`, so no caller can observe a finished attempt still in flight — before this, an
   immediate `signal()` after `ExecutionWaitingSignal` could be refused, or its `resume()` attach to the
   dead attempt and schedule nothing. `liveAttempt(id)` (ignores done futures) is the second layer.
-  A **swallowed wait** re-raises at every later boundary (`requireAppendable`, after cancel/abandon), so
+  Parking (waiting **or** paused) ends via `parkUnlessCancelled`, which checks the token
+  and completes/deregisters **under the id lock** `cancel()` decides under — otherwise a `cancel()` between
+  the check and the deregistration only trips the token and is lost. A **swallowed wait** re-raises at every later boundary (`requireAppendable`, after cancel/abandon), so
   nothing is recorded after `SignalAwaited` — a fallback's events there would make the signalled resume
   diverge. `ExecutionState.awaitingSignal()`
   is **derived from the timeline**, so the state records and snapshot format are unchanged.
