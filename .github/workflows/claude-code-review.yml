@@ -1,23 +1,20 @@
 name: Claude Code Review
 
+# Automatic review on every PR open/push.
+#
+# This used to run the `code-review` plugin, whose multi-agent orchestration (a Haiku eligibility
+# gate, then Sonnet + Opus sub-agents) collapsed silently here: no run ever reached the Opus review
+# agents, yet some still posted "No issues found". A review that can quietly not happen and still
+# look clean is worse than none. So this is one direct prompt on one strong model, and it must end
+# with a summary comment naming what it read — a skipped review cannot pass for a clean one.
+
 on:
   pull_request:
     types: [opened, synchronize, ready_for_review, reopened]
-    # Optional: Only run on specific file changes
-    # paths:
-    #   - "src/**/*.ts"
-    #   - "src/**/*.tsx"
-    #   - "src/**/*.js"
-    #   - "src/**/*.jsx"
 
 jobs:
   claude-review:
-    # Optional: Filter by PR author
-    # if: |
-    #   github.event.pull_request.user.login == 'external-contributor' ||
-    #   github.event.pull_request.user.login == 'new-developer' ||
-    #   github.event.pull_request.author_association == 'FIRST_TIME_CONTRIBUTOR'
-
+    if: github.event.pull_request.draft == false
     runs-on: ubuntu-latest
     permissions:
       contents: read
@@ -36,10 +33,31 @@ jobs:
         uses: anthropics/claude-code-action@v1
         with:
           claude_code_oauth_token: ${{ secrets.CLAUDE_CODE_OAUTH_TOKEN }}
-          plugin_marketplaces: 'https://github.com/anthropics/claude-code.git'
-          plugins: 'code-review@claude-code-plugins'
-          prompt: '/code-review:code-review --comment ${{ github.repository }}/pull/${{ github.event.pull_request.number }}'
-          claude_args: '--allowedTools "mcp__github_inline_comment__create_inline_comment"'
-          # See https://github.com/anthropics/claude-code-action/blob/main/docs/usage.md
-          # or https://code.claude.com/docs/en/cli-reference for available options
+          prompt: |
+            REPO: ${{ github.repository }}
+            PR NUMBER: ${{ github.event.pull_request.number }}
 
+            Review this pull request for correctness. Do not skip the review for any reason.
+
+            1. Read CLAUDE.md at the repo root. Its "Key invariants" and acceptance-test sections are the
+               bar: recorded boundaries, dense per-execution seq, version-keyed Gumbo reads, additive event
+               schema, and the reasoning recorded for each milestone.
+            2. Get the change with `gh pr view <PR>` and `gh pr diff <PR>`. Read the surrounding code in the
+               checkout for anything the diff alone does not settle — callers, the code paths a change
+               interacts with, lock and ordering assumptions.
+            3. Look for real defects: incorrect logic, races, a path that leaves the event log in a state
+               resume/replay/recovery mishandles, a broken CLAUDE.md invariant, missing handling for a case
+               the change itself introduces, a test that does not test what it claims. Skip style nits and
+               anything you cannot ground in the code.
+            4. Before reporting a finding, confirm it by reading the code involved and state the concrete
+               scenario (inputs/state → wrong result). Drop anything you cannot confirm.
+            5. Post each confirmed finding as an inline comment on the relevant line with
+               mcp__github_inline_comment__create_inline_comment.
+            6. ALWAYS finish with exactly one summary comment via `gh pr comment <PR> --body ...`, even when
+               there are no findings. It must list the files you actually read, the number of confirmed
+               findings with a one-line summary of each, and a verdict. Say plainly that you did not build
+               or run anything.
+          claude_args: |
+            --model claude-opus-5-5
+            --max-turns 80
+            --allowedTools "mcp__github_inline_comment__create_inline_comment,Bash(gh pr view:*),Bash(gh pr diff:*),Bash(gh pr comment:*),Read,Grep,Glob"
