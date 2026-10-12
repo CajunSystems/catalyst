@@ -274,6 +274,19 @@ checkout's pom to `com.github.CajunSystems` before installing.
   `raisedAbandon()`), and `runAttempt` honours that on the success path (and the failure path, for
   cancel) instead of recording `ExecutionCompleted` with a result the stop produced.
 
+- **Deployment guide + sharding (Deploy-5)** — `docs/deployment.md` + `ShardRingTest` (core) +
+  `ShardingTest` (runtime) + `ShardingAcceptanceTest` (three Gumbo shards behind a client router;
+  re-submitting every key makes zero new model calls). Scale-out is **independent nodes, each its own
+  log, routed by idempotency key** — the only thing a client holds before submit, and the idempotency
+  index is per-log, so any other routing duplicates model calls on re-submission. `ShardRing.shardFor`
+  is rendezvous hashing over SHA-256; its outputs are **pinned in the test** — changing them re-routes
+  every key, which is a data break. `Builder.shard(self, ring)` makes the node enforce the contract
+  **before writing**: no key → refused, key routed elsewhere → refused, ids minted
+  `exec-<uuid>@<shard>` (`ExecutionId.shard()` parses only that exact minted shape), and id-addressed
+  calls (`inspect`/`resume`/`cancel`/`pause`/`replay`/`branch`) refuse another shard's id; unstamped
+  (pre-sharding) ids pass. The shard set is fixed for the life of the data. Not failover: a shard's
+  work waits for that node — node takeover is the Dist track.
+
 - **In-doubt model completions** — `ReplayingContextInDoubtCompletionTest`: a `CompletionRequested`
   with no `CompletionReceived` is a provider call that may have been accepted and *billed*, so it
   routes through `InDoubtPolicy` exactly as a dangling `ToolRequested` does (it previously just

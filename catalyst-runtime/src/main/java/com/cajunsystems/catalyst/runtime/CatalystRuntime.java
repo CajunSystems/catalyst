@@ -4,6 +4,7 @@ import com.cajunsystems.catalyst.ExecutionId;
 import com.cajunsystems.catalyst.ExecutionInfo;
 import com.cajunsystems.catalyst.ExecutionOptions;
 import com.cajunsystems.catalyst.ReplayMode;
+import com.cajunsystems.catalyst.ShardRing;
 import com.cajunsystems.catalyst.Status;
 import com.cajunsystems.catalyst.Task;
 import com.cajunsystems.catalyst.TaskFactory;
@@ -93,6 +94,9 @@ public final class CatalystRuntime implements AutoCloseable {
     /** Set once by {@code build()} when {@code recoverOnStart} is on, before the runtime is handed out. */
     private RecoveryReport startupRecovery;
     private final Duration drainTimeout;
+    /** This node's shard and the ring it belongs to; both null for an unsharded runtime. */
+    private final String shard;
+    private final ShardRing shardRing;
 
     /**
      * True once {@link #close()} has begun. Every attempt's token reads it as its abandon flag, so this
@@ -167,6 +171,8 @@ public final class CatalystRuntime implements AutoCloseable {
         this.snapshotInterval = b.snapshotInterval;
         this.registry = b.registry;
         this.drainTimeout = b.drainTimeout;
+        this.shard = b.shard;
+        this.shardRing = b.shardRing;
         this.executor = Executors.newThreadPerTaskExecutor(
                 Thread.ofVirtual().name("catalyst-exec-", 0).factory());
     }
@@ -182,13 +188,14 @@ public final class CatalystRuntime implements AutoCloseable {
         requireOpen();
         String taskType = task.getClass().getName();
         Optional<String> key = opts.idempotencyKey();
+        requireRoutedHere(key);
 
         // No key → a fresh random id no caller can name yet, so only the id lock is needed. Creation
         // happens UNDER it, not before: ExecutionCreated puts the id in the execution index, and a
         // concurrent recoverAll() that saw it there — open, STARTING, nothing in flight — would resume
         // it and leave this FRESH attempt as a second writer on the same stream.
         if (key.isEmpty()) {
-            ExecutionId id = ExecutionId.random();
+            ExecutionId id = mintId();
             return byExecution.withLock(id, () -> {
                 createExecution(id, taskType, "", opts);
                 return scheduleAttempt(task, id, taskType, opts, Mode.FRESH);
@@ -202,7 +209,7 @@ public final class CatalystRuntime implements AutoCloseable {
         return byIdempotencyKey.withLock(key.get(), () -> {
             Optional<ExecutionId> existing = log.findByKey(key.get());
             if (existing.isEmpty()) {
-                ExecutionId id = ExecutionId.random();
+                ExecutionId id = mintId();
                 log.putKey(key.get(), id);
                 // Created under the id lock for the same reason as the keyless path above.
                 return byExecution.withLock(id, () -> {
@@ -263,6 +270,47 @@ public final class CatalystRuntime implements AutoCloseable {
                 + " will be resumed on the next start if its task type is registered", cause);
     }
 
+    /** A fresh id, stamped with this node's shard when the runtime is one shard of several. */
+    private ExecutionId mintId() {
+        return shard == null ? ExecutionId.random() : ExecutionId.random(shard);
+    }
+
+    /**
+     * A sharded runtime accepts only work routed to it, checked before anything is written. Without a
+     * key there is nothing to route on — the id does not exist yet — and a key that routes to another
+     * shard means the caller's router disagrees with this ring; accepting it would put the key's
+     * execution where a later, correctly routed re-submission will not find it, duplicating every
+     * model call. Refusing is the only safe answer to both.
+     */
+    private void requireRoutedHere(Optional<String> key) {
+        if (shard == null) return;
+        if (key.isEmpty()) {
+            throw new IllegalArgumentException("Sharded runtime (shard '" + shard + "') requires an idempotency"
+                    + " key on every submission: it is what routes the work to a shard."
+                    + " Use ExecutionOptions.withKey(...)");
+        }
+        String owner = shardRing.shardFor(key.get());
+        if (!owner.equals(shard)) {
+            throw new IllegalArgumentException("Idempotency key '" + key.get() + "' routes to shard '" + owner
+                    + "', not this node's shard '" + shard + "'; submit it there (ShardRing.shardFor)");
+        }
+    }
+
+    /**
+     * An id stamped with another shard names an execution in another node's log: here it would read
+     * as unknown, or be resumed by the wrong node. Refuse instead. Unstamped ids — minted before the
+     * deployment was sharded, or by an unsharded runtime — are allowed through.
+     */
+    private void requireOwned(ExecutionId id) {
+        if (shard == null) return;
+        id.shard().ifPresent(owner -> {
+            if (!owner.equals(shard)) {
+                throw new IllegalArgumentException("Execution " + id + " belongs to shard '" + owner
+                        + "', not this node's shard '" + shard + "'; route it there (ShardRing.shardOf)");
+            }
+        });
+    }
+
     private void requireOpen() {
         if (closing) throw new IllegalStateException("Runtime is shutting down; not accepting new work");
     }
@@ -300,6 +348,7 @@ public final class CatalystRuntime implements AutoCloseable {
      * accumulated since the last one.
      */
     public ExecutionState inspect(ExecutionId id) {
+        requireOwned(id);
         return foldState(id);
     }
 
@@ -393,6 +442,7 @@ public final class CatalystRuntime implements AutoCloseable {
      * {@link NonDeterministicReplayException}.
      */
     public <R> ExecutionState replay(ExecutionId id, Task<R> task, ExecutionOptions opts) {
+        requireOwned(id);
         List<SequencedEvent> recorded = log.read(id);
         ExecutionState state = Reducer.fold(id, recorded);
         ExecutionInfo info = new ExecutionInfo(id, state.attempt(),
@@ -438,6 +488,7 @@ public final class CatalystRuntime implements AutoCloseable {
      */
     public ExecutionHandle<?> resume(ExecutionId id, ExecutionOptions opts) {
         requireOpen();
+        requireOwned(id);
         return byExecution.withLock(id, () -> {
             // Already running here → attach to the in-flight attempt rather than scheduling a duplicate
             // that would interleave events and corrupt the stream (same guard as execute()).
@@ -562,6 +613,7 @@ public final class CatalystRuntime implements AutoCloseable {
      * {@link Trajectory}.
      */
     public BranchBuilder branch(ExecutionId id, long atSeq) {
+        requireOwned(id);
         return new BranchBuilder(this, id, atSeq);
     }
 
@@ -583,7 +635,7 @@ public final class CatalystRuntime implements AutoCloseable {
         Map<String, JsonNode> overrides = new HashMap<>();
         toolOverrideObjects.forEach((name, value) -> overrides.put(name, payloads.toTree(value)));
 
-        ExecutionId childId = ExecutionId.random();
+        ExecutionId childId = mintId();
         String components = changedComponents == null || changedComponents.isBlank()
                 ? "branch@" + atSeq : changedComponents;
         BranchSpec spec = new BranchSpec(atSeq, parentId.value(), overrides, components);
@@ -641,6 +693,7 @@ public final class CatalystRuntime implements AutoCloseable {
      * pause/cancel of a running task — that lands with the reserved WAITING/signal APIs in v1.)
      */
     public void pause(ExecutionId id) {
+        requireOwned(id);
         byExecution.withLock(id, () -> {
             if (inspect(id).isTerminal()) return;  // terminal (incl. just-completed) → no-op
             if (inFlight.containsKey(id)) {
@@ -665,6 +718,7 @@ public final class CatalystRuntime implements AutoCloseable {
      * event is appended directly, since there is no concurrent writer.
      */
     public void cancel(ExecutionId id) {
+        requireOwned(id);
         byExecution.withLock(id, () -> {
             if (inspect(id).isTerminal()) return;  // terminal (incl. just-completed) → no-op
             RunningAttempt attempt = running.get(id);
@@ -1068,6 +1122,8 @@ public final class CatalystRuntime implements AutoCloseable {
         private BlobStore blobStore;
         private int blobThresholdBytes = EventCodec.DEFAULT_BLOB_THRESHOLD_BYTES;
         private Duration drainTimeout = DEFAULT_DRAIN_TIMEOUT;
+        private String shard;
+        private ShardRing shardRing;
 
         /** Uses a log the caller already built. Exclusive with {@link #logFactory}. */
         public Builder log(EventLog log) {
@@ -1188,6 +1244,25 @@ public final class CatalystRuntime implements AutoCloseable {
         /** Replaces the task registry wholesale (for callers assembling registrations elsewhere). */
         public Builder tasks(TaskRegistry registry) {
             this.registry = java.util.Objects.requireNonNull(registry, "registry");
+            return this;
+        }
+
+        /**
+         * Makes this runtime shard {@code self} of {@code ring} in a sharded deployment: independent
+         * nodes, each with its own log, with work routed by idempotency key ({@link ShardRing}).
+         *
+         * <p>A sharded runtime then requires an idempotency key on every {@code execute}, refuses a key
+         * that {@code ring} routes to another shard, stamps {@code self} into every id it mints, and
+         * refuses id-addressed calls for an id stamped with another shard. All of it is checked before
+         * anything is written. Every node must be built with the same ring.
+         */
+        public Builder shard(String self, ShardRing ring) {
+            java.util.Objects.requireNonNull(ring, "ring");
+            if (!ring.contains(self)) {
+                throw new IllegalArgumentException("shard '" + self + "' is not in " + ring);
+            }
+            this.shard = self;
+            this.shardRing = ring;
             return this;
         }
 
