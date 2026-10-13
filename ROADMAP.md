@@ -473,12 +473,12 @@ below give the same capability natively.
     `ChildExecutionFailedException`, which the parent can handle.
   - **Who wakes it:** the child's completion in-process, and startup recovery / the claim loop,
     where a parent whose child is terminal counts as resumable.
-  - **Not yet:** cancelling a parent does not cascade to its children, and a branch cannot start a
-    child live.
+  - **Not yet:** a branch cannot start a child live.
   - **Exit demo:** `Demo child`.
 - **Supervision for child executions.** Follow-ups to `ctx.child`, in this order:
-  1. **Cancel cascade (propagate down).** Cancelling a parent cancels its running children. Every
-     supervision strategy needs it, and it closes the known gap above.
+  1. ✅ **Cancel cascade (propagate down).** Cancelling a parent cancels every child it has no
+     outcome for, recursively, by id (so a child on another node gets the request on its lease row).
+     Recovery is the durable backstop: a child whose parent is cancelled is cancelled, not resumed.
   2. **Supervision v1: one-for-one.** For example `ctx.child(task, Supervision.restart(3).fresh())`.
      - **Restart modes:** *resume* retries on the child's own stream, so its successful prefix is
        substituted (for transient failures). *Fresh* starts a new child execution from scratch (for

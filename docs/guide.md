@@ -276,7 +276,12 @@ the recorded result without running the child again.
 - **Inputs:** vars aren't persisted, and the child does not inherit the parent's vars or options.
   Pass a child's input through its constructor from values the parent got at a recorded boundary.
 - `inspect(id).awaitingChild()` gives the child a waiting parent is waiting on.
-- **Limits:** cancelling a parent does not cancel its children. A branch or an eval candidate that
+- **Cancelling a parent cancels its children:** every child it started and has no outcome for, and
+  their children in turn, whether they are running, waiting or paused, and on whichever node. If
+  the process stops before the cascade reaches a child, the next start's recovery cancels it rather
+  than resuming it. Cancelling a child on its own does not cancel the parent: the parent wakes and
+  gets `ChildExecutionFailedException` with status `CANCELLED`.
+- **Limits:** a branch or an eval candidate that
   reaches `ctx.child` past its fork point fails with `UnsupportedOperationException`; a child that
   was already completed in the recorded prefix is substituted as usual.
 

@@ -213,7 +213,7 @@ class ChildTest {
         }
     }
 
-    /** A parent cancelled while its child runs stays cancelled when the child finishes. */
+    /** A parent cancelled while its child runs stays cancelled when the child ends (cancelled by the cascade). */
     @Test
     void aCancelledParentIsNotWokenByItsChild() {
         Research.sleep = Duration.ofMillis(300);
@@ -224,7 +224,7 @@ class ChildTest {
             assertThatThrownBy(() -> run.result(Duration.ofSeconds(5))).isInstanceOf(ExecutionWaitingSignal.class);
             runtime.cancel(run.id());
             ExecutionId child = childOf(log, run.id());
-            await(() -> runtime.inspect(child).status() == Status.COMPLETED);
+            await(() -> runtime.inspect(child).isTerminal());
             sleep(200);
             assertThat(runtime.inspect(run.id()).status()).isEqualTo(Status.CANCELLED);
         } finally {
@@ -371,6 +371,182 @@ class ChildTest {
             assertThat((String) runtime.resume(run.id()).result()).startsWith("M|recovered from CANCELLED");
         } finally {
             Research.sleep = Duration.ZERO;
+        }
+    }
+    // ── Cancel cascade ─────────────────────────────────────────────────────────
+
+    /** A middle layer, so a cascade has a grandchild to reach. */
+    static final class Middle implements Task<String> {
+        @Override public String execute(Context ctx) {
+            return "middle:" + ctx.child(new Research());
+        }
+    }
+
+    static final class Top implements Task<String> {
+        @Override public String execute(Context ctx) {
+            return "top:" + ctx.child(new Middle());
+        }
+    }
+
+    private static CatalystRuntime cascadeRuntime(EventLog log, MockModel model) {
+        return CatalystRuntime.builder().log(log).model(model).clock(new LeaseTest.TestClock())
+                .task(Coordinator.class, Coordinator::new).task(Research.class, Research::new)
+                .task(Middle.class, Middle::new).task(Top.class, Top::new).build();
+    }
+
+    @Test
+    void cancellingAParentCancelsItsRunningChild() {
+        Research.sleep = Duration.ZERO;
+        Research.fail = false;
+        Research.gate = new java.util.concurrent.CountDownLatch(1);
+        EventLog log = EventLogs.inMemory();
+        MockModel model = MockModel.alwaysReturn("M");
+        try (CatalystRuntime runtime = cascadeRuntime(log, model)) {
+            var run = runtime.execute(new Coordinator(), ExecutionOptions.none());
+            await(() -> runtime.inspect(run.id()).status() == Status.WAITING);
+            ExecutionId child = childOf(log, run.id());
+            await(() -> runtime.inspect(child).status() == Status.RUNNING); // blocked on the gate
+            runtime.cancel(run.id());
+            await(() -> runtime.inspect(child).status() == Status.CANCELLED);
+            assertThat(runtime.inspect(run.id()).status()).isEqualTo(Status.CANCELLED);
+            assertThat(model.callCount()).as("the plan only; the child's call never ran").isEqualTo(1);
+        } finally {
+            Research.gate.countDown();
+            Research.gate = null;
+        }
+    }
+
+    @Test
+    void cancellingAParentCancelsEveryGenerationBelowIt() {
+        Research.sleep = Duration.ofHours(1);
+        Research.fail = false;
+        Research.gate = null;
+        EventLog log = EventLogs.inMemory();
+        try (CatalystRuntime runtime = cascadeRuntime(log, MockModel.alwaysReturn("M"))) {
+            var run = runtime.execute(new Top(), ExecutionOptions.none());
+            await(() -> runtime.inspect(run.id()).status() == Status.WAITING);
+            await(() -> log.read(run.id()).stream().anyMatch(se -> se.event() instanceof CatalystEvent.ChildStarted));
+            ExecutionId middle = childOf(log, run.id());
+            await(() -> runtime.inspect(middle).status() == Status.WAITING);
+            ExecutionId leaf = childOf(log, middle);
+            await(() -> runtime.inspect(leaf).status() == Status.WAITING); // asleep
+            runtime.cancel(run.id());
+            await(() -> runtime.inspect(leaf).status() == Status.CANCELLED);
+            assertThat(runtime.inspect(middle).status()).isEqualTo(Status.CANCELLED);
+            assertThat(runtime.inspect(run.id()).status()).isEqualTo(Status.CANCELLED);
+        } finally {
+            Research.sleep = Duration.ZERO;
+        }
+    }
+
+    /** The process stopped between the parent's cancel and the cascade: recovery cancels the child instead of resuming it. */
+    @Test
+    void recoveryCancelsAChildWhoseParentWasCancelled() {
+        Research.sleep = Duration.ZERO;
+        Research.fail = false;
+        Research.gate = null;
+        EventLog log = EventLogs.inMemory();
+        ExecutionId parent = ExecutionId.random();
+        ExecutionId child = ExecutionId.random();
+        java.time.Instant t = java.time.Instant.parse("2026-01-01T00:00:00Z");
+        log.append(parent, new CatalystEvent.ExecutionCreated(t, Coordinator.class.getName(), "novars", "cfg", ""));
+        log.append(parent, new CatalystEvent.ExecutionStarted(t, 1, "node-dead"));
+        log.append(parent, new CatalystEvent.ChildStarted(t, "child-1", child.value(), Research.class.getName()));
+        log.append(child, new CatalystEvent.ExecutionCreated(t, Research.class.getName(), "novars", "cfg",
+                "child:" + parent.value() + ":child-1"));
+        log.append(child, new CatalystEvent.ExecutionStarted(t, 1, "node-dead"));
+        log.append(parent, new CatalystEvent.ExecutionCancelled(t, "cancelled by request", 2));
+        MockModel model = MockModel.alwaysReturn("M");
+        try (CatalystRuntime runtime = cascadeRuntime(log, model)) {
+            RecoveryReport report = runtime.recoverAll();
+            assertThat(report.resumed()).doesNotContainKey(child);
+            assertThat(runtime.inspect(child).status()).isEqualTo(Status.CANCELLED);
+            assertThat(model.callCount()).isZero();
+        }
+    }
+    /** Swallows the child wait and blocks, so it is still in flight when cancelled. */
+    static final class Lingering implements Task<String> {
+        static final java.util.concurrent.CountDownLatch blocked = new java.util.concurrent.CountDownLatch(1);
+        @Override public String execute(Context ctx) {
+            try {
+                return ctx.child(new Research());
+            } catch (ExecutionWaitingSignal swallowed) {
+                blocked.countDown();
+                try {
+                    Thread.sleep(Duration.ofSeconds(20).toMillis());
+                } catch (InterruptedException e) {
+                    Thread.currentThread().interrupt();
+                }
+                return ctx.effect("after", () -> "late"); // unwinds here, with the cancel
+            }
+        }
+    }
+
+    /** The parent's own attempt records the cancel (it was in flight): the cascade still runs. */
+    @Test
+    void aParentCancelledInFlightCancelsItsChild() {
+        Research.sleep = Duration.ZERO;
+        Research.fail = false;
+        Research.gate = new java.util.concurrent.CountDownLatch(1);
+        EventLog log = EventLogs.inMemory();
+        try (CatalystRuntime runtime = CatalystRuntime.builder().log(log).model(MockModel.alwaysReturn("M"))
+                .task(Lingering.class, Lingering::new).task(Research.class, Research::new).build()) {
+            var run = runtime.execute(new Lingering(), ExecutionOptions.none());
+            assertThat(awaitLatch(Lingering.blocked)).isTrue();
+            ExecutionId child = childOf(log, run.id());
+            await(() -> runtime.inspect(child).status() == Status.RUNNING);
+            runtime.cancel(run.id()); // trips the parent's attempt, which records ExecutionCancelled itself
+            await(() -> runtime.inspect(run.id()).status() == Status.CANCELLED);
+            await(() -> runtime.inspect(child).status() == Status.CANCELLED);
+        } finally {
+            Research.gate.countDown();
+            Research.gate = null;
+        }
+    }
+
+    private static boolean awaitLatch(java.util.concurrent.CountDownLatch latch) {
+        try {
+            return latch.await(10, TimeUnit.SECONDS);
+        } catch (InterruptedException e) {
+            Thread.currentThread().interrupt();
+            return false;
+        }
+    }
+    /** Caller keys are not namespaced: a key that only looks like a child's never gets an execution cancelled. */
+    @Test
+    void recoveryDoesNotCancelAnExecutionWhoseKeyOnlyLooksLikeAChilds() {
+        Research.sleep = Duration.ZERO;
+        Research.fail = false;
+        Research.gate = null;
+        EventLog log = EventLogs.inMemory();
+        ExecutionId cancelled = ExecutionId.random();
+        ExecutionId unrelated = ExecutionId.random();
+        java.time.Instant t = java.time.Instant.parse("2026-01-01T00:00:00Z");
+        log.append(cancelled, new CatalystEvent.ExecutionCreated(t, Coordinator.class.getName(), "novars", "cfg", ""));
+        log.append(cancelled, new CatalystEvent.ExecutionCancelled(t, "cancelled by request", 0));
+        log.append(unrelated, new CatalystEvent.ExecutionCreated(t, Research.class.getName(), "novars", "cfg",
+                "child:" + cancelled.value() + ":mine"));
+        log.append(unrelated, new CatalystEvent.ExecutionStarted(t, 1, "node-dead"));
+        try (CatalystRuntime runtime = cascadeRuntime(log, MockModel.alwaysReturn("M"))) {
+            runtime.recoverAll();
+            await(() -> runtime.inspect(unrelated).status() == Status.COMPLETED);
+        }
+    }
+    /** A child the parent recorded but never created: the cascade leaves its stream empty. */
+    @Test
+    void cancellingAParentDoesNotWriteAStreamForAChildNeverCreated() {
+        EventLog log = EventLogs.inMemory();
+        ExecutionId parent = ExecutionId.random();
+        ExecutionId child = ExecutionId.random();
+        java.time.Instant t = java.time.Instant.parse("2026-01-01T00:00:00Z");
+        log.append(parent, new CatalystEvent.ExecutionCreated(t, Coordinator.class.getName(), "novars", "cfg", ""));
+        log.append(parent, new CatalystEvent.ExecutionStarted(t, 1, "node-dead"));
+        log.append(parent, new CatalystEvent.ChildStarted(t, "child-1", child.value(), Research.class.getName()));
+        try (CatalystRuntime runtime = cascadeRuntime(log, MockModel.alwaysReturn("M"))) {
+            runtime.cancel(parent);
+            assertThat(runtime.inspect(parent).status()).isEqualTo(Status.CANCELLED);
+            sleep(300); // the cascade runs on the timer thread
+            assertThat(log.read(child)).isEmpty();
         }
     }
 }
