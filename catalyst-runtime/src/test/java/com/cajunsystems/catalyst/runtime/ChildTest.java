@@ -512,4 +512,24 @@ class ChildTest {
             return false;
         }
     }
+    /** Caller keys are not namespaced: a key that only looks like a child's never gets an execution cancelled. */
+    @Test
+    void recoveryDoesNotCancelAnExecutionWhoseKeyOnlyLooksLikeAChilds() {
+        Research.sleep = Duration.ZERO;
+        Research.fail = false;
+        Research.gate = null;
+        EventLog log = EventLogs.inMemory();
+        ExecutionId cancelled = ExecutionId.random();
+        ExecutionId unrelated = ExecutionId.random();
+        java.time.Instant t = java.time.Instant.parse("2026-01-01T00:00:00Z");
+        log.append(cancelled, new CatalystEvent.ExecutionCreated(t, Coordinator.class.getName(), "novars", "cfg", ""));
+        log.append(cancelled, new CatalystEvent.ExecutionCancelled(t, "cancelled by request", 0));
+        log.append(unrelated, new CatalystEvent.ExecutionCreated(t, Research.class.getName(), "novars", "cfg",
+                "child:" + cancelled.value() + ":mine"));
+        log.append(unrelated, new CatalystEvent.ExecutionStarted(t, 1, "node-dead"));
+        try (CatalystRuntime runtime = cascadeRuntime(log, MockModel.alwaysReturn("M"))) {
+            runtime.recoverAll();
+            await(() -> runtime.inspect(unrelated).status() == Status.COMPLETED);
+        }
+    }
 }

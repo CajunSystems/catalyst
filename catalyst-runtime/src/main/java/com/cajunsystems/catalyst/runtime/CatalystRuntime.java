@@ -787,7 +787,7 @@ public final class CatalystRuntime implements AutoCloseable {
                     // deliberate PAUSED or WAITING (Deploy-2). A live lease held elsewhere means it is
                     // running there.
                     ExecutionState unleased = foldState(id);
-                    if (cancelledParentOf(unleased).isPresent()) {
+                    if (cancelledParentOf(id, unleased).isPresent()) {
                         // A child whose parent was cancelled, and the cascade never reached it (the
                         // process stopped first, say): cancel it now. Recovery is the durable backstop.
                         cancel(id); // reentrant on the id lock; forwarded if another node runs it
@@ -951,7 +951,6 @@ public final class CatalystRuntime implements AutoCloseable {
         wakeIfResumable(id);
     }
 
-    /** Wakes {@code id} later, on the timer thread: never inline, since the caller may hold locks or be the child's attempt. */
     /**
      * Cancels, off this thread, the children a cancelled {@code parent} started and has no outcome
      * for. Each is cancelled by id, so a child running on another node gets the request on its lease
@@ -997,21 +996,25 @@ public final class CatalystRuntime implements AutoCloseable {
 
     /**
      * The parent of a not-yet-terminal child execution, if that parent is cancelled. A child is
-     * created with the key {@code child:<parent>:<ref>}, so its own stream names its parent.
+     * created with the key {@code child:<parent>:<ref>}, so its own stream names its parent. Caller
+     * keys are not namespaced, so the key alone proves nothing: the parent must also have recorded
+     * starting this very child. A cancel is terminal, and must never land on an unrelated execution.
      */
-    private Optional<ExecutionId> cancelledParentOf(ExecutionState state) {
+    private Optional<ExecutionId> cancelledParentOf(ExecutionId id, ExecutionState state) {
         String key = state.idempotencyKey();
         if (state.isTerminal() || key == null || !key.startsWith(CHILD_KEY_PREFIX)) return Optional.empty();
         int ref = key.lastIndexOf(':');
         if (ref <= CHILD_KEY_PREFIX.length()) return Optional.empty();
         try {
             ExecutionId parent = ExecutionId.of(key.substring(CHILD_KEY_PREFIX.length(), ref));
-            return foldState(parent).status() == Status.CANCELLED ? Optional.of(parent) : Optional.empty();
+            return foldState(parent).status() == Status.CANCELLED && unfinishedChildren(parent).contains(id)
+                    ? Optional.of(parent) : Optional.empty();
         } catch (RuntimeException notAParent) {
             return Optional.empty(); // a caller's own key that only looks like a child's
         }
     }
 
+    /** Wakes {@code id} later, on the timer thread: never inline, since the caller may hold locks or be the child's attempt. */
     private void wakeLater(ExecutionId id) {
         if (closing) return;
         try {

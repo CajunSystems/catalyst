@@ -436,11 +436,15 @@ checkout's pom to `com.github.CajunSystems` before installing.
     - **Durable backstop:** `scan()` checks `cancelledParentOf(state)` first. A child's key is
       `child:<parent>:<ref>` (`CHILD_KEY_PREFIX`), so its own stream names its parent. If that
       parent is CANCELLED, the scan cancels the child instead of resuming it. This covers a crash
-      or shutdown that cut the cascade short.
+      or shutdown that cut the cascade short. **The parent must also list this child among its
+      unfinished children:** caller keys are not namespaced, so a key alone that looks like
+      `child:…` must never get an unrelated execution cancelled (review finding, mutation-checked).
     - **Order is parent first, then children.** Cancelling the children first would wake the parent
       with a `CANCELLED` child failure that it could handle and carry on from.
     - **Mutation-checked:** the cancel hook, the in-flight hook and the backstop each fail a test.
-      The CANCELLED guard in `cascadeCancel` is defensive and untested.
+      The CANCELLED re-fold in `cascadeCancel` is load-bearing but untested: a failed
+      `recordCancelled` append and a `REPLAY_TERMINAL` handle both complete with
+      `CancellationException` without the parent being cancelled.
 
 - **Fenced runtime writes (Dist-1)** — `FencedWritesTest` (runtime: two runtimes over one log = two
   writers) + `FencedWritesAcceptanceTest` (the same over a real Gumbo log: storage refuses the zombie).
