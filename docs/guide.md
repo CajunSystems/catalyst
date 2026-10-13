@@ -378,6 +378,36 @@ Some specifics:
 - **Real models:** `LangChain4jModel` carries tool calls and tool results (linked by call id) both
   ways.
 
+### Tools from an MCP server
+
+`catalyst-mcp` (opt-in, like `catalyst-langchain4j`) turns the tools an MCP server offers into
+Catalyst tools, using the official MCP Java SDK:
+
+```java
+McpSyncClient client = McpClient.sync(new StdioClientTransport(
+        ServerParameters.builder("npx").args("-y", "@acme/ticket-mcp").build(),
+        new JacksonMcpJsonMapper(new ObjectMapper()))).build();
+client.initialize();
+
+Agent agent = McpToolset.from(client)          // every tool the server lists
+        .only("lookup_ticket", "escalate")     // optional: a fixed subset
+        .addTo(Agent.builder().instructions("You triage support tickets."))
+        .build();
+```
+
+Each MCP call goes through `ctx.call`, so it is a recorded boundary like any other tool call:
+- **Resume, replay and eval substitute the recorded result,** and a replay never contacts the server.
+- **A result with `isError: true`** is recorded as the call's failure, and the agent tells the model.
+- **Text content** goes back to the model. Images and other non-text content are described as
+  placeholders.
+
+**The tool list is part of the recording.** Every model request carries the tools' names and schemas
+(schemas canonicalised, so key order doesn't matter), and both feed the request hash. A replay or
+resume must offer the same tools with the same schemas. Pin the server's version, or use `only(...)`.
+
+Any tool that takes its arguments as JSON with its own schema can join an agent the same way:
+`Agent.builder().tool(jsonTool, description, inputSchemaJson)`.
+
 ## Evaluating models and prompts
 
 The log is a dataset. `catalyst-eval` (included in `catalyst-api`) replays recorded executions

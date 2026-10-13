@@ -33,17 +33,54 @@ public final class AgentTool<I, O> {
     private final Tool<I, O> tool;
     private final ToolSpec spec;
     private final boolean wrapped;
+    /** The input is the model's arguments object as-is (a tool with its own schema, e.g. from MCP). */
+    private final boolean raw;
 
     private AgentTool(Tool<I, O> tool, String description) {
         this.tool = Objects.requireNonNull(tool, "tool");
         Class<I> type = Objects.requireNonNull(tool.inputType(), "tool " + tool.name() + " has no input type");
         this.wrapped = !type.isRecord();
+        this.raw = false;
         this.spec = new ToolSpec(tool.name(), description, schemaFor(tool.name(), type).toString());
+    }
+
+    private AgentTool(Tool<I, O> tool, String description, String inputSchemaJson) {
+        this.tool = Objects.requireNonNull(tool, "tool");
+        if (tool.inputType() != JsonNode.class) {
+            throw new IllegalArgumentException("Tool '" + tool.name() + "': an explicit schema is for tools that take the"
+                    + " arguments as JSON (inputType JsonNode); this one takes " + tool.inputType().getName());
+        }
+        this.wrapped = false;
+        this.raw = true;
+        this.spec = new ToolSpec(tool.name(), description, canonicalSchema(tool.name(), inputSchemaJson));
     }
 
     /** {@code tool}, described to the model as {@code description}. */
     public static <I, O> AgentTool<I, O> of(Tool<I, O> tool, String description) {
         return new AgentTool<>(tool, description);
+    }
+
+    /**
+     * A tool that takes the model's arguments object as JSON and brings its own JSON schema, such as
+     * one from an MCP server. The arguments are passed through as given; the tool (or the server
+     * behind it) validates them, and a failure goes back to the model like any tool failure. The
+     * schema is part of every request's hash, so it is written in canonical form (keys sorted), and
+     * the same schema always hashes the same.
+     */
+    public static <O> AgentTool<JsonNode, O> withSchema(Tool<JsonNode, O> tool, String description, String inputSchemaJson) {
+        return new AgentTool<>(tool, description, inputSchemaJson);
+    }
+
+    private static String canonicalSchema(String toolName, String schemaJson) {
+        try {
+            JsonNode schema = JSON.readTree(Objects.requireNonNull(schemaJson, "inputSchemaJson"));
+            if (!schema.isObject()) throw new IllegalArgumentException("not a JSON object");
+            Object plain = JSON.treeToValue(schema, Object.class); // maps, so ORDER_MAP_ENTRIES_BY_KEYS applies
+            return JSON.writeValueAsString(plain);
+        } catch (JsonProcessingException | IllegalArgumentException e) {
+            throw new IllegalArgumentException("Tool '" + toolName + "': input schema is not a JSON object schema: "
+                    + getOriginalMessageOf(e), e);
+        }
     }
 
     public Tool<I, O> tool() {
@@ -59,6 +96,11 @@ public final class AgentTool<I, O> {
     I decode(String argumentsJson) {
         try {
             JsonNode args = JSON.readTree(argumentsJson == null || argumentsJson.isBlank() ? "{}" : argumentsJson);
+            if (raw) {
+                if (!args.isObject()) throw new IllegalArgumentException("arguments must be a JSON object");
+                @SuppressWarnings("unchecked") I asIs = (I) args;
+                return asIs;
+            }
             if (wrapped) {
                 JsonNode value = args.get("value");
                 if (value == null || value.isNull()) throw new IllegalArgumentException("missing \"value\"");

@@ -178,6 +178,7 @@ runs every one of them as a gate.
 | check that my task code is deterministic | `runtime.replay(id, task)` | [Replay](docs/guide.md#inspect-replay-branch) |
 | try a different model on a past run | `runtime.branch(id, seq).withModel(m).run(task)` | [Branch](docs/guide.md#inspect-replay-branch) |
 | build a tool-calling agent that survives crashes and replays | `Agent.builder().tool(...).build().run(ctx, input)` | [Agents](docs/guide.md#agents) |
+| give an agent the tools of an MCP server | `McpToolset.from(client).addTo(Agent.builder())` | [MCP](docs/guide.md#tools-from-an-mcp-server) |
 | check a model or prompt change against real traffic | `Eval.on(runtime).cases(ids).candidate(...).run()` | [Evaluating](docs/guide.md#evaluating-models-and-prompts) |
 | stream tokens to a UI | `ctx.model().stream(request, sink)` | [Streaming](docs/guide.md#streaming-completions) |
 | see what an execution did, and what it cost | `TimelineReport.writeTo(...)`, `CatalystTracer` (OTel) | [Observability](docs/guide.md#timeline-reports-and-opentelemetry) |
@@ -192,7 +193,8 @@ runs every one of them as a gate.
 
 ## Modules
 
-Most applications need only `catalyst-api`, plus `catalyst-langchain4j` for real models.
+Most applications need only `catalyst-api`, plus `catalyst-langchain4j` for real models and
+`catalyst-mcp` for MCP tools.
 
 | Module | What it is |
 |---|---|
@@ -203,6 +205,7 @@ Most applications need only `catalyst-api`, plus `catalyst-langchain4j` for real
 | `catalyst-events` | The event schema and its serialization (kept stable; changes are additive) |
 | `catalyst-tools` | Built-in tools: clock, calculator, HTTP, sandboxed filesystem |
 | `catalyst-langchain4j` | Adapter for any LangChain4j chat model, streaming included |
+| `catalyst-mcp` | An MCP server's tools as Catalyst tools, for agents (official MCP Java SDK; opt-in) |
 | `catalyst-timeline` | Renders an execution as a self-contained HTML report |
 | `catalyst-otel` | Exports an execution as an OpenTelemetry trace (API only; you bring the SDK) |
 | `catalyst-eval` | Eval harness: replays recorded runs against candidate models and prompts, and scores them |

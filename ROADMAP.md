@@ -435,8 +435,19 @@ The substrate becomes a platform. This is where the other CajunSystems component
     an agent's failure text, and therefore its next prompt, is identical live and on replay.
   - **Exit demo `Demo agent`:** a crash mid-conversation resumes without repeating a turn or a tool
     call, a strict replay makes zero calls, and an eval re-runs no tool.
-- **MCP** integration and richer tool ecosystems. *Next:* an MCP module that turns an MCP server's
-  tools into Catalyst `Tool`s (recorded boundaries like any other), so an `Agent` can use them.
+- ✅ **MCP** integration and richer tool ecosystems. *As shipped:* `catalyst-mcp` (opt-in), on the
+  official MCP Java SDK 2.0.1 (`mcp-core` + `mcp-json-jackson2`, staying on Jackson 2):
+  - **Tools:** `McpToolset.from(client)` lists a server's tools (all pages, sorted by name), and
+    `.only(...)` refuses unknown names. `.addTo(Agent.Builder)` offers each with the server's
+    description and schema.
+  - **Calls:** `McpTool` is a `Tool<JsonNode, String>`, not `@Deterministic`. Text content is the
+    output, and `isError` throws `McpToolError`, recorded as the call's failure.
+  - **Agents:** `catalyst-agents` gained `tool(jsonTool, description, inputSchemaJson)`, which passes
+    the arguments through and stores the schema canonicalised for a stable hash.
+  - **Tests:** `McpAgentTest` spawns a real MCP server JVM over stdio. A strict replay of an agent's
+    run leaves the server's own call counter unchanged.
+  - **Limits:** the tool list is part of the recording, so replay needs the same tools and schemas.
+    Text-only results.
 
 ### Signals & human-in-the-loop — Boudin integration (spec §5 lifecycle, §12)
 *Pulled forward as Deploy-6 above; Boudin workflow invocation stays here.*
