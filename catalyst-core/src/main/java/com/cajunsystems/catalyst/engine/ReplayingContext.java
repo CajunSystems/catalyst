@@ -109,6 +109,8 @@ public final class ReplayingContext implements Context {
     private String awaitingSignal;
     /** Children started and not yet recorded as finished, by child ref. */
     private final java.util.Map<String, ChildStarted> pendingChildren = new java.util.HashMap<>();
+    /** Retries and timeout for a model or tool call that names no policy of its own. */
+    private CallPolicy defaultCallPolicy = CallPolicy.none();
     /** The task type each recorded child ref was started with, so a different one is a divergence. */
     private final java.util.Map<String, String> childTypes = new java.util.HashMap<>();
     /** Every recorded ctx.spawn, by ref: a spawn re-run on resume or replay gets the same child. */
@@ -333,7 +335,18 @@ public final class ReplayingContext implements Context {
 
     @Override
     public Model model() {
-        return new RecordingModel();
+        return new RecordingModel(null);
+    }
+
+    @Override
+    public Model model(CallPolicy policy) {
+        java.util.Objects.requireNonNull(policy, "policy");
+        return new RecordingModel(policy);
+    }
+
+    /** The policy for calls that name none; set by the runtime ({@code Builder.callPolicy}). */
+    public void setCallPolicy(CallPolicy policy) {
+        this.defaultCallPolicy = java.util.Objects.requireNonNull(policy, "policy");
     }
 
     /**
@@ -342,15 +355,22 @@ public final class ReplayingContext implements Context {
      * a non-streamed one produce the same events and replay identically.
      */
     private final class RecordingModel implements Model {
+        /** This view's call policy, or null for the context's default. */
+        private final CallPolicy policy;
+
+        RecordingModel(CallPolicy policy) {
+            this.policy = policy;
+        }
+
         @Override
         public Completion complete(CompletionRequest request) {
-            return modelBoundary(request, null);
+            return modelBoundary(request, null, policy);
         }
 
         @Override
         public Completion stream(CompletionRequest request, TokenSink sink) {
             if (sink == null) throw new IllegalArgumentException("sink");
-            return modelBoundary(request, sink);
+            return modelBoundary(request, sink, policy);
         }
     }
 
@@ -361,7 +381,7 @@ public final class ReplayingContext implements Context {
      * rebuilds its result from what it receives, so a replay that delivered nothing would diverge at
      * the task's own output.
      */
-    private Completion modelBoundary(CompletionRequest request, TokenSink sink) {
+    private Completion modelBoundary(CompletionRequest request, TokenSink sink, CallPolicy policy) {
         Optional<Boundary> recorded = pollExpected(CompletionReceived.class, "model completion");
         if (recorded.isPresent()) {
             Boundary b = recorded.get();
@@ -383,14 +403,14 @@ public final class ReplayingContext implements Context {
             forkOrThrow(b.seq(), "model request " + b.hash(), "model request " + actualHash);
         }
         if (danglingCompletion != null) {
-            return handleInDoubtCompletion(request, sink);
+            return handleInDoubtCompletion(request, sink, policy);
         }
         requireAppendable("model completion");
         requireModel();
         String requestHash = Hashing.canonicalRequestHash(request);
         append(new PromptBuilt(now(), Hashing.sha256(canonicalPrompt(request)), eventMapper.valueToTree(request.prompt())));
         append(new CompletionRequested(now(), requestHash));
-        return invokeAndRecord(request, sink);
+        return invokeAndRecord(request, sink, policy);
     }
 
     /**
@@ -413,7 +433,7 @@ public final class ReplayingContext implements Context {
      * execution replays exactly like one that never crashed. Same shape as the tool path, which
      * appends only the {@code ToolCompleted}.
      */
-    private Completion handleInDoubtCompletion(CompletionRequest request, TokenSink sink) {
+    private Completion handleInDoubtCompletion(CompletionRequest request, TokenSink sink, CallPolicy policy) {
         CompletionRequested pending = danglingCompletion;
         long pendingSeq = danglingCompletionSeq;
         danglingCompletion = null;
@@ -426,7 +446,7 @@ public final class ReplayingContext implements Context {
             case RETRY -> {
                 requireAppendable("in-doubt retry of model completion");
                 requireModel();
-                yield invokeAndRecord(request, sink);
+                yield invokeAndRecord(request, sink, policy);
             }
             case FAIL -> throw new InDoubtException(
                     "In-doubt model completion (crashed between request and completion); the provider"
@@ -448,17 +468,39 @@ public final class ReplayingContext implements Context {
      * Calls the provider and records the completion. The request marker is the caller's business: a
      * live call opens one, an in-doubt retry closes the one already in the log.
      */
-    private Completion invokeAndRecord(CompletionRequest request, TokenSink sink) {
+    private Completion invokeAndRecord(CompletionRequest request, TokenSink sink, CallPolicy policy) {
+        CallPolicy p = policy != null ? policy : defaultCallPolicy;
         long t0 = System.nanoTime();
-        Completion completion = sink == null
-                ? realModel.complete(request)
-                : realModel.stream(request, guarded(sink));
+        Completion completion;
+        try {
+            completion = sink == null
+                    ? invokeWithPolicy(p, "model", () -> realModel.complete(request), true, () -> true)
+                    : streamWithPolicy(p, request, sink);
+        } catch (ExecutionAbandonedSignal stop) {
+            recordRetryOnRestart(stop, -1); // the model failure recorded nothing; this closes its request
+            throw stop;
+        }
         long latencyMillis = (System.nanoTime() - t0) / 1_000_000;
         append(new CompletionReceived(now(), eventMapper.valueToTree(completion),
                 completion.usage().promptTokens(), completion.usage().completionTokens(),
                 latencyMillis, costModel.usd(completion.usage().promptTokens(), completion.usage().completionTokens()),
                 completion.finishReason()));
         return completion;
+    }
+
+    /**
+     * A streamed completion under its policy. A retry would deliver the text again, and the task would
+     * assemble it twice, so it is retried only while nothing has reached the sink. No timeout, so the
+     * sink stays on the task's thread.
+     */
+    private Completion streamWithPolicy(CallPolicy p, CompletionRequest request, TokenSink sink) {
+        java.util.concurrent.atomic.AtomicBoolean delivered = new java.util.concurrent.atomic.AtomicBoolean();
+        TokenSink guardedSink = guarded(sink);
+        TokenSink tracking = text -> {
+            delivered.set(true);
+            guardedSink.accept(text);
+        };
+        return invokeWithPolicy(p, "model", () -> realModel.stream(request, tracking), false, () -> !delivered.get());
     }
 
     /**
@@ -492,8 +534,19 @@ public final class ReplayingContext implements Context {
     // ── Tool boundary ──────────────────────────────────────────────────────────
 
     @Override
-    @SuppressWarnings("unchecked")
     public <I, O> O call(Tool<I, O> tool, I input) {
+        return callWith(tool, input, null);
+    }
+
+    @Override
+    public <I, O> O call(Tool<I, O> tool, I input, CallPolicy policy) {
+        java.util.Objects.requireNonNull(policy, "policy");
+        return callWith(tool, input, policy);
+    }
+
+    /** The tool boundary; {@code policy} (null for the default) governs only a live call. */
+    @SuppressWarnings("unchecked")
+    private <I, O> O callWith(Tool<I, O> tool, I input, CallPolicy policy) {
         Optional<Boundary> recorded = pollExpected(ToolCompleted.class, "tool " + tool.name());
         if (recorded.isPresent()) {
             Boundary b = recorded.get();
@@ -528,12 +581,12 @@ public final class ReplayingContext implements Context {
             }
         }
         if (danglingTool != null) {
-            return handleInDoubt(tool, input);
+            return handleInDoubt(tool, input, policy);
         }
         if (branchSpec != null && branchSpec.toolReplay() != BranchSpec.ToolReplay.LIVE && !isDeterministic(tool)) {
-            return answerFromRecording(tool, input);
+            return answerFromRecording(tool, input, policy);
         }
-        return runToolLive(tool, input);
+        return runToolLive(tool, input, policy);
     }
 
     /**
@@ -543,7 +596,7 @@ public final class ReplayingContext implements Context {
      * Deterministic tools never get here: re-running them is safe and is what they are for.
      */
     @SuppressWarnings("unchecked")
-    private <I, O> O answerFromRecording(Tool<I, O> tool, I input) {
+    private <I, O> O answerFromRecording(Tool<I, O> tool, I input, CallPolicy policy) {
         com.fasterxml.jackson.databind.JsonNode inputTree = eventMapper.valueToTree(input);
         String inputHash = Hashing.canonicalJsonHash(inputTree);
         String key = BranchSpec.toolKey(tool.name(), inputHash);
@@ -561,7 +614,7 @@ public final class ReplayingContext implements Context {
                 raisedUnrecordedTool = new UnrecordedToolCallException(tool.name(), inputHash);
                 throw raisedUnrecordedTool;
             }
-            return runToolLive(tool, input);
+            return runToolLive(tool, input, policy);
         }
         requireAppendable("tool " + tool.name());
         recordedToolCursor.put(key, next + 1);
@@ -578,12 +631,12 @@ public final class ReplayingContext implements Context {
         return (O) payloads.fromTree(recorded.output());
     }
 
-    private <I, O> O runToolLive(Tool<I, O> tool, I input) {
+    private <I, O> O runToolLive(Tool<I, O> tool, I input, CallPolicy policy) {
         requireAppendable("tool " + tool.name());
         append(new ToolRequested(now(), tool.name(), eventMapper.valueToTree(input)));
         long t0 = System.nanoTime();
         try {
-            O output = applyUnchecked(tool, input);
+            O output = applyWithPolicy(tool, input, policy);
             long latencyMillis = (System.nanoTime() - t0) / 1_000_000;
             append(new ToolCompleted(now(), payloads.toTree(output), null, latencyMillis));
             return output;
@@ -592,13 +645,20 @@ public final class ReplayingContext implements Context {
             // Record the failure as a boundary result (so inspect/replay see it), and remember which seq
             // it landed at plus the instance we rethrow, so a retry can attribute the propagating failure
             // back to this boundary and re-run it live rather than substituting the recorded failure.
-            lastToolFailureSeq = append(new ToolCompleted(now(), null, String.valueOf(ex), latencyMillis));
+            lastToolFailureSeq = append(new ToolCompleted(now(), null, String.valueOf(lastRealFailure(ex)), latencyMillis));
             lastToolFailureException = ex;
+            recordRetryOnRestart(ex, lastToolFailureSeq);
             throw ex;
         }
     }
 
-    private <I, O> O handleInDoubt(Tool<I, O> tool, I input) {
+    /** What the call actually failed with: a stop that cut its retries short carries it as suppressed. */
+    private static Throwable lastRealFailure(RuntimeException ex) {
+        return (ex instanceof CancellationSignal || ex instanceof ExecutionAbandonedSignal) && ex.getSuppressed().length > 0
+                ? ex.getSuppressed()[0] : ex;
+    }
+
+    private <I, O> O handleInDoubt(Tool<I, O> tool, I input, CallPolicy policy) {
         ToolRequested pending = danglingTool;
         long pendingSeq = danglingToolSeq;
         danglingTool = null;
@@ -612,7 +672,7 @@ public final class ReplayingContext implements Context {
                 long t0 = System.nanoTime();
                 O output;
                 try {
-                    output = applyUnchecked(tool, input);
+                    output = applyWithPolicy(tool, input, policy);
                 } catch (RuntimeException ex) {
                     // The retried call failed: that is its verdict, recorded exactly as runToolLive
                     // records one, completing the dangling request. Left unrecorded, a task that handles
@@ -620,8 +680,9 @@ public final class ReplayingContext implements Context {
                     // request that never completes: replay diverges there, and every resume would find
                     // it in doubt again.
                     long latencyMillis = (System.nanoTime() - t0) / 1_000_000;
-                    lastToolFailureSeq = append(new ToolCompleted(now(), null, String.valueOf(ex), latencyMillis));
+                    lastToolFailureSeq = append(new ToolCompleted(now(), null, String.valueOf(lastRealFailure(ex)), latencyMillis));
                     lastToolFailureException = ex;
+                    recordRetryOnRestart(ex, lastToolFailureSeq);
                     throw ex;
                 }
                 long latencyMillis = (System.nanoTime() - t0) / 1_000_000;
@@ -1262,6 +1323,143 @@ public final class ReplayingContext implements Context {
      * pure replay must not append.)
      */
     @SuppressWarnings("unchecked")
+    private <I, O> O applyWithPolicy(Tool<I, O> tool, I input, CallPolicy policy) {
+        CallPolicy p = policy != null ? policy : defaultCallPolicy;
+        return invokeWithPolicy(p, "tool " + tool.name(), () -> applyUnchecked(tool, input), true, () -> true);
+    }
+
+    // ── Per-call retries and timeouts ──────────────────────────────────────────
+
+    /**
+     * Runs one live call under its {@link CallPolicy}: each attempt (under the timeout, if any and if
+     * {@code timeoutAllowed}), retried while the policy accepts the failure, {@code retryable} holds and
+     * the execution is not being stopped. Each retry records an informational {@code CallRetried}. The
+     * caller records only the outcome, so a replay substitutes it without retrying.
+     */
+    private <T> T invokeWithPolicy(CallPolicy policy, String call, Supplier<T> invocation,
+                                   boolean timeoutAllowed, java.util.function.BooleanSupplier retryable) {
+        for (int attempt = 1; ; attempt++) {
+            try {
+                return timeoutAllowed && policy.timeout().isPresent()
+                        ? withTimeout(invocation, call, policy.timeout().get())
+                        : invocation.get();
+            } catch (RuntimeException failure) {
+                if (failure instanceof CancellationSignal || failure instanceof ExecutionAbandonedSignal) throw failure;
+                if (!policy.retries(attempt, failure) || !retryable.getAsBoolean()) throw failure;
+                if (stopRequested()) throw stoppedRetrying(failure);
+                append(new CallRetried(now(), call, attempt, String.valueOf(failure)));
+                if (!waitBackoff(policy.backoffAfter(attempt))) throw stoppedRetrying(failure);
+            }
+        }
+    }
+
+    /**
+     * Retries cut short; the failure travels as a suppressed exception on the signal returned.
+     * <ul>
+     *   <li>A <b>cancel</b> surfaces as the cancel, so the execution ends {@code CANCELLED}, not
+     *       {@code FAILED}, over a failure that was only waiting for its retry.</li>
+     *   <li>A <b>shutdown</b> surfaces as an abandon, so the execution stays {@code RUNNING} for the
+     *       next start. Failing it would end, for good, a call the policy would still have retried.
+     *       The caller records the failure and a {@code RetryRequested} naming it
+     *       ({@link #recordRetryOnRestart}), so the request is closed rather than left in doubt, and
+     *       the resumed attempt re-runs the call live with a fresh budget.</li>
+     * </ul>
+     * The caller records the call's outcome first, with {@link #lastRealFailure} as its error.
+     */
+    private RuntimeException stoppedRetrying(RuntimeException failure) {
+        if (cancellation != null && cancellation.isCancelled()) {
+            raisedCancellation = true;
+            CancellationSignal signal = new CancellationSignal(cancellation.reason());
+            signal.addSuppressed(failure);
+            return signal;
+        }
+        if (cancellation != null && cancellation.isAbandoned()) {
+            raisedAbandon = true;
+            ExecutionAbandonedSignal signal = new ExecutionAbandonedSignal("runtime shutting down during the retries of a"
+                    + " call; execution " + id + " is left RUNNING and the call is retried on the next start");
+            signal.addSuppressed(failure);
+            return signal;
+        }
+        return failure;
+    }
+
+    /**
+     * After retries were cut short by a shutdown: names the failed call in a {@code RetryRequested}.
+     * {@code failedSeq} is its {@code ToolCompleted}, or -1 for a model call, which recorded nothing
+     * and whose request the retry closes. The next start then re-runs the call live instead of
+     * substituting the failure, or finding the request in doubt.
+     */
+    private void recordRetryOnRestart(RuntimeException stop, long failedSeq) {
+        if (stop instanceof ExecutionAbandonedSignal && stop.getSuppressed().length > 0) {
+            append(new RetryRequested(now(), String.valueOf(stop.getSuppressed()[0]), 0, failedSeq, true));
+        }
+    }
+
+    /** Cancelled, shutting down, or interrupted: retries stop. */
+    private boolean stopRequested() {
+        return Thread.currentThread().isInterrupted()
+                || (cancellation != null && (cancellation.isCancelled() || cancellation.isAbandoned()));
+    }
+
+    /**
+     * Waits out a backoff in short slices, so a cancel or a shutdown is seen promptly (a shutdown
+     * never interrupts). Returns false if the execution is being stopped.
+     */
+    private boolean waitBackoff(java.time.Duration backoff) {
+        long deadline = System.nanoTime() + backoff.toNanos();
+        while (true) {
+            if (stopRequested()) return false;
+            long left = deadline - System.nanoTime();
+            if (left <= 0) return true;
+            try {
+                Thread.sleep(Math.max(1, Math.min(50, java.util.concurrent.TimeUnit.NANOSECONDS.toMillis(left))));
+            } catch (InterruptedException e) {
+                Thread.currentThread().interrupt();
+                return false;
+            }
+        }
+    }
+
+    /**
+     * Runs {@code invocation} on its own virtual thread and waits at most {@code timeout}. On timeout
+     * the thread is interrupted and {@link CallTimeoutException} thrown. If this thread is interrupted
+     * while waiting (a cancel), the call is interrupted too and the interrupt is kept.
+     */
+    private <T> T withTimeout(Supplier<T> invocation, String call, java.time.Duration timeout) {
+        java.util.concurrent.CompletableFuture<T> result = new java.util.concurrent.CompletableFuture<>();
+        Thread worker = Thread.ofVirtual().name("catalyst-call-" + call).start(() -> {
+            try {
+                result.complete(invocation.get());
+            } catch (Throwable t) {
+                result.completeExceptionally(t);
+            }
+        });
+        try {
+            return result.get(timeout.toNanos(), java.util.concurrent.TimeUnit.NANOSECONDS);
+        } catch (java.util.concurrent.TimeoutException e) {
+            worker.interrupt();
+            throw new CallTimeoutException(call, timeout);
+        } catch (InterruptedException e) {
+            worker.interrupt();
+            Thread.currentThread().interrupt();
+            RuntimeException interrupted = new RuntimeException(call + " was interrupted", e);
+            // Interrupted while waiting on its own thread: that is a cancel (a shutdown never interrupts).
+            // Surfaced as the cancel even with no retries left, or the stop rule would record FAILED.
+            if (cancellation != null && cancellation.isCancelled()) {
+                raisedCancellation = true;
+                CancellationSignal signal = new CancellationSignal(cancellation.reason());
+                signal.addSuppressed(interrupted);
+                throw signal;
+            }
+            throw interrupted;
+        } catch (java.util.concurrent.ExecutionException e) {
+            Throwable cause = e.getCause();
+            if (cause instanceof RuntimeException r) throw r;
+            if (cause instanceof Error err) throw err;
+            throw new RuntimeException(cause);
+        }
+    }
+
     private static <I, O> O applyUnchecked(Tool<I, O> tool, I input) {
         boolean previousSuppression = AutoCapture.suppress();
         try {

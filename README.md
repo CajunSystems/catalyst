@@ -144,7 +144,7 @@ scripts/demo.sh /tmp/catalyst-demo resume   # a new process resumes it
 [resume] model calls THIS run: 1 (step 1 was substituted from the log; only step 2 ran live)
 ```
 
-Other demos: `scripts/demo.sh replay`, `branch`, `agent`, `eval`, `timer`, `child`, `supervise`, `fanout`, `group`, `signal`, `retry`, `cancel`, `shutdown`, `streaming`,
+Other demos: `scripts/demo.sh replay`, `branch`, `agent`, `eval`, `timer`, `child`, `supervise`, `fanout`, `group`, `calls`, `signal`, `retry`, `cancel`, `shutdown`, `streaming`,
 `timeline`, `otel`, `autocapture`, and more. The full list is at the top of `scripts/demo.sh`, and CI
 runs every one of them as a gate (the two-node `distributed-a`/`distributed-b` demo in its
 FoundationDB job).
@@ -173,6 +173,7 @@ FoundationDB job).
 | call an API or system with side effects | implement `Tool`, then `ctx.call(tool, input)` | [Tools](docs/guide.md#tools) |
 | use the clock, random values or config safely | `ctx.effect("label", () -> …)` | [Effects](docs/guide.md#effects-memory-and-vars) |
 | retry transient failures | `.retryPolicy(RetryPolicy.exponential(…))` | [Failures](docs/guide.md#failures-retries-and-in-doubt-calls) |
+| retry one flaky call, or give up on a hung one | `.callPolicy(CallPolicy.retries(3, d).timeout(t))`, `ctx.call(tool, in, policy)` | [Per-call](docs/guide.md#per-call-retries-and-timeouts) |
 | decide what happens to a call cut off by a crash | `.inDoubtPolicy(…)` | [Failures](docs/guide.md#failures-retries-and-in-doubt-calls) |
 | resume crashed work after a restart | `.task(...)` + `.recoverOnStart(true)` | [Resuming](docs/guide.md#idempotency-keys-and-resuming) |
 | wait hours or days, then continue (durably) | `ctx.sleep(Duration.ofDays(3))` | [Timers](docs/guide.md#durable-timers) |

@@ -553,6 +553,52 @@ checkout's pom to `com.github.CajunSystems` before installing.
     - No cancel on restart is caught **only** by the give-up test. In the one-for-all test, the
       parent's end-of-life cascade also cancels the stray child.
 
+- **Per-call retries and timeouts** — `CallPolicyTest` (runtime, 13) + `CallPolicyUnitTest` (core) +
+  `CallsAcceptanceTest` + `Demo calls` (CI gate).
+  - **API:** `CallPolicy.retries(n, backoff)` (exponential ×2, `maxBackoff` default 30s),
+    `.timeout(d)` / `timeoutAfter(d)`, and `.retryOn(predicate)`. The runtime-wide default is
+    `Builder.callPolicy` (`CallPolicy.none()`), set with `ctx.setCallPolicy` on attempt and branch
+    contexts. Per call: `ctx.call(tool, input, policy)` and `ctx.model(policy)`; `RecordingModel`
+    carries the policy. Both are `Context` defaults that throw.
+  - **Mechanism:** `invokeWithPolicy` wraps **only the invocation**: `applyUnchecked` for tools
+    (`applyWithPolicy`, also used by the in-doubt `RETRY`), and the provider call inside
+    `invokeAndRecord` for models.
+    - The request marker and the outcome event are written once, so the boundary queue and replay
+      are unchanged.
+    - Each retry appends `CallRetried(call, attempt, error)`. It is informational: `seed` ignores it
+      (default case), the reducer adds a `CALL_RETRIED` step, and OTel adds a root event.
+    - It lands between `ToolRequested`/`CompletionRequested` and the outcome, which is harmless
+      because `seed` pairs by type.
+  - **Timeout:** the attempt runs on its own virtual thread, `CompletableFuture.get(timeout)`.
+    Timing out interrupts the worker and throws `CallTimeoutException`. An interrupt of the task
+    thread (a cancel) interrupts the worker too, and keeps the flag.
+  - **Streams:** retried only while the tracking sink has delivered nothing; a re-delivery would
+    double the task's assembled text. No timeout, so the sink stays on the task thread.
+  - **Stopping:** `stopRequested()` covers a cancel, an abandon or an interrupt. The backoff waits
+    in 50ms slices, because a shutdown never interrupts.
+    - `stoppedRetrying` turns a **cancel** into `CancellationSignal`, with the failure suppressed and
+      `raisedCancellation` set. A plain failure with a cancel pending would record FAILED.
+    - An **abandon** becomes `ExecutionAbandonedSignal` (failure suppressed, `raisedAbandon` set).
+      The caller then records the failure (tool) and `recordRetryOnRestart` appends
+      `RetryRequested(failedSeq)`: the `ToolCompleted` seq for a tool, -1 for a model, which closes
+      its request. The execution stays RUNNING, and the next start re-runs the call live with a fresh
+      budget. The event carries **`callRetry = true`**, an additive field (`@JsonInclude NON_DEFAULT`,
+      so other `RetryRequested`s encode byte-identically). The reducer does not count it in
+      `retries`, so the task's `RetryPolicy` budget is untouched (review finding, mutation-checked).
+      This was a review finding: surfacing the raw failure instead
+      went to `recordFailed` under `RetryPolicy.none()`, ending for good a call the policy would have
+      retried.
+    - **An interrupt during `withTimeout`'s wait with a cancel pending** surfaces as
+      `CancellationSignal`, even with no retries left. With `maxAttempts == 1` it otherwise reached
+      the stop rule as a plain failure and recorded FAILED (review finding). Signals pass straight
+      through `invokeWithPolicy`.
+    - Both tool paths, `runToolLive` and the in-doubt `RETRY` in `handleInDoubt`, record
+      `lastRealFailure` (the suppressed cause) as the `ToolCompleted` error. The in-doubt one was a
+      review finding, mutation-checked.
+      The agent rethrows signals before treating anything as a recorded tool failure.
+  - **Mutation-checked:** never retrying, no `CallRetried`, no timeout, a stream retried after
+    chunks, a cancel not surfaced, and recording the signal's text each fail a test.
+
 - **Fenced runtime writes (Dist-1)** — `FencedWritesTest` (runtime: two runtimes over one log = two
   writers) + `FencedWritesAcceptanceTest` (the same over a real Gumbo log: storage refuses the zombie).
   Every runtime append goes through a `StreamCursor`: conditional when the log can fence, plain

@@ -11,6 +11,7 @@ import com.cajunsystems.catalyst.TaskFactory;
 import com.cajunsystems.catalyst.TaskRegistry;
 import com.cajunsystems.catalyst.Cost;
 import com.cajunsystems.catalyst.engine.BranchSpec;
+import com.cajunsystems.catalyst.engine.CallPolicy;
 import com.cajunsystems.catalyst.engine.ChildExecutionFailedException;
 import com.cajunsystems.catalyst.engine.ChildLauncher;
 import com.cajunsystems.catalyst.engine.CancellationSignal;
@@ -95,6 +96,7 @@ public final class CatalystRuntime implements AutoCloseable {
     private final InDoubtPolicy inDoubtPolicy;
     private final CostModel costModel;
     private final RetryPolicy retryPolicy;
+    private final CallPolicy callPolicy;
     private final ObjectMapper eventMapper;
     private final PayloadCodec payloads;
     private final String nodeId;
@@ -219,6 +221,7 @@ public final class CatalystRuntime implements AutoCloseable {
         this.inDoubtPolicy = b.inDoubtPolicy;
         this.costModel = b.costModel;
         this.retryPolicy = b.retryPolicy;
+        this.callPolicy = b.callPolicy;
         this.eventMapper = b.eventMapper;
         this.payloads = new PayloadCodec();
         this.nodeId = b.nodeId;
@@ -1371,6 +1374,7 @@ public final class CatalystRuntime implements AutoCloseable {
         ReplayingContext ctx = new ReplayingContext(childId, log, model, info, vars,
                 eventMapper, payloads, inDoubtPolicy, costModel, ReplayMode.BRANCH, spec, clock, logger,
                 parentEvents, /* appendEnabled */ true, null, childCursor);
+        ctx.setCallPolicy(callPolicy);
         try (AutoCapture.Scope captured = AutoCapture.bind(ctx)) {
             R result = task.execute(ctx);
             // The task swallowed an unanswerable tool call: still that finding, not a completion.
@@ -1610,6 +1614,7 @@ public final class CatalystRuntime implements AutoCloseable {
                         eventMapper, payloads, inDoubtPolicy, costModel, replayMode, null, clock, logger,
                         recorded, /* appendEnabled */ true, runningAttempt.token, cursor);
                 ctx.setChildLauncher(children.forAttempt(runningAttempt));
+                ctx.setCallPolicy(callPolicy);
                 // Children recorded before this attempt count too: one cancelled before its code reaches
                 // them (a cancel tripped during the replayed prefix) never calls ensure, yet must cascade.
                 if (!runningAttempt.touchedChildren && recorded.stream().anyMatch(se ->
@@ -1996,6 +2001,7 @@ public final class CatalystRuntime implements AutoCloseable {
         private InDoubtPolicy inDoubtPolicy = InDoubtPolicy.FAIL;
         private CostModel costModel = CostModel.free();
         private RetryPolicy retryPolicy = RetryPolicy.none();
+        private CallPolicy callPolicy = CallPolicy.none();
         private ObjectMapper eventMapper = EventJson.shared();
         private String nodeId = "node-0";
         private long snapshotInterval = 100;
@@ -2085,6 +2091,17 @@ public final class CatalystRuntime implements AutoCloseable {
          */
         public Builder retryPolicy(RetryPolicy retryPolicy) {
             this.retryPolicy = retryPolicy;
+            return this;
+        }
+
+        /**
+         * Retries and a timeout for every model and tool call that names no policy of its own
+         * (default {@link CallPolicy#none()}: one attempt, no timeout). These run inside the attempt
+         * making the call, before any failure reaches the task. Override per call with
+         * {@code ctx.model(policy)} or {@code ctx.call(tool, input, policy)}.
+         */
+        public Builder callPolicy(CallPolicy callPolicy) {
+            this.callPolicy = java.util.Objects.requireNonNull(callPolicy, "callPolicy");
             return this;
         }
 

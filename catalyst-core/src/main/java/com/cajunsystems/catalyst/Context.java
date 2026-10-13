@@ -17,6 +17,24 @@ public interface Context {
     Model model();
 
     /**
+     * The execution's model, with {@code policy}'s retries and timeout for each completion requested
+     * through it. Only the outcome is recorded, so a replay substitutes it without retrying. The
+     * default throws, so other {@code Context} implementations still compile.
+     */
+    default Model model(com.cajunsystems.catalyst.engine.CallPolicy policy) {
+        throw new UnsupportedOperationException(getClass().getSimpleName() + " does not support call policies");
+    }
+
+    /**
+     * Invokes a tool with {@code policy}'s retries and timeout. Only the outcome is recorded: the
+     * result, or the last failure once retries run out. The default throws, so other {@code Context}
+     * implementations still compile.
+     */
+    default <I, O> O call(Tool<I, O> tool, I input, com.cajunsystems.catalyst.engine.CallPolicy policy) {
+        throw new UnsupportedOperationException(getClass().getSimpleName() + " does not support call policies");
+    }
+
+    /**
      * Invokes a tool. This is the <em>only</em> way to call a tool so that the invocation is
      * recorded (as {@code ToolRequested} before, {@code ToolCompleted} after), substitutable on
      * replay, and visible in the timeline.
