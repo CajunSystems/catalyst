@@ -77,6 +77,27 @@ public interface Context {
     }
 
     /**
+     * Runs {@code task} as a <strong>child execution</strong> and returns its result: a separate,
+     * durable execution with its own stream, timeline and id, which can be resumed, replayed and
+     * evaluated on its own. Use it to delegate (a coordinator agent handing a sub-task to another
+     * agent).
+     *
+     * <p>While the child runs, this execution waits as {@code WAITING} and holds no thread. When the
+     * child finishes it is resumed, and this call returns the child's result. A failed or cancelled
+     * child throws {@link com.cajunsystems.catalyst.engine.ChildExecutionFailedException}, which the
+     * caller may catch. Either outcome is recorded here, so a replay or resume returns it without
+     * running the child again.
+     *
+     * <p>The child is an ordinary execution: if it may be resumed by another process, its task type
+     * must be registered, and its input should arrive through a recorded boundary
+     * ({@code ctx.effect}), as for any task. The default throws, so other {@code Context}
+     * implementations still compile.
+     */
+    default <R> R child(Task<R> task) {
+        throw new UnsupportedOperationException(getClass().getSimpleName() + " does not run child executions");
+    }
+
+    /**
      * Whether {@code failure}, thrown by {@link #call}, is the recorded result of that call: the tool
      * failed, and the failure is in the log as its {@code ToolCompleted}. That covers a live failure, a
      * failure substituted on replay or resume, and one reproduced by a branch. Code that handles tool

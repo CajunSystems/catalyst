@@ -53,7 +53,8 @@ public record ExecutionState(
     public java.util.Optional<String> awaitingSignal() {
         if (status != Status.WAITING) return java.util.Optional.empty();
         for (int i = timeline.size() - 1; i >= 0; i--) {
-            if (timeline.get(i).kind() == TimelineStep.Kind.SLEEPING) return java.util.Optional.empty(); // waiting on a timer
+            if (timeline.get(i).kind() == TimelineStep.Kind.SLEEPING
+                    || timeline.get(i).kind() == TimelineStep.Kind.CHILD_STARTED) return java.util.Optional.empty(); // a timer or child wait
             if (timeline.get(i).kind() == TimelineStep.Kind.WAITING) return java.util.Optional.ofNullable(timeline.get(i).label());
         }
         return java.util.Optional.empty();
@@ -68,7 +69,7 @@ public record ExecutionState(
         if (status != Status.WAITING) return java.util.Optional.empty();
         for (int i = timeline.size() - 1; i >= 0; i--) {
             TimelineStep step = timeline.get(i);
-            if (step.kind() == TimelineStep.Kind.WAITING) return java.util.Optional.empty();
+            if (step.kind() == TimelineStep.Kind.WAITING || step.kind() == TimelineStep.Kind.CHILD_STARTED) return java.util.Optional.empty();
             if (step.kind() == TimelineStep.Kind.SLEEPING && step.detail() != null) {
                 return java.util.Optional.of(java.time.Instant.parse(step.detail().asText()));
             }
@@ -81,10 +82,26 @@ public record ExecutionState(
         if (status != Status.WAITING) return java.util.Optional.empty();
         for (int i = timeline.size() - 1; i >= 0; i--) {
             TimelineStep step = timeline.get(i);
-            if (step.kind() == TimelineStep.Kind.SLEEPING) return java.util.Optional.empty();
+            if (step.kind() == TimelineStep.Kind.SLEEPING || step.kind() == TimelineStep.Kind.CHILD_STARTED) return java.util.Optional.empty();
             if (step.kind() == TimelineStep.Kind.WAITING) {
                 return step.detail() == null || !step.detail().isTextual()
                         ? java.util.Optional.empty() : java.util.Optional.of(step.detail().asText());
+            }
+        }
+        return java.util.Optional.empty();
+    }
+
+    /**
+     * The child execution a {@code WAITING} parent waits on ({@code ctx.child}), or empty if it is not
+     * waiting on a child. Derived from the timeline, like {@link #awaitingSignal()}.
+     */
+    public java.util.Optional<com.cajunsystems.catalyst.ExecutionId> awaitingChild() {
+        if (status != Status.WAITING) return java.util.Optional.empty();
+        for (int i = timeline.size() - 1; i >= 0; i--) {
+            TimelineStep step = timeline.get(i);
+            if (step.kind() == TimelineStep.Kind.WAITING || step.kind() == TimelineStep.Kind.SLEEPING) return java.util.Optional.empty();
+            if (step.kind() == TimelineStep.Kind.CHILD_STARTED && step.detail() != null) {
+                return java.util.Optional.of(com.cajunsystems.catalyst.ExecutionId.of(step.detail().asText()));
             }
         }
         return java.util.Optional.empty();

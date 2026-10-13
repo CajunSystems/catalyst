@@ -463,9 +463,19 @@ below give the same capability natively.
     distributed claim loop. A due timer counts as resumable everywhere, and a paused or cancelled
     sleeper is never woken.
   - **Exit demo:** `Demo timer`.
-- **Child executions.** A task (an agent) starts another execution and waits for its result, with
-  failures propagated. This is multi-agent orchestration with each sub-agent durable, replayable and
-  evaluable on its own. It builds on WAITING and the execution index.
+- ✅ **Child executions: `ctx.child(task)`.**
+  - **Mechanism:** the parent records `ChildStarted(childRef, childId, taskType)`, which folds to
+    WAITING, and the runtime creates and starts the child as its own execution (own stream, indexed,
+    leased). The parent's attempt ends holding no thread. When the child is terminal the parent is
+    resumed, and the resumed attempt records `ChildCompleted` (status, result, error) itself, so the
+    single-writer rule holds and a replay never touches the child.
+  - **Failures** are recorded outcomes: a failed or cancelled child throws
+    `ChildExecutionFailedException`, which the parent can handle.
+  - **Who wakes it:** the child's completion in-process, and startup recovery / the claim loop,
+    where a parent whose child is terminal counts as resumable.
+  - **Not yet:** cancelling a parent does not cascade to its children, and a branch cannot start a
+    child live.
+  - **Exit demo:** `Demo child`.
 - **Per-call retries and timeouts** for model and tool calls. Boudin has per-activity
   `startToClose`/`maxAttempts`/backoff; Catalyst retries the whole task, and a hung provider call
   has no limit.

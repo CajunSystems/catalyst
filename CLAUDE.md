@@ -384,6 +384,30 @@ checkout's pom to `com.github.CajunSystems` before installing.
     status-scoped `awaitingTimer`, the signal-read stop, or the in-process wake each fails a
     `TimerTest` case.
 
+- **Child executions** — `ChildTest` (runtime, 7) + `ChildAcceptanceTest` + `Demo child` (CI gate).
+  - **Events:** `ctx.child(task)` (ref `child-<n>` per attempt) mints an id and records
+    `ChildStarted(childRef, childId, taskType)`. It is not a boundary; it folds to WAITING, timeline
+    `CHILD_STARTED`. It then asks the runtime's `ChildLauncher` (`Children`) to `ensure` the child:
+    create + start it (under its lease, idempotency key `child:<parent>:<ref>`), resume it if
+    crash-interrupted, or report its terminal outcome. A terminal child is recorded at once as
+    `ChildCompleted` (the boundary, identity = ref; status/result/error). Otherwise it throws
+    `ExecutionWaitingSignal` with `child()` and parks like a timer wait.
+  - **The parent records the outcome itself** on the resumed attempt, so one writer per stream; the
+    child never writes to its parent's stream. A non-COMPLETED outcome throws
+    `ChildExecutionFailedException`, a recorded fact that replays identically.
+  - **Waking:** `resumableWait(state)` = timer due **or** awaited child terminal (`childDone` folds
+    the child); `parked` uses it. `childParents` (child → parent) drives the in-process wake: a
+    child's `whenComplete` calls `wakeLater(parent)`, and a child park calls `wakeLater(self)` right
+    away (a quick child may finish before the park registers). `wakeIfResumable` re-folds under the
+    id lock, so paused/cancelled parents stay put. **`scan()` and `wakeIfResumable` re-register the
+    link** for a parent found waiting on an unfinished child, or after a restart the child finishes
+    and wakes nobody (mutation-checked).
+  - **Early resume** re-records `ChildStarted` with the same child id (mutation-checked).
+  - **No launcher** (branch/eval context) past the fork → `UnsupportedOperationException`.
+    `waitingHandle` reports a child wait as such.
+  - **Known gaps:** no cancel cascade; `childParents` keeps an entry for a parent cancelled while
+    its child runs, until the child finishes.
+
 - **Fenced runtime writes (Dist-1)** — `FencedWritesTest` (runtime: two runtimes over one log = two
   writers) + `FencedWritesAcceptanceTest` (the same over a real Gumbo log: storage refuses the zombie).
   Every runtime append goes through a `StreamCursor`: conditional when the log can fence, plain

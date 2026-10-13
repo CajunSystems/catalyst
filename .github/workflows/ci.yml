@@ -157,6 +157,19 @@ jobs:
           echo "$OUT" | grep -q "\[timer\] calls during a strict replay: 0" || { echo "FAIL: replay made calls"; exit 1; }
           echo "$OUT" | grep -q "Durable timer exit criterion holds" || exit 1
 
+      # The child execution exit criterion: a coordinator delegates to two child executions, each its
+      # own durable stream; the runtime shuts down mid-way, the next one finishes the child, which
+      # wakes the coordinator, no model call repeats, and the coordinator replays exactly.
+      - name: Child execution exit demo (delegate → restart → child wakes parent; exact replay)
+        run: |
+          set -uo pipefail
+          CP="catalyst-api/target/classes:$(cat catalyst-api/target/cp.txt)"
+          OUT="$(java -cp "$CP" com.cajunsystems.catalyst.api.Demo child)" || { echo "$OUT"; exit 1; }
+          echo "$OUT"
+          echo "$OUT" | grep -q "\[child\] model calls: before the restart 1, after 1" || { echo "FAIL: a model call repeated"; exit 1; }
+          echo "$OUT" | grep -q "\[child\] calls during a strict replay of the coordinator: 0" || { echo "FAIL: replay made calls"; exit 1; }
+          echo "$OUT" | grep -q "Child execution exit criterion holds" || exit 1
+
       # The agent exit criterion: a tool-calling agent behaves as any execution does. It resumes
       # mid-conversation without repeating a model turn or a tool call, replays with zero calls, and
       # is evaluated without re-running a tool.

@@ -1,0 +1,242 @@
+package com.cajunsystems.catalyst.runtime;
+
+import com.cajunsystems.catalyst.Context;
+import com.cajunsystems.catalyst.ExecutionId;
+import com.cajunsystems.catalyst.ExecutionOptions;
+import com.cajunsystems.catalyst.Status;
+import com.cajunsystems.catalyst.Task;
+import com.cajunsystems.catalyst.engine.ChildExecutionFailedException;
+import com.cajunsystems.catalyst.engine.ExecutionState;
+import com.cajunsystems.catalyst.engine.ExecutionWaitingSignal;
+import com.cajunsystems.catalyst.events.CatalystEvent;
+import com.cajunsystems.catalyst.log.EventLog;
+import com.cajunsystems.catalyst.mock.MockModel;
+import com.cajunsystems.catalyst.model.CompletionRequest;
+import com.cajunsystems.catalyst.model.Prompt;
+import org.junit.jupiter.api.Test;
+import org.junit.jupiter.api.Timeout;
+
+import java.time.Duration;
+import java.util.concurrent.TimeUnit;
+import java.util.function.BooleanSupplier;
+
+import static org.assertj.core.api.Assertions.assertThat;
+import static org.assertj.core.api.Assertions.assertThatThrownBy;
+
+/**
+ * Child executions: {@code ctx.child(task)} runs a task as its own durable execution and returns its
+ * result. The parent waits with no thread held, is resumed when the child finishes, and records the
+ * outcome itself. Each run is a separate stream that resumes, replays and evaluates on its own.
+ */
+@Timeout(30)
+class ChildTest {
+
+    private static final CompletionRequest PLAN = CompletionRequest.of(Prompt.builder().user("plan").build());
+    private static final CompletionRequest RESEARCH = CompletionRequest.of(Prompt.builder().user("research").build());
+
+    /** The sub-task: one model call, optionally after a sleep, optionally failing. */
+    static final class Research implements Task<String> {
+        static volatile Duration sleep = Duration.ZERO;
+        static volatile boolean fail = false;
+        @Override public String execute(Context ctx) {
+            if (!sleep.isZero()) ctx.sleep(sleep);
+            if (fail) throw new IllegalStateException("source unavailable");
+            return "found:" + ctx.model().complete(RESEARCH).message();
+        }
+    }
+
+    /** The coordinator: plans, delegates to a child, and uses (or recovers from) its outcome. */
+    static final class Coordinator implements Task<String> {
+        @Override public String execute(Context ctx) {
+            String plan = ctx.model().complete(PLAN).message();
+            try {
+                return plan + "|" + ctx.child(new Research());
+            } catch (ChildExecutionFailedException e) {
+                return plan + "|recovered from " + e.status() + ": " + e.error();
+            }
+        }
+    }
+
+    private static CatalystRuntime runtime(EventLog log, MockModel model, java.time.Clock clock) {
+        return CatalystRuntime.builder().log(log).model(model).clock(clock)
+                .task(Coordinator.class, Coordinator::new).task(Research.class, Research::new).build();
+    }
+
+    private static ExecutionId childOf(EventLog log, ExecutionId parent) {
+        return log.read(parent).stream().map(se -> se.event())
+                .filter(e -> e instanceof CatalystEvent.ChildStarted)
+                .map(e -> ExecutionId.of(((CatalystEvent.ChildStarted) e).childId())).findFirst().orElseThrow();
+    }
+
+    @Test
+    void aParentGetsItsChildsResultAndEachRunHasItsOwnStream() {
+        Research.sleep = Duration.ZERO;
+        Research.fail = false;
+        MockModel model = MockModel.alwaysReturn("M");
+        EventLog log = EventLogs.inMemory();
+        try (CatalystRuntime runtime = runtime(log, model, java.time.Clock.systemUTC())) {
+            var run = runtime.execute(new Coordinator(), ExecutionOptions.none());
+            await(() -> runtime.inspect(run.id()).status() == Status.COMPLETED);
+            assertThat(runtime.resume(run.id()).result()).isEqualTo("M|found:M");
+
+            ExecutionId child = childOf(log, run.id());
+            ExecutionState childState = runtime.inspect(child);
+            assertThat(childState.status()).isEqualTo(Status.COMPLETED);
+            assertThat(log.read(child).get(0).event()).isInstanceOfSatisfying(CatalystEvent.ExecutionCreated.class,
+                    c -> assertThat(c.idempotencyKey()).as("linked to its parent").isEqualTo("child:" + run.id().value() + ":child-1"));
+            assertThat(log.read(run.id())).extracting(se -> se.event().getClass().getSimpleName())
+                    .containsSubsequence("ChildStarted", "ChildCompleted", "ExecutionCompleted");
+            assertThat(model.callCount()).isEqualTo(2);
+
+            assertThat(runtime.replay(run.id(), new Coordinator()).status()).isEqualTo(Status.COMPLETED);
+            assertThat(model.callCount()).as("the parent's replay substitutes the child's result").isEqualTo(2);
+        }
+    }
+
+    @Test
+    void aFailedChildIsARecordedOutcomeTheParentCanHandle() {
+        Research.sleep = Duration.ZERO;
+        Research.fail = true;
+        try (CatalystRuntime runtime = runtime(EventLogs.inMemory(), MockModel.alwaysReturn("M"), java.time.Clock.systemUTC())) {
+            var run = runtime.execute(new Coordinator(), ExecutionOptions.none());
+            await(() -> runtime.inspect(run.id()).status() == Status.COMPLETED);
+            assertThat(runtime.resume(run.id()).result())
+                    .isEqualTo("M|recovered from FAILED: java.lang.IllegalStateException: source unavailable");
+            assertThat(runtime.replay(run.id(), new Coordinator()).status()).isEqualTo(Status.COMPLETED);
+        } finally {
+            Research.fail = false;
+        }
+    }
+
+    /** While the child runs (here, sleeps), the parent waits as WAITING, holds no thread, and refuses signals. */
+    @Test
+    void aParentWaitsWithNoThreadHeldWhileItsChildRuns() {
+        Research.sleep = Duration.ofHours(1);
+        Research.fail = false;
+        EventLog log = EventLogs.inMemory();
+        try (CatalystRuntime runtime = runtime(log, MockModel.alwaysReturn("M"), new LeaseTest.TestClock())) {
+            var run = runtime.execute(new Coordinator(), ExecutionOptions.none());
+            assertThatThrownBy(() -> run.result(Duration.ofSeconds(5)))
+                    .isInstanceOfSatisfying(ExecutionWaitingSignal.class, w -> assertThat(w.child()).isNotNull());
+            ExecutionId child = childOf(log, run.id());
+            await(() -> runtime.inspect(child).status() == Status.WAITING);
+
+            ExecutionState parent = runtime.inspect(run.id());
+            assertThat(parent.status()).isEqualTo(Status.WAITING);
+            assertThat(parent.awaitingChild()).contains(child);
+            assertThat(parent.awaitingTimer()).isEmpty();
+            assertThat(parent.awaitingSignal()).isEmpty();
+            assertThatThrownBy(() -> runtime.signal(run.id(), "x", "y")).isInstanceOf(IllegalStateException.class);
+        } finally {
+            Research.sleep = Duration.ZERO;
+        }
+    }
+
+    /**
+     * The process dies while the child sleeps. The next one recovers the child when its timer is due,
+     * and the child finishing wakes the parent, with nothing repeated.
+     */
+    @Test
+    void afterARestartTheChildFinishesAndWakesItsParent() {
+        Research.sleep = Duration.ofHours(1);
+        Research.fail = false;
+        EventLog log = EventLogs.inMemory();
+        LeaseTest.TestClock clock = new LeaseTest.TestClock();
+        MockModel first = MockModel.alwaysReturn("A");
+        ExecutionId parentId;
+        try (CatalystRuntime dying = runtime(log, first, clock)) {
+            var run = dying.execute(new Coordinator(), ExecutionOptions.none());
+            assertThatThrownBy(() -> run.result(Duration.ofSeconds(5))).isInstanceOf(ExecutionWaitingSignal.class);
+            parentId = run.id();
+            ExecutionId child = childOf(log, parentId);
+            await(() -> dying.inspect(child).status() == Status.WAITING);
+        }
+        MockModel second = MockModel.alwaysReturn("B");
+        try (CatalystRuntime next = runtime(log, second, clock)) {
+            clock.advance(Duration.ofHours(1));
+            next.recoverAll(); // the parent's child link is remembered; the child's due timer resumes it
+            ExecutionId p = parentId;
+            await(() -> next.inspect(p).status() == Status.COMPLETED);
+            assertThat(next.resume(parentId).result()).isEqualTo("A|found:B");
+        } finally {
+            Research.sleep = Duration.ZERO;
+        }
+        assertThat(first.callCount()).as("the plan, once").isEqualTo(1);
+        assertThat(second.callCount()).as("the research, once").isEqualTo(1);
+    }
+
+    /** Paused while waiting, then resumed before the child finishes: it records the wait again and still reads WAITING. */
+    @Test
+    void aParentResumedBeforeItsChildFinishesParksAgain() {
+        Research.sleep = Duration.ofHours(1);
+        Research.fail = false;
+        EventLog log = EventLogs.inMemory();
+        MockModel model = MockModel.alwaysReturn("M");
+        try (CatalystRuntime runtime = runtime(log, model, new LeaseTest.TestClock())) {
+            var run = runtime.execute(new Coordinator(), ExecutionOptions.none());
+            assertThatThrownBy(() -> run.result(Duration.ofSeconds(5))).isInstanceOf(ExecutionWaitingSignal.class);
+            ExecutionId child = childOf(log, run.id());
+            runtime.pause(run.id());
+            assertThatThrownBy(() -> runtime.resume(run.id()).result(Duration.ofSeconds(5))).isInstanceOf(ExecutionWaitingSignal.class);
+            assertThat(runtime.inspect(run.id()).status()).isEqualTo(Status.WAITING);
+            assertThat(runtime.inspect(run.id()).awaitingChild()).contains(child);
+            assertThat(log.read(run.id()).stream().filter(se -> se.event() instanceof CatalystEvent.ExecutionCreated).count())
+                    .isEqualTo(1);
+            assertThat(log.read(child).stream().filter(se -> se.event() instanceof CatalystEvent.ExecutionCreated).count())
+                    .as("the child was created once, not again on the resume").isEqualTo(1);
+            assertThat(model.callCount()).isEqualTo(1);
+        } finally {
+            Research.sleep = Duration.ZERO;
+        }
+    }
+
+    /** A parent cancelled while its child runs stays cancelled when the child finishes. */
+    @Test
+    void aCancelledParentIsNotWokenByItsChild() {
+        Research.sleep = Duration.ofMillis(300);
+        Research.fail = false;
+        EventLog log = EventLogs.inMemory();
+        try (CatalystRuntime runtime = runtime(log, MockModel.alwaysReturn("M"), java.time.Clock.systemUTC())) {
+            var run = runtime.execute(new Coordinator(), ExecutionOptions.none());
+            assertThatThrownBy(() -> run.result(Duration.ofSeconds(5))).isInstanceOf(ExecutionWaitingSignal.class);
+            runtime.cancel(run.id());
+            ExecutionId child = childOf(log, run.id());
+            await(() -> runtime.inspect(child).status() == Status.COMPLETED);
+            sleep(200);
+            assertThat(runtime.inspect(run.id()).status()).isEqualTo(Status.CANCELLED);
+        } finally {
+            Research.sleep = Duration.ZERO;
+        }
+    }
+
+    /** A branch cannot start a child live: it fails rather than run one. A recorded child result is still substituted before the fork. */
+    @Test
+    void aBranchThatReachesAChildLiveFails() {
+        Research.sleep = Duration.ZERO;
+        Research.fail = false;
+        try (CatalystRuntime runtime = runtime(EventLogs.inMemory(), MockModel.alwaysReturn("M"), java.time.Clock.systemUTC())) {
+            var run = runtime.execute(new Coordinator(), ExecutionOptions.none());
+            await(() -> runtime.inspect(run.id()).status() == Status.COMPLETED);
+            long beforePlan = runtime.log().read(run.id()).stream()
+                    .filter(e -> e.event() instanceof CatalystEvent.PromptBuilt).findFirst().orElseThrow().seq() - 1;
+            assertThatThrownBy(() -> runtime.branch(run.id(), beforePlan).withModel(MockModel.alwaysReturn("other")).run(new Coordinator()))
+                    .isInstanceOf(UnsupportedOperationException.class).hasMessageContaining("child-1");
+        }
+    }
+
+    private static void sleep(long millis) {
+        try {
+            Thread.sleep(millis);
+        } catch (InterruptedException e) {
+            Thread.currentThread().interrupt();
+        }
+    }
+
+    private static void await(BooleanSupplier condition) {
+        long deadline = System.nanoTime() + TimeUnit.SECONDS.toNanos(10);
+        while (!condition.getAsBoolean()) {
+            if (System.nanoTime() > deadline) throw new AssertionError("condition not met within 10s");
+            sleep(20);
+        }
+    }
+}

@@ -12,6 +12,7 @@ public final class ExecutionWaitingSignal extends RuntimeException {
 
     private final String signalName;
     private final java.time.Instant wakeAt;
+    private final com.cajunsystems.catalyst.ExecutionId child;
 
     public ExecutionWaitingSignal(String signalName, String message) {
         this(signalName, null, message);
@@ -22,9 +23,20 @@ public final class ExecutionWaitingSignal extends RuntimeException {
      * {@code wakeAt} when it comes due; {@code ctx.sleep}).
      */
     public ExecutionWaitingSignal(String signalName, java.time.Instant wakeAt, String message) {
+        this(signalName, wakeAt, null, message);
+    }
+
+    /** A wait for a child execution ({@code ctx.child}) when {@code child} is set. */
+    public ExecutionWaitingSignal(String signalName, java.time.Instant wakeAt, com.cajunsystems.catalyst.ExecutionId child, String message) {
         super(message);
         this.signalName = signalName;
         this.wakeAt = wakeAt;
+        this.child = child;
+    }
+
+    /** The child execution this one waits on; null unless it is a child wait. */
+    public com.cajunsystems.catalyst.ExecutionId child() {
+        return child;
     }
 
     /** The signal the execution is waiting for; null for a timer wait. */

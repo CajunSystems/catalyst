@@ -3,6 +3,7 @@ package com.cajunsystems.catalyst.engine;
 import com.cajunsystems.catalyst.Context;
 import com.cajunsystems.catalyst.Deterministic;
 import com.cajunsystems.catalyst.ExecutionId;
+import com.cajunsystems.catalyst.Task;
 import com.cajunsystems.catalyst.ExecutionInfo;
 import com.cajunsystems.catalyst.Memory;
 import com.cajunsystems.catalyst.ReplayMode;
@@ -106,6 +107,13 @@ public final class ReplayingContext implements Context {
      * waiting. Reaching it again parks the attempt without recording a second wait.
      */
     private String awaitingSignal;
+    /** Children started and not yet recorded as finished, by child ref. */
+    private final java.util.Map<String, ChildStarted> pendingChildren = new java.util.HashMap<>();
+    /** Children this attempt has reached, so far: child-1, child-2, … in task order. */
+    private int childCount;
+    /** The runtime's side of {@code ctx.child}; null where children cannot run (a branch, a plain replay). */
+    private ChildLauncher childLauncher;
+
     /** Timers started and not yet fired, by id: when each comes due. A resume waits only for what is left. */
     private final java.util.Map<String, java.time.Instant> pendingTimers = new java.util.HashMap<>();
     /** Timers this attempt has reached, so far: ids are timer-1, timer-2, … in task order, like auto-capture. */
@@ -261,6 +269,12 @@ public final class ReplayingContext implements Context {
                 case EffectRecorded er -> boundaries.add(new Boundary(se.seq(), e, er.label(), null));
                 case SignalAwaited sa -> this.awaitingSignal = sa.name();
                 case TimerStarted ts -> pendingTimers.put(ts.timerId(), ts.wakeAt());
+                case ChildStarted cs -> pendingChildren.put(cs.childRef(), cs);
+                case ChildCompleted cc -> {
+                    // The child boundary; the ChildStarted before it only named the child.
+                    boundaries.add(new Boundary(se.seq(), e, cc.childRef(), null));
+                    pendingChildren.remove(cc.childRef());
+                }
                 case TimerFired tf -> {
                     // The sleep's boundary; the TimerStarted before it only said when to wake.
                     boundaries.add(new Boundary(se.seq(), e, tf.timerId(), null));
@@ -668,6 +682,62 @@ public final class ReplayingContext implements Context {
         requireAppendable("await signal " + name);
         append(new SignalAwaited(now(), name, type.getName()));
         throw raisedWaiting = new ExecutionWaitingSignal(name, "Execution " + id + " is waiting for signal '" + name + "'");
+    }
+
+    // ── Child executions ───────────────────────────────────────────────────────
+
+    /** Lets this context start and follow child executions; set by the runtime for live attempts. */
+    public void setChildLauncher(ChildLauncher launcher) {
+        this.childLauncher = launcher;
+    }
+
+    @Override
+    @SuppressWarnings("unchecked")
+    public <R> R child(Task<R> task) {
+        java.util.Objects.requireNonNull(task, "task");
+        String childRef = "child-" + (++childCount);
+        Optional<Boundary> done = pollExpected(ChildCompleted.class, "child " + childRef);
+        if (done.isPresent() && identityMatchesOrFork(done.get(), "child", childRef)) {
+            ChildCompleted cc = (ChildCompleted) done.get().event();
+            if (cc.result() == null && !"COMPLETED".equals(cc.status())) {
+                throw new ChildExecutionFailedException(ExecutionId.of(cc.childId()), cc.status(), cc.error());
+            }
+            return (R) payloads.fromTree(cc.result());
+        }
+        ChildStarted started = pendingChildren.remove(childRef);
+        if (started != null && !appendEnabled) {
+            throw raisedWaiting = waitingOnChild(ExecutionId.of(started.childId())); // a pure replay ends at the wait
+        }
+        if (childLauncher == null) {
+            throw new UnsupportedOperationException("Child executions cannot be started here (a branch or a replay"
+                    + " that reached ctx.child live); " + childRef + " has no recorded outcome to substitute");
+        }
+        requireAppendable("child " + childRef);
+        ExecutionId childId;
+        if (started == null) {
+            childId = childLauncher.mint();
+            append(new ChildStarted(now(), childRef, childId.value(), task.getClass().getName()));
+        } else {
+            childId = ExecutionId.of(started.childId());
+        }
+        Optional<ChildLauncher.Outcome> outcome = childLauncher.ensure(id, childRef, childId, task);
+        if (outcome.isPresent()) {
+            ChildLauncher.Outcome o = outcome.get();
+            append(new ChildCompleted(now(), childRef, childId.value(), o.status(), o.completed() ? o.result() : null, o.error()));
+            if (!o.completed()) throw new ChildExecutionFailedException(childId, o.status(), o.error());
+            return (R) payloads.fromTree(o.result());
+        }
+        if (started != null) {
+            // Still running, and only reachable after something folded this execution out of WAITING
+            // (a pause, then a resume). Record the wait again so the fold returns to WAITING; otherwise
+            // it stays RUNNING and every recovery re-resumes it to find the child still going.
+            append(new ChildStarted(now(), childRef, childId.value(), started.taskType()));
+        }
+        throw raisedWaiting = waitingOnChild(childId);
+    }
+
+    private ExecutionWaitingSignal waitingOnChild(ExecutionId childId) {
+        return new ExecutionWaitingSignal(null, null, childId, "Execution " + id + " is waiting for child execution " + childId);
     }
 
     // ── Durable timers ─────────────────────────────────────────────────────────

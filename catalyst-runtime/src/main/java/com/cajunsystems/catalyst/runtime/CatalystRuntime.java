@@ -11,6 +11,7 @@ import com.cajunsystems.catalyst.TaskFactory;
 import com.cajunsystems.catalyst.TaskRegistry;
 import com.cajunsystems.catalyst.Cost;
 import com.cajunsystems.catalyst.engine.BranchSpec;
+import com.cajunsystems.catalyst.engine.ChildLauncher;
 import com.cajunsystems.catalyst.engine.CancellationSignal;
 import com.cajunsystems.catalyst.engine.CancellationToken;
 import com.cajunsystems.catalyst.engine.CostModel;
@@ -122,6 +123,9 @@ public final class CatalystRuntime implements AutoCloseable {
      * registration, as any resume by id does.
      */
     private final ConcurrentHashMap<ExecutionId, Map.Entry<Task<?>, ExecutionOptions>> sleepers = new ConcurrentHashMap<>();
+    /** Child executions started by attempts in this process, with their parents: who to wake when one finishes. */
+    private final ConcurrentHashMap<ExecutionId, ExecutionId> childParents = new ConcurrentHashMap<>();
+    private final ChildLauncher children = new Children();
     /** Fires durable timers this process knows about ({@code ctx.sleep}); see {@link #scheduleWake}. */
     private final java.util.concurrent.ScheduledExecutorService timers =
             java.util.concurrent.Executors.newSingleThreadScheduledExecutor(r -> {
@@ -382,6 +386,15 @@ public final class CatalystRuntime implements AutoCloseable {
                 sleepers.put(id, Map.entry(task, opts));
                 scheduleWake(id, w.wakeAt());
             }
+            if (cause instanceof ExecutionWaitingSignal w && w.child() != null) {
+                // Parked on a child: check now as well, since a quick child may have finished before
+                // this attempt deregistered, when its completion's wake found this one still in flight.
+                sleepers.put(id, Map.entry(task, opts));
+                wakeLater(id);
+            }
+            // A child execution finished an attempt: wake its parent, which re-checks whether it is done.
+            ExecutionId parent = childParents.get(id);
+            if (parent != null) wakeLater(parent);
         });
         inFlight.put(id, visible);
         running.put(id, attempt);
@@ -768,10 +781,13 @@ public final class CatalystRuntime implements AutoCloseable {
                     // deliberate PAUSED or WAITING (Deploy-2). A live lease held elsewhere means it is
                     // running there.
                     ExecutionState unleased = foldState(id);
-                    if (!isCrashInterrupted(unleased.status()) && !timerDue(unleased)) {
+                    if (!isCrashInterrupted(unleased.status()) && !resumableWait(unleased)) {
                         // A timer that is not due yet: make sure this process wakes it when it is. A
                         // timer recorded by a process that has since died has no wake scheduled anywhere.
                         unleased.awaitingTimer().ifPresent(wakeAt -> scheduleWake(id, wakeAt));
+                        // A parent waiting on a child that has not finished: remember the link, so the
+                        // child finishing in this process (recovered by this same scan, say) wakes it.
+                        unleased.awaitingChild().ifPresent(child -> childParents.put(child, id));
                         leftAlone.put(id, honourOrphanedCancel(id, unleased));
                         return;
                     }
@@ -779,7 +795,7 @@ public final class CatalystRuntime implements AutoCloseable {
                         underLease(id, () -> {
                             ExecutionState state = leases == null ? unleased : foldState(id);
                             Optional<String> carried = leases == null ? Optional.empty() : leases.pendingCancel(id);
-                            if (!isCrashInterrupted(state.status()) && !timerDue(state)) {
+                            if (!isCrashInterrupted(state.status()) && !resumableWait(state)) {
                                 leftAlone.put(id, state.status());
                             } else if (carried.isPresent()) {
                                 // A cancel requested of its last holder: record it here. Recording a cancel
@@ -791,7 +807,7 @@ public final class CatalystRuntime implements AutoCloseable {
                                 notRecovered.put(id, "no task registered for type '" + state.taskType() + "'");
                             } else {
                                 // A sleeper this process parked carries its own task and options.
-                                Map.Entry<Task<?>, ExecutionOptions> sleeper = timerDue(state) ? sleepers.remove(id) : null;
+                                Map.Entry<Task<?>, ExecutionOptions> sleeper = resumableWait(state) ? sleepers.remove(id) : null;
                                 resumed.put(id, sleeper == null ? resume(id)   // reentrant on the id lock and the lease
                                         : resume(id, sleeper.getValue(), sleeper.getKey()));
                             }
@@ -872,7 +888,20 @@ public final class CatalystRuntime implements AutoCloseable {
      * execution whose timer has come due is resumable, not parked.
      */
     private boolean parked(ExecutionState state) {
-        return state.status() == Status.WAITING && !timerDue(state);
+        return state.status() == Status.WAITING && !resumableWait(state);
+    }
+
+    /**
+     * Waiting on something that has happened: a timer that has come due, or a child execution that
+     * has finished. Such an execution is resumable: its next attempt records the outcome and carries on.
+     */
+    private boolean resumableWait(ExecutionState state) {
+        return timerDue(state) || childDone(state);
+    }
+
+    /** Waiting on a child execution that has reached a terminal state. */
+    private boolean childDone(ExecutionState state) {
+        return state.awaitingChild().map(child -> foldState(child).isTerminal()).orElse(false);
     }
 
     /** Waiting on a timer that has come due by this runtime's clock. */
@@ -899,18 +928,39 @@ public final class CatalystRuntime implements AutoCloseable {
 
     private void wakeIfDue(ExecutionId id, java.time.Instant scheduledFor) {
         scheduledWakes.remove(id, scheduledFor);
+        wakeIfResumable(id);
+    }
+
+    /** Wakes {@code id} later, on the timer thread: never inline, since the caller may hold locks or be the child's attempt. */
+    private void wakeLater(ExecutionId id) {
+        if (closing) return;
+        try {
+            timers.execute(() -> wakeIfResumable(id));
+        } catch (RejectedExecutionException shuttingDown) {
+            // closing: the next start's recovery resumes it
+        }
+    }
+
+    /**
+     * Resumes {@code id} if it is waiting on a timer that has come due or a child that has finished,
+     * with the task and options it parked with in this process. Re-folds under the id lock, so a
+     * paused, cancelled or already-woken execution is left alone. Best-effort and idempotent.
+     */
+    private void wakeIfResumable(ExecutionId id) {
         if (closing) return;
         try {
             byExecution.withLock(id, () -> {
                 if (liveAttempt(id) != null) return;
                 ExecutionState state = foldState(id);
-                Optional<java.time.Instant> wakeAt = state.awaitingTimer();
-                if (wakeAt.isEmpty()) {                      // paused, cancelled, woken: nothing to do
+                if (state.status() != Status.WAITING) {      // paused, cancelled, woken: nothing to do
                     if (state.isTerminal()) sleepers.remove(id);
                     return;
                 }
-                if (!timerDue(state)) {
-                    scheduleWake(id, wakeAt.get());          // fired early by this clock; try again then
+                if (!resumableWait(state)) {
+                    // A timer this clock says is early: try again when it is due. A child still going:
+                    // its own completion wakes this one.
+                    state.awaitingTimer().ifPresent(wakeAt -> scheduleWake(id, wakeAt));
+                    state.awaitingChild().ifPresent(child -> childParents.put(child, id));
                     return;
                 }
                 Map.Entry<Task<?>, ExecutionOptions> sleeper = sleepers.remove(id);
@@ -920,7 +970,50 @@ public final class CatalystRuntime implements AutoCloseable {
         } catch (LeaseHeldException runningElsewhere) {
             // another node took it first
         } catch (RuntimeException e) {
-            LOG.warn("Could not wake {} from its timer: {}", id, e.toString());
+            LOG.warn("Could not wake {}: {}", id, e.toString());
+        }
+    }
+
+    /**
+     * The runtime's side of {@code ctx.child}: creates child executions as ordinary executions (their
+     * own stream, indexed, recoverable) and reports their outcome once they finish.
+     */
+    private final class Children implements ChildLauncher {
+
+        @Override
+        public ExecutionId mint() {
+            return mintId();
+        }
+
+        @Override
+        public Optional<Outcome> ensure(ExecutionId parentId, String childRef, ExecutionId childId, Task<?> task) {
+            childParents.put(childId, parentId);
+            return byExecution.withLock(childId, () -> {
+                ExecutionState child = foldState(childId);
+                if (child.isTerminal()) {
+                    childParents.remove(childId);
+                    return Optional.of(outcomeOf(child));
+                }
+                if (child.lastSeq() < 0) {
+                    // First time here, or a crash between the parent recording ChildStarted and the child
+                    // being created. The create is fenced at seq 0, so it happens once. The key names the
+                    // parent and the child's place in it, which links the two in the log.
+                    String taskType = task.getClass().getName();
+                    underLease(childId, () -> {
+                        createExecution(childId, taskType, "child:" + parentId.value() + ":" + childRef, ExecutionOptions.none());
+                        return scheduleAttempt(task, childId, taskType, ExecutionOptions.none(), Mode.FRESH);
+                    });
+                } else if (liveAttempt(childId) == null && isCrashInterrupted(child.status())) {
+                    // A child a crash left behind: bring it back, with this task instance if its type is not registered.
+                    resume(childId, ExecutionOptions.none(), task);
+                }
+                // Otherwise it is running, waiting or paused: its own progress, then its completion, wakes the parent.
+                return Optional.empty();
+            });
+        }
+
+        private Outcome outcomeOf(ExecutionState child) {
+            return new Outcome(child.status().name(), child.result(), child.error());
         }
     }
 
@@ -1051,6 +1144,11 @@ public final class CatalystRuntime implements AutoCloseable {
         if (wakeAt.isPresent()) {
             return new FutureExecutionHandle<>(id, CompletableFuture.<R>failedFuture(new ExecutionWaitingSignal(null,
                     wakeAt.get(), "Execution " + id + " is sleeping until " + wakeAt.get())));
+        }
+        Optional<ExecutionId> child = state.awaitingChild();
+        if (child.isPresent()) {
+            return new FutureExecutionHandle<>(id, CompletableFuture.<R>failedFuture(new ExecutionWaitingSignal(null, null,
+                    child.get(), "Execution " + id + " is waiting for child execution " + child.get())));
         }
         String name = state.awaitingSignal().orElse(null);
         return new FutureExecutionHandle<>(id, CompletableFuture.<R>failedFuture(new ExecutionWaitingSignal(name,
@@ -1338,6 +1436,7 @@ public final class CatalystRuntime implements AutoCloseable {
                 ReplayingContext ctx = new ReplayingContext(id, log, defaultModel, info, opts.vars(),
                         eventMapper, payloads, inDoubtPolicy, costModel, replayMode, null, clock, logger,
                         recorded, /* appendEnabled */ true, runningAttempt.token, cursor);
+                ctx.setChildLauncher(children);
 
                 // The capture scope is per-attempt: a retry re-enters the task from the top, so its
                 // auto-capture counter restarts in step with the recorded prefix it replays.
