@@ -1,7 +1,13 @@
 # Catalyst Roadmap
 
-Catalyst **v0.1 is complete**: M0 (execute + record + resume), M1 (replay + inspect), and
-M2 (branch + diff) are implemented, CI-gated, and merged. This document lays out what comes next.
+Catalyst **v0.1 and v0.2 are complete**: M0 (execute + record + resume), M1 (replay + inspect), M2
+(branch + diff), then hardening and observability. Since then:
+- **Deploy-1 to Deploy-6** have shipped.
+- **Dist-0 to Dist-4** have shipped. Dist-5 is deferred.
+- **Much of v1 has shipped:** agents, MCP tools, the eval harness, durable timers, and child
+  executions with supervision.
+
+Everything is CI-gated. This document records what shipped and lays out what comes next.
 
 The organizing principle is unchanged from the spec: **execution semantics first.** Each phase adds
 capability without breaking the durable event schema — the sealed `CatalystEvent` hierarchy already
@@ -207,7 +213,7 @@ exporter, the auto-capture agent, streaming completions, and the timeline UI hav
 
 ---
 
-## Next — deployable, then distributed 🔜
+## Next — deployable, then distributed ✅
 
 v0.2 hardened the single-node runtime; this is the sequenced plan for running it in production, then
 across nodes. Two tracks share one foundation. **Deploy** makes a single active node deployable and
@@ -250,8 +256,8 @@ Labels follow the build order (see *Order* below).
   applies when the builder constructs the log itself (the `embedded(path)` path); combined with
   `.log(...)` — a log the caller already built — it is **rejected** at `build()`, never silently
   ignored.
-- ✅ **Deploy-4. Graceful shutdown** — needs a new engine path, not just a better `close()`. Today
-  `close()` calls `executor.close()`, which blocks until every in-flight attempt finishes (a task
+- ✅ **Deploy-4. Graceful shutdown** — needs a new engine path, not just a better `close()`. Before
+  this, `close()` called `executor.close()`, which blocked until every in-flight attempt finishes (a task
   waiting on a slow provider holds the pod, and the Gumbo directory lock, indefinitely), and
   interrupting a worker without the cancel token folds to `ExecutionFailed` — terminal, so Deploy-2
   would never resume it. Add an **abandon** unwind: shutdown trips an abandon token, the worker raises
@@ -331,7 +337,8 @@ The original phasing rationale is in `docs/distribution.md`; **this list is the 
   `InDoubtPolicy.FAIL`. Dist-3/4 lift that refusal once leases say whose work is whose. The same
   hazard remains on the by-id paths, which are not refused: a keyed `execute` or `resume(id)` of an
   execution running on another node (`liveAttempt` only sees this process). Until leases exist, the
-  operator must know the execution is not running elsewhere.
+  operator must know the execution is not running elsewhere. *Lifted in Dist-3:* recovery and the
+  by-id paths now respect leases.
   `isDistributed()` reports the mode. Tests: `DistributionGuardTest` and
   `DistributionGuardAcceptanceTest` (the file-backed log is refused and its directory released).
   `FoundationDBAcceptanceTest`'s nodes run distributed.
@@ -371,7 +378,7 @@ The original phasing rationale is in `docs/distribution.md`; **this list is the 
     exactly that).
   - **Left to Dist-4:** the signal side ("re-enqueues it"). A signal on any node already resumes the
     execution, but nothing watches the queue yet.
-- ✅ **Dist-4. Claim loop + cross-node control** — each node subscribes to the Deploy-1 queue, claims via
+- ✅ **Dist-4. Claim loop + cross-node control** — each node polls the Deploy-1 index every `claimInterval` (Gumbo push subscriptions are per process), claims via
   Dist-3, runs `resume(id)`, and reclaims expired leases. **Control ships in the same item**: today
   `cancel(id)`/`pause(id)` append `ExecutionCancelled`/`ExecutionPaused` directly when the execution
   is not in flight *in this process*, which across nodes is a second writer on a stream another node
@@ -418,7 +425,7 @@ anywhere.
 
 ---
 
-## v1 — Agents, signals, distribution 🔭
+## v1 — Agents, signals, distribution (mostly shipped)
 
 The substrate becomes a platform. This is where the other CajunSystems components integrate.
 
@@ -475,10 +482,11 @@ below give the same capability natively.
     where a parent whose child is terminal counts as resumable.
   - **Not yet:** a branch cannot start a child live.
   - **Exit demo:** `Demo child`.
-- **Supervision for child executions.** Follow-ups to `ctx.child`, in this order:
-  1. ✅ **Cancel cascade (propagate down).** Cancelling a parent cancels every child it has no
-     outcome for, recursively, by id (so a child on another node gets the request on its lease row).
-     Recovery is the durable backstop: a child whose parent is cancelled is cancelled, not resumed.
+- ✅ **Supervision for child executions.** Follow-ups to `ctx.child`, in this order:
+  1. ✅ **Cancel cascade (propagate down).** A parent that ends (completed, failed or cancelled)
+     cancels every child it has no outcome for, recursively, by id (so a child on another node gets
+     the request on its lease row). Recovery is the durable backstop: a child whose parent has ended,
+     or recorded discarding it, is cancelled, not resumed.
   2. ✅ **Supervision v1: one-for-one.** `ctx.child(task, Supervision.restart(3).within(w).backoff(d))`.
      - **Restarts are fresh:** each restart is a new child execution, run from the top.
      - **Retrying in place** (*resume*, with the successful prefix substituted) is the runtime's
@@ -501,7 +509,7 @@ below give the same capability natively.
        `awaitAny`, are recorded as `ChildCompleted` in await order, so a replay is exact.
      - **No orphans:** a parent that ends (completed, failed or cancelled) cancels the children it
        never awaited.
-     - **Supervision for spawned children** comes with item 4.
+     - **Supervision for spawned children:** `ctx.supervise` (item 4).
      - **Exit demo:** `Demo fanout`.
   4. ✅ **Supervised groups: one-for-all and rest-for-one.**
      `ctx.supervise(Supervision.restart(n).oneForAll() | .restForOne(), tasks)` spawns the group and
@@ -522,7 +530,7 @@ below give the same capability natively.
 
 ### Distributed execution (spec §12)
 *Sequenced as `Dist-0`…`Dist-5` above; the bullets below are design and status, not order.*
-- Execution across many nodes over a shared **Gumbo cluster** — same `EventLog` SPI, history and
+- ✅ Execution across many nodes over a shared **Gumbo cluster** — same `EventLog` SPI, history and
   replay preserved across nodes. Design recorded in [`docs/distribution.md`](docs/distribution.md):
   **the log is the arbiter, not a coordination service.** Single-writer-per-execution is enforced by
   a *conditional append* (`append(id, event, expectedSeq)`) rather than by a distributed lock, so a
@@ -534,7 +542,8 @@ below give the same capability natively.
   instead of polling) whenever it is ready, and backed out cheaply if it is not. **Bayou** does not
   distribute — it is single-process — but it shares Gumbo with Catalyst, so it is useful *within* a
   node (supervising the claim loop, lease-renewal timers, death watch) and could later consume the
-  same primitives to become clustered itself.
+  same primitives to become clustered itself. *As shipped:* FoundationDB-backed
+  (`GumboEventLog.foundationDB`), Dist-0 to Dist-4.
 - ✅ **The `EventLog` seam for conditional append has landed** — `append(id, event, expectedSeq)` plus
   `supportsConditionalAppend()`, rejecting a stale writer with `StaleWriterException`. The default
   **throws** rather than falling back to an unconditional append: a log that quietly ignored
@@ -544,23 +553,24 @@ below give the same capability natively.
   the increment are one storage operation — Catalyst's `seq` *is* the execution tag's
   `streamVersion`, so there is no translation in between. Covered by `ConditionalAppendTest` and
   three `GumboEventLogTest` cases (with a second execution in the log), each verified to fail when
-  the fence is removed. What remains for distribution is the claim loop above it, not the primitive.
+  the fence is removed. (The claim loop above it shipped in Dist-4.)
 - ✅ **Both capability answers are now asked for, not asserted** — `supportsConditionalAppend()` and
   the new `supportsMultiWriter()` delegate to Gumbo 0.5.0's `capabilities()`. The first used to be a
   hardcoded `true`, correct for every adapter Gumbo ships and wrong in shape: a client asserting a
   guarantee on storage's behalf is the mistake that produced D4. Read them as a pair — a file-backed
   log is fenced and *not* multi-writer, which is precisely the configuration a runtime must refuse
-  to distribute over. **No log Catalyst builds today reports `multiWriter`**, because Gumbo composes
-  it from storage *and* the sequencer, and the default sequencer is a per-process counter that no
-  storage fence can compensate for.
+  to distribute over. **Only `GumboEventLog.foundationDB(...)` reports `multiWriter`**, because
+  Gumbo composes it from storage *and* the sequencer: that log pairs FDB storage with the FDB
+  sequencer, while the default sequencer is a per-process counter that no storage fence can
+  compensate for.
 - **Status of the storage-side prerequisites**, all measured rather than assumed. Gumbo 0.3.0 closed
   the blocker: versions are assigned *in storage* now, not by a per-process counter, so the two-JVM
   probe that handed both writers `seq` 0,1,2 no longer applies — and the file adapter takes an
   exclusive directory lock, so a second process is refused loudly instead of corrupting silently.
-  Lease CAS arrived in 0.4.0. Two gaps are left, and both are Gumbo-side:
+  Lease CAS arrived in 0.4.0. Both remaining gaps are closed, and Catalyst is on gumbo **0.7.0**:
   - ~~**0.4.0 is merged but untagged**~~ — tagged and picked up. Catalyst is now on gumbo **0.6.0**:
     the lease CAS (A3), declared capabilities (A4) and per-tag stream versions are all reachable.
-    Nothing consumes the CAS yet; the claim loop is what would.
+    The lease CAS now backs Dist-3 leases and Dist-4 `claimKey`.
   - ~~**Claimable work** … the queue tag cannot be cursored by version~~ — **fixed in gumbo 0.6.0**
     and adopted. Every tag an entry carries now has its own dense position, so a shared
     `catalyst-tasks/<queue>` fed by dual-tagged appends is cursored with `readAfterVersion` like any

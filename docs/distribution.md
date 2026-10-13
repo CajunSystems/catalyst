@@ -1,7 +1,12 @@
 # Distributed execution
 
-Catalyst runs on one node today. This document records the design for running it on many — the v1
-roadmap item — and, more importantly, records *where the correctness lives*, because that is the
+> **Status:** shipped as Dist-0 to Dist-4 (see [`ROADMAP.md`](../ROADMAP.md), and
+> [`deployment.md`](deployment.md) for running it). Push placement (Dist-5) is deferred. The
+> sections below are the original design. Where they differ from what shipped, the roadmap wins, and
+> the notes marked *As shipped* or *Closed* say how.
+
+Catalyst runs on one node or, on a FoundationDB-backed log, on many. This document records the
+design for running it on many, and more importantly, records *where the correctness lives*, because that is the
 decision which is expensive to revisit later.
 
 The short version: **the log is the arbiter, not a coordination service.** Nodes do not form a
@@ -60,7 +65,7 @@ one.
 Correctness is settled by the paragraph above; the rest is efficiency and operations.
 
 1. **Claim** — a node compare-and-sets a lease row for an execution: `(executionId → nodeId,
-   fencingToken, expiresAt)`.
+   expiresAt)`. (There is no fencing token: the conditional append is the fence; see Dist-3.)
 2. **Run** — `runtime.resume(id)`. This already exists and is CI-gated: a node recovers an execution
    *from its id alone* via the `TaskRegistry`, substitutes every recorded boundary, and continues at
    the exact point it left off.
@@ -93,7 +98,8 @@ with no matching `ToolCompleted` and routes recovery through `InDoubtPolicy` (`R
 `pendingRequestHash` and is otherwise ignored, with no `danglingModel` counterpart to `danglingTool`.
 Closing that asymmetry (an in-doubt policy for model calls, keyed on the recorded `requestHash`) is a
 prerequisite for honestly claiming exactly-once provider spend under node failure, and is worth doing
-independently of distribution.
+independently of distribution. *Closed:* model completions now route through `InDoubtPolicy` too,
+keyed on the recorded `requestHash` (see "In-doubt model completions" in the roadmap).
 
 ## What "just start an instance" looks like
 
@@ -101,10 +107,12 @@ The operational model this buys is the one worth having:
 
 ```
 $ java -jar my-agent.jar    # node A
-$ java -jar my-agent.jar    # node B — no config, no seed list, no join
+$ java -jar my-agent.jar    # node B — no seed list, no join
 ```
 
-Both nodes subscribe to the shared task tag and take what they can claim. Start more
+*As shipped,* each node needs a FoundationDB-backed log and `.nodeId(...).distributed()`, and nodes
+**poll** the shared index every `claimInterval` (Gumbo push subscriptions are per process). Both
+nodes take what they can claim. Start more
 instances and throughput rises; kill one and its executions are reclaimed and resumed. There is no
 membership protocol, no seed nodes, no split-brain to reason about, and no cluster state that can
 disagree with itself — because there is no cluster, only a shared log.
@@ -207,11 +215,11 @@ these primitives belong in the log, not in Catalyst and not in an actor system.
 
 Three gaps, all in storage. None of them require an actor system.
 
-| Gap | Today | Needed |
-|---|---|---|
-| Conditional append | `append(id, event)` — unconditional | `append(id, event, expectedSeq)`, rejecting on mismatch |
-| Lease storage | Gumbo's tag KV exists (`setTagValue`/`getTagValue`/`deleteTagValue`) — but get/set only | **compare-and-set + TTL** on the existing KV |
-| Claimable work | ~~no way to ask the log what needs running~~ | **already possible** — dual-tagging delivers it, and since Gumbo 0.6.0 the queue tag can be cursored by version too |
+| Gap | Before | Needed | Status |
+|---|---|---|---|
+| Conditional append | `append(id, event)` — unconditional | `append(id, event, expectedSeq)`, rejecting on mismatch | ✅ Dist-1 |
+| Lease storage | Gumbo's tag KV exists (`setTagValue`/`getTagValue`/`deleteTagValue`) — but get/set only | **compare-and-set + TTL** on the existing KV | ✅ gumbo 0.4.0, used by Dist-3 |
+| Claimable work | no way to ask the log what needs running | dual-tagging delivers it, and since Gumbo 0.6.0 the queue tag can be cursored by version too | ✅ Deploy-1, Dist-4 |
 
 Smaller than it first appeared, because two of the three are partly solved already.
 
@@ -270,9 +278,9 @@ not yet claimable.
 SPI addition is that read — a log has to be asked for the set, not just written to.
 
 Better still, Gumbo has **push subscriptions** (`SharedLogService.notifySubscribers`), which Boudin's
-`WorkflowDispatcher` uses to subscribe to its task tag rather than poll. Work delivery is therefore
-push already, which removes polling latency from the design and further reduces what a placement
-layer would add.
+`WorkflowDispatcher` uses to subscribe to its task tag rather than poll. *As shipped,* the claim loop
+**polls** instead: those subscriptions are fed only by the subscribing process's own appends, so
+another node's work would never arrive.
 
 #### Cursoring the queue tag: resolved in Gumbo 0.6.0
 
@@ -356,16 +364,15 @@ Being clear about the limits, since the comparison to BEAM invites them:
   boundary is redone on resume. This is the trade Catalyst already made for determinism, and replay
   makes it cheap.
 - **An in-flight boundary may be executed twice.** See the in-doubt window above: a provider call
-  accepted but not yet recorded is re-issued on resume. Bounded by `InDoubtPolicy` for tools; not yet
-  bounded at all for model completions.
+  accepted but not yet recorded is re-issued on resume. Bounded by `InDoubtPolicy` for tools and
+  model completions.
 - **No cross-node visibility of *running* work.** A node cannot ask "who is executing what right
   now" except through lease rows. That is a monitoring gap, not a correctness one.
 
 ## Open questions
 
-- **Where CAS belongs on the tag KV.** A `compareAndSetTagValue(tag, key, expected, value)` on
-  `PersistenceAdapter` is the obvious shape, and FDB gives it natively. The file adapter needs it only
-  to be correct within one process, since a shared *file* directory is not the multi-writer target.
+- ~~**Where CAS belongs on the tag KV.**~~ *Resolved:* Gumbo's lease CAS, used by `LeaseKeeper` and
+  `claimKey`.
 - ~~**Lease duration and heartbeat interval.**~~ *Resolved in Dist-3:* defaults of 30s and 10s,
   set with `Builder.lease(duration, heartbeat)`.
 - ~~**Fencing token vs. `expectedSeq`.**~~ *Resolved in Dist-3: no separate token.* Every stream
@@ -392,15 +399,15 @@ Being clear about the limits, since the comparison to BEAM invites them:
 > roadmap wins.
 
 0. ✅ **Gumbo multi-writer safety** — cross-process `localId` assignment and a non-clobbering index.
-   Done on FoundationDB (Gumbo 0.7.0; see above). Measured above; this is a hard prerequisite and it is Gumbo-side work, not Catalyst work. Until it
-   lands, two Catalyst nodes on one log corrupt each other's executions, and no amount of care above
-   the log prevents it.
-1. **Conditional append**, implemented as a Gumbo primitive and exposed through the `EventLog` SPI.
-   Additive, testable single-node today, and the piece the correctness argument rests on.
-2. **Shared-log Gumbo cluster** — the durability substrate for more than one node.
-3. **Claim loop** — lease CAS plus the claimable index, driving the existing `resume(id)`. This is
-   the point at which "start another instance" begins to work.
-4. **Push-based placement** — Cajun, or anything else, swapped in behind `KeyedLock`, which was
+   Done on FoundationDB (Gumbo 0.7.0; see above). This was a hard prerequisite, and it was
+   Gumbo-side work, not Catalyst work.
+1. ✅ **Conditional append**, implemented as a Gumbo primitive and exposed through the `EventLog` SPI
+   (Dist-1). The piece the correctness argument rests on.
+2. ✅ **Shared-log Gumbo cluster** — the durability substrate for more than one node
+   (`GumboEventLog.foundationDB`, Dist-0).
+3. ✅ **Claim loop** — lease CAS plus the claimable index, driving the existing `resume(id)`
+   (Dist-3/4). This is the point at which "start another instance" begins to work.
+4. ⏸ **Push-based placement** (deferred) — Cajun, or anything else, swapped in behind `KeyedLock`, which was
    deliberately left as the single seam for exactly this.
 
 Steps 0 and 1 are where the design risk is, and both are in Gumbo. Step 4 is where the convenience
