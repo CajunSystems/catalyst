@@ -350,6 +350,34 @@ checkout's pom to `com.github.CajunSystems` before installing.
   resume, so a bad one is terminal on an append-only log. `signal(id, name, payload, opts)` for tasks
   that read vars.
 
+- **Durable timers** — `TimerTest` (runtime) + `TimerAcceptanceTest` + `Demo timer` (CI gate).
+  - **Events:** `ctx.sleep(d)` records `TimerStarted(timerId, wakeAt)` (not a boundary; folds to
+    WAITING, timeline `SLEEPING`). It then throws `ExecutionWaitingSignal` with a `wakeAt`, so the
+    attempt parks through the same stop rule and park path as a signal wait, holding no thread. A
+    wake is just a resume after `wakeAt`. The attempt replays to the sleep, finds it due, and
+    records `TimerFired` (the boundary, identity = timer id; folds to RUNNING) itself, keeping one
+    writer per stream.
+  - **Timer ids** are `timer-<n>` in task order per attempt, like auto-capture.
+  - **Early resume:** a live attempt that reaches a recorded-but-not-due timer (after a pause +
+    resume) **re-records `TimerStarted` with the same `wakeAt`**, the same rule as a re-reached
+    signal wait. Without it the fold stays RUNNING (mutation-checked).
+  - **Waking:**
+    - `scheduleAttempt`'s `whenComplete` schedules an in-process wake on a timer park.
+    - `scan()` (recovery and claim loop) treats a WAITING execution whose timer is due as resumable,
+      and schedules a wake for one not yet due.
+    - `parked(state)` = WAITING and not timer-due; it replaced the plain WAITING checks in `resume`,
+      keyed `execute` and the claim-then-decide re-fold.
+    - `wakeIfDue` re-folds under the id lock and only resumes a still-sleeping, due execution, so
+      paused and cancelled sleepers stay put.
+    - `scheduledWakes` dedupes per id and `wakeAt`. The claim loop re-schedules every tick, and
+      without the dedupe a long sleep would collect thousands of tasks.
+  - **State:** `awaitingSignal()`/`awaitingSignalType()` stop at a SLEEPING step, so an earlier,
+    answered signal wait can't be mistaken for the current sleep. `awaitingTimer()` derives the
+    wake time from the timeline.
+  - **Mutation-checked:** removing scan treating due timers as resumable, `parked`, re-record,
+    status-scoped `awaitingTimer`, the signal-read stop, or the in-process wake each fails a
+    `TimerTest` case.
+
 - **Fenced runtime writes (Dist-1)** — `FencedWritesTest` (runtime: two runtimes over one log = two
   writers) + `FencedWritesAcceptanceTest` (the same over a real Gumbo log: storage refuses the zombie).
   Every runtime append goes through a `StreamCursor`: conditional when the log can fence, plain

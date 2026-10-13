@@ -77,6 +77,15 @@ public final class Reducer {
                     timeline.add(new TimelineStep(se.seq(), TimelineStep.Kind.WAITING, sa.name(), sa.at(), 0,
                             sa.payloadType() == null ? null : com.fasterxml.jackson.databind.node.TextNode.valueOf(sa.payloadType())));
                 }
+                case TimerStarted ts -> {
+                    status = Status.WAITING;
+                    timeline.add(new TimelineStep(se.seq(), TimelineStep.Kind.SLEEPING, ts.timerId(), ts.at(), 0,
+                            com.fasterxml.jackson.databind.node.TextNode.valueOf(ts.wakeAt().toString())));
+                }
+                case TimerFired tf -> {
+                    status = Status.RUNNING; // recorded by the attempt that woke, which is running
+                    timeline.add(new TimelineStep(se.seq(), TimelineStep.Kind.WOKE, tf.timerId(), tf.at(), 0, null));
+                }
                 case SignalReceived sr -> {
                     status = Status.RESUMING;
                     timeline.add(new TimelineStep(se.seq(), TimelineStep.Kind.SIGNALLED, sr.name(), sr.at(), 0, sr.payload()));

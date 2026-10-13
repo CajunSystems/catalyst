@@ -23,6 +23,8 @@ public record TimelineStep(long seq, Kind kind, String label, Instant at, long l
         PAUSED,
         WAITING,
         SIGNALLED,
+        SLEEPING,
+        WOKE,
         PROMPT,
         MODEL,
         TOOL,

@@ -220,6 +220,30 @@ nothing in doubt as long as every in-flight call finishes within `drainTimeout`.
 when the drain times out is left exactly as a crash would leave it, and this policy decides what
 happens to it. Size `drainTimeout` above your slowest call (see [deployment.md](deployment.md#shutdown-drain-dont-kill)).
 
+## Durable timers
+
+A task can wait for hours or days without holding anything:
+
+```java
+String welcome = ctx.model().complete(draftWelcome).message();
+ctx.sleep(Duration.ofDays(3));                              // durable: no thread held while asleep
+String followUp = ctx.model().complete(draftFollowUp).message();
+```
+
+`ctx.sleep` records when to wake, ends the attempt, and the execution waits as `WAITING`. When the
+timer comes due, the execution is resumed, the earlier steps are substituted, the sleep returns, and
+the task carries on.
+- **The wake time is fixed when the sleep is recorded**, from the runtime's clock, so a restart or a
+  failover waits only for what is left.
+- **Who wakes it:** the runtime that started the sleep wakes it in-process. A runtime started with
+  `recoverOnStart(true)` finds sleepers its predecessor left and wakes them when due, and a
+  distributed node's claim loop wakes due timers started on other nodes. Expect to wake at or
+  shortly after the wake time, never before it.
+- **A paused or cancelled sleeper is never woken.** `resume(id)` before the timer is due parks it
+  again with the same wake time.
+- `inspect(id).awaitingTimer()` gives the wake time of a sleeping execution. `awaitingSignal()` is
+  empty for a timer wait, and `signal(...)` refuses it.
+
 ## Signals: waiting for a human
 
 A task can stop and wait for input from outside, such as a reviewer's approval, a user's choice or a

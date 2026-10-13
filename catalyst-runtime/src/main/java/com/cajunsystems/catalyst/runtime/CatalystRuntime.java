@@ -109,6 +109,19 @@ public final class CatalystRuntime implements AutoCloseable {
     private final boolean distributed;
     /** This node's leases (Dist-3); null unless {@link #distributed}. */
     private final LeaseKeeper leases;
+    /**
+     * The wake already scheduled per execution, so a scan that runs every claim-loop tick does not
+     * schedule the same timer over and over (a week-long sleep would otherwise collect tens of
+     * thousands of duplicate wakes).
+     */
+    private final ConcurrentHashMap<ExecutionId, java.time.Instant> scheduledWakes = new ConcurrentHashMap<>();
+    /** Fires durable timers this process knows about ({@code ctx.sleep}); see {@link #scheduleWake}. */
+    private final java.util.concurrent.ScheduledExecutorService timers =
+            java.util.concurrent.Executors.newSingleThreadScheduledExecutor(r -> {
+                Thread t = new Thread(r, "catalyst-timers");
+                t.setDaemon(true);
+                return t;
+            });
     /** The claim loop (Dist-4): started by {@code build()} on a distributed runtime; null otherwise. */
     private volatile java.util.concurrent.ScheduledExecutorService claimLoop;
 
@@ -271,7 +284,7 @@ public final class CatalystRuntime implements AutoCloseable {
     /** A keyed submission of an existing execution: its waiting handle, its recorded outcome, or a resume. */
     private <R> ExecutionHandle<R> attachOrResume(Task<R> task, ExecutionId id, String taskType,
                                                   ExecutionOptions opts, ExecutionState state) {
-        if (state.status() == Status.WAITING) return waitingHandle(id, state);
+        if (parked(state)) return waitingHandle(id, state);
         Mode mode = state.isTerminal() ? Mode.REPLAY_TERMINAL : Mode.RESUME;
         return scheduleAttempt(task, id, taskType, opts, mode);
     }
@@ -324,7 +337,7 @@ public final class CatalystRuntime implements AutoCloseable {
                         throw e;
                     }
                 }
-                if (now.isTerminal() || now.status() == Status.WAITING) {
+                if (now.isTerminal() || parked(now)) {
                     if (claimedHere) leases.release(id);
                     if (!now.isTerminal()) return waitingHandle(id, now);
                     @SuppressWarnings("unchecked") // completes from the recorded outcome; never runs a task
@@ -356,6 +369,9 @@ public final class CatalystRuntime implements AutoCloseable {
             // execution over from another node at once.
             if (leases != null && running.get(id) == attempt) leases.release(id);
             if (running.remove(id, attempt)) inFlight.remove(id);
+            // Parked on a durable timer: wake it when it comes due.
+            Throwable cause = t instanceof java.util.concurrent.CompletionException c && c.getCause() != null ? c.getCause() : t;
+            if (cause instanceof ExecutionWaitingSignal w && w.wakeAt() != null) scheduleWake(id, w.wakeAt());
         });
         inFlight.put(id, visible);
         running.put(id, attempt);
@@ -651,7 +667,7 @@ public final class CatalystRuntime implements AutoCloseable {
             }
             // Still waiting for a signal: an attempt would only replay to the wait and park again, and
             // its ExecutionResumed would fold the status to RUNNING while it is really waiting.
-            if (state.status() == Status.WAITING) return waitingHandle(id, state);
+            if (parked(state)) return waitingHandle(id, state);
 
             TaskFactory factory = registry.lookup(taskType).orElseThrow(() -> new IllegalStateException(
                     "No task registered for type '" + taskType + "' to resume " + id
@@ -732,7 +748,10 @@ public final class CatalystRuntime implements AutoCloseable {
                     // deliberate PAUSED or WAITING (Deploy-2). A live lease held elsewhere means it is
                     // running there.
                     ExecutionState unleased = foldState(id);
-                    if (!isCrashInterrupted(unleased.status())) {
+                    if (!isCrashInterrupted(unleased.status()) && !timerDue(unleased)) {
+                        // A timer that is not due yet: make sure this process wakes it when it is. A
+                        // timer recorded by a process that has since died has no wake scheduled anywhere.
+                        unleased.awaitingTimer().ifPresent(wakeAt -> scheduleWake(id, wakeAt));
                         leftAlone.put(id, honourOrphanedCancel(id, unleased));
                         return;
                     }
@@ -740,7 +759,7 @@ public final class CatalystRuntime implements AutoCloseable {
                         underLease(id, () -> {
                             ExecutionState state = leases == null ? unleased : foldState(id);
                             Optional<String> carried = leases == null ? Optional.empty() : leases.pendingCancel(id);
-                            if (!isCrashInterrupted(state.status())) {
+                            if (!isCrashInterrupted(state.status()) && !timerDue(state)) {
                                 leftAlone.put(id, state.status());
                             } else if (carried.isPresent()) {
                                 // A cancel requested of its last holder: record it here. Recording a cancel
@@ -823,6 +842,58 @@ public final class CatalystRuntime implements AutoCloseable {
     private void stopClaimLoop() {
         java.util.concurrent.ScheduledExecutorService loop = claimLoop;
         if (loop != null) loop.shutdownNow();
+    }
+
+    /**
+     * Waiting on something only an outside actor can end: a signal, or a timer not yet due. A sleeping
+     * execution whose timer has come due is resumable, not parked.
+     */
+    private boolean parked(ExecutionState state) {
+        return state.status() == Status.WAITING && !timerDue(state);
+    }
+
+    /** Waiting on a timer that has come due by this runtime's clock. */
+    private boolean timerDue(ExecutionState state) {
+        return state.awaitingTimer().map(wakeAt -> !clock.instant().isBefore(wakeAt)).orElse(false);
+    }
+
+    /**
+     * Wakes {@code id} at {@code wakeAt} in this process: resumes it then, if it is still sleeping on
+     * a timer that has come due. Best-effort and idempotent. A wake for an execution that was paused,
+     * cancelled or already woken does nothing, and a timer this process never sees comes due through
+     * startup recovery or, distributed, the claim loop.
+     */
+    private void scheduleWake(ExecutionId id, java.time.Instant wakeAt) {
+        if (closing) return;
+        if (wakeAt.equals(scheduledWakes.put(id, wakeAt))) return; // already scheduled for exactly this
+        long delay = Math.max(0, java.time.Duration.between(clock.instant(), wakeAt).toMillis());
+        try {
+            timers.schedule(() -> wakeIfDue(id, wakeAt), delay, TimeUnit.MILLISECONDS);
+        } catch (RejectedExecutionException shuttingDown) {
+            scheduledWakes.remove(id, wakeAt); // closing: the next start's recovery wakes it
+        }
+    }
+
+    private void wakeIfDue(ExecutionId id, java.time.Instant scheduledFor) {
+        scheduledWakes.remove(id, scheduledFor);
+        if (closing) return;
+        try {
+            byExecution.withLock(id, () -> {
+                if (liveAttempt(id) != null) return;
+                ExecutionState state = foldState(id);
+                Optional<java.time.Instant> wakeAt = state.awaitingTimer();
+                if (wakeAt.isEmpty()) return;               // paused, cancelled, woken: nothing to do
+                if (!timerDue(state)) {
+                    scheduleWake(id, wakeAt.get());          // fired early by this clock; try again then
+                    return;
+                }
+                resume(id);
+            });
+        } catch (LeaseHeldException runningElsewhere) {
+            // another node took it first
+        } catch (RuntimeException e) {
+            LOG.warn("Could not wake {} from its timer: {}", id, e.toString());
+        }
     }
 
     /** The states a process death leaves an execution in — as opposed to ones recorded deliberately. */
@@ -1538,6 +1609,7 @@ public final class CatalystRuntime implements AutoCloseable {
         }
         closing = true;
         stopClaimLoop();
+        timers.shutdownNow();
         executor.shutdown();
         if (calledFromTaskThread()) {
             Thread.ofVirtual().name("catalyst-close").start(this::drainAndCloseLog);
@@ -1572,6 +1644,7 @@ public final class CatalystRuntime implements AutoCloseable {
         executor.shutdown();
         closeFinished.countDown();
         stopClaimLoop();
+        timers.shutdownNow();
         if (leases != null) leases.close();
         if (closeLog) log.close();
     }
