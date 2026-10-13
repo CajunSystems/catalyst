@@ -333,4 +333,25 @@ class ChildTest {
             Research.gate = null;
         }
     }
+    /** A crash after the parent recorded ChildStarted but before the child existed: recovery creates the child. */
+    @Test
+    void aCrashBeforeTheChildExistedIsRecovered() {
+        Research.sleep = Duration.ZERO;
+        Research.fail = false;
+        Research.gate = null;
+        Uncaught.other = false;
+        EventLog log = EventLogs.inMemory();
+        ExecutionId parent = ExecutionId.random();
+        java.time.Instant t = java.time.Instant.parse("2026-01-01T00:00:00Z");
+        log.append(parent, new CatalystEvent.ExecutionCreated(t, Uncaught.class.getName(), "novars", "cfg", ""));
+        log.append(parent, new CatalystEvent.ExecutionStarted(t, 1, "node-dead"));
+        log.append(parent, new CatalystEvent.ChildStarted(t, "child-1", ExecutionId.random().value(), Research.class.getName()));
+        try (CatalystRuntime runtime = CatalystRuntime.builder().log(log).model(MockModel.alwaysReturn("M"))
+                .task(Uncaught.class, Uncaught::new).task(Research.class, Research::new).build()) {
+            assertThat(runtime.inspect(parent).status()).isEqualTo(Status.WAITING);
+            runtime.recoverAll();
+            await(() -> runtime.inspect(parent).status() == Status.COMPLETED);
+            assertThat(runtime.resume(parent).result()).isEqualTo("found:M");
+        }
+    }
 }

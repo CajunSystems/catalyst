@@ -902,7 +902,12 @@ public final class CatalystRuntime implements AutoCloseable {
 
     /** Waiting on a child execution that has reached a terminal state. */
     private boolean childDone(ExecutionState state) {
-        return state.awaitingChild().map(child -> foldState(child).isTerminal()).orElse(false);
+        // An empty child stream is a crash between the parent recording ChildStarted and creating the
+        // child: only the parent's resumed attempt creates it (ensure), so the parent must not stay parked.
+        return state.awaitingChild().map(child -> {
+            ExecutionState c = foldState(child);
+            return c.isTerminal() || c.lastSeq() < 0;
+        }).orElse(false);
     }
 
     /** Waiting on a timer that has come due by this runtime's clock. */

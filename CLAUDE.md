@@ -384,7 +384,7 @@ checkout's pom to `com.github.CajunSystems` before installing.
     status-scoped `awaitingTimer`, the signal-read stop, or the in-process wake each fails a
     `TimerTest` case.
 
-- **Child executions** — `ChildTest` (runtime, 10) + `ChildAcceptanceTest` + `Demo child` (CI gate).
+- **Child executions** — `ChildTest` (runtime, 11) + `ChildAcceptanceTest` + `Demo child` (CI gate).
   - **Events:** `ctx.child(task)` (ref `child-<n>` per attempt) mints an id and records
     `ChildStarted(childRef, childId, taskType)`. It is not a boundary; it folds to WAITING, timeline
     `CHILD_STARTED`. It then asks the runtime's `ChildLauncher` (`Children`) to `ensure` the child:
@@ -415,6 +415,9 @@ checkout's pom to `com.github.CajunSystems` before installing.
     - The `ChildCompleted` boundary's hash is the child's **task type** (taken from its
       `ChildStarted`). Delegating the same ref to another type is a divergence, both on a completed
       child and on a pending one.
+    - **A child with an empty stream counts as done** for `childDone`. That is a crash between
+      the parent's `ChildStarted` and the child's create, and only the parent's resumed attempt
+      creates the child (`ensure`). Without this, recovery left the parent parked for good.
   - **Known gaps:** no cancel cascade; `childParents` keeps an entry for a parent cancelled while
     its child runs, until the child finishes.
 
