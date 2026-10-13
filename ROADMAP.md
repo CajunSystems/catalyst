@@ -520,9 +520,19 @@ below give the same capability natively.
      - **Limit and escalation:** the restart limit is counted across the group. Giving up cancels the
        children still running, then escalates.
      - **Exit demo:** `Demo group`.
-- **Per-call retries and timeouts** for model and tool calls. Boudin has per-activity
-  `startToClose`/`maxAttempts`/backoff; Catalyst retries the whole task, and a hung provider call
-  has no limit.
+- ✅ **Per-call retries and timeouts** for model and tool calls. Boudin has per-activity
+  `startToClose`/`maxAttempts`/backoff; Catalyst retried only the whole task, and a hung provider
+  call had no limit.
+  - *As shipped:* `CallPolicy.retries(n, backoff).timeout(t).retryOn(p)`. It is set runtime-wide
+    with `Builder.callPolicy`, or per call with `ctx.call(tool, input, policy)` and
+    `ctx.model(policy)`.
+  - **Retries run inside the attempt,** and only the outcome is recorded (one request, one result).
+    An informational `CallRetried` is left per retry, and a replay substitutes the outcome.
+  - **A timeout** runs the attempt on its own virtual thread and throws `CallTimeoutException`.
+  - **Streams** are retried only before the first chunk, and get no timeout.
+  - **A cancel** cuts retries short as `CANCELLED`. A shutdown surfaces the last failure to the
+    usual drain decision.
+  - **Exit demo:** `Demo calls`.
 - **Logging context and live metrics.** The execution id in MDC, plus counters for running
   executions, retries and lease takeovers. Today all observability is post-hoc (OTel, timeline).
 - **Remote result handles:** wait for an execution's result from any process. A keyed submit that

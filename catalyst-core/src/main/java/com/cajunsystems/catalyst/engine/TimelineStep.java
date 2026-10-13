@@ -30,6 +30,7 @@ public record TimelineStep(long seq, Kind kind, String label, Instant at, long l
         CHILD_SPAWNED,
         CHILD_AWAITED,
         CHILD_DISCARDED,
+        CALL_RETRIED,
         PROMPT,
         MODEL,
         TOOL,

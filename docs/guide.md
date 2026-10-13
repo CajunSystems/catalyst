@@ -211,6 +211,34 @@ The default is `RetryPolicy.none()`. The retry count is recorded, so the budget 
 Some failures are never retried, whatever the policy: a nondeterministic replay, an in-doubt call, an
 interrupt, a JVM `Error`.
 
+### Per-call retries and timeouts
+
+`RetryPolicy` re-runs the task. For a flaky provider or a hung service, it is usually better to retry
+just that call, where it happens, with a `CallPolicy`:
+
+```java
+Catalyst.builder(dir).callPolicy(CallPolicy.retries(3, Duration.ofMillis(200)).timeout(Duration.ofSeconds(30)))
+// or for one call:
+ctx.call(lookupTool, orderId, CallPolicy.retries(5, Duration.ofSeconds(1)));
+ctx.model(CallPolicy.timeoutAfter(Duration.ofSeconds(60))).complete(request);
+```
+
+- **Retries happen inside the attempt.** The backoff doubles from the given value, up to 30s by
+  default (`maxBackoff`). Only failures accepted by `retryOn(predicate)` are retried; the default
+  accepts all of them.
+- **Only the outcome is recorded:** one request and its result, or its last failure once retries run
+  out. Each retry leaves an informational `CallRetried` event, which the timeline and OTel show. A
+  replay substitutes the outcome without retrying or waiting.
+- **A timeout** gives up on an attempt with `CallTimeoutException`, which the policy can retry. The
+  call is interrupted, but a provider may already have accepted it, so a timed-out model call can
+  still be billed.
+- **Streamed completions** are retried only until the first chunk arrives: retrying after that would
+  deliver the text twice. Timeouts don't apply to them.
+- **Cancel and shutdown stop the retries.** A cancel ends the execution `CANCELLED`. A shutdown
+  surfaces the last failure, which then goes through `RetryPolicy` as usual.
+- The default is `CallPolicy.none()`: one attempt and no timeout. Whatever is left after the call's
+  own retries reaches the task, and `RetryPolicy` can still retry the whole task.
+
 **A call is in doubt:** the process died after recording a request but before recording its result.
 Did the model call get billed? Did the ticket get created? `InDoubtPolicy` decides, on resume:
 

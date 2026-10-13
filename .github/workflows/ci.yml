@@ -170,6 +170,19 @@ jobs:
           echo "$OUT" | grep -q "\[child\] calls during a strict replay of the coordinator: 0" || { echo "FAIL: replay made calls"; exit 1; }
           echo "$OUT" | grep -q "Child execution exit criterion holds" || exit 1
 
+      # The per-call retry exit criterion: a provider that answers 503 twice and a tool that hangs once
+      # are each retried in place under a CallPolicy (the hang cut by its timeout), so the task runs in
+      # one attempt with no whole-task retry, and a strict replay makes no call.
+      - name: Per-call retry exit demo (503s and a hang retried in place; replay with no calls)
+        run: |
+          set -uo pipefail
+          CP="catalyst-api/target/classes:$(cat catalyst-api/target/cp.txt)"
+          OUT="$(java -cp "$CP" com.cajunsystems.catalyst.api.Demo calls)" || { echo "$OUT"; exit 1; }
+          echo "$OUT"
+          echo "$OUT" | grep -q "\[calls\] whole-task retries: 0" || { echo "FAIL: the task was retried whole"; exit 1; }
+          echo "$OUT" | grep -q "\[calls\] calls during a strict replay: 0" || { echo "FAIL: replay made calls"; exit 1; }
+          echo "$OUT" | grep -q "Per-call retry exit criterion holds" || exit 1
+
       # The supervised-group exit criterion: one child's failure restarts the whole group
       # (one-for-all), cancelling its running siblings, across a runtime restart during the backoff;
       # no model call repeats and the coordinator replays exactly.

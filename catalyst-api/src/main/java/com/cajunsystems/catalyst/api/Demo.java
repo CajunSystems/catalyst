@@ -120,6 +120,8 @@ public final class Demo {
         } else if (args.length >= 2 && args[1].equals("distributed-b")) {
             DistributedDemo.rest(args[0]);
             System.exit(0); // FoundationDB's network thread outlives the logs
+        } else if (args.length >= 1 && args[0].equals("calls")) {
+            CallsDemo.main(Files.createTempDirectory("catalyst-calls-"));
         } else if (args.length >= 1 && args[0].equals("group")) {
             GroupDemo.main(Files.createTempDirectory("catalyst-group-"));
         } else if (args.length >= 1 && args[0].equals("fanout")) {

@@ -4,7 +4,7 @@
 #   scripts/demo.sh replay                 # single-process demos: replay, branch, snapshot, cancel,
 #                                          #   retry, resumeid, tools, collections, blob, schema,
 #                                          #   streaming, timeline, otel, autocapture, shutdown, signal, recover,
-#                                          #   eval, agent, timer, child, supervise, fanout, group
+#                                          #   eval, agent, timer, child, supervise, fanout, group, calls
 #   scripts/demo.sh /tmp/demo record       # two-process crash demo: record, then (new process) resume
 #   scripts/demo.sh /tmp/demo resume
 #   scripts/demo.sh /tmp/many crashmany    # startup recovery: crash several executions, then

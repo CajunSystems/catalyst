@@ -49,6 +49,7 @@ import java.time.Instant;
         @JsonSubTypes.Type(value = CatalystEvent.ChildSpawned.class, name = "ChildSpawned"),
         @JsonSubTypes.Type(value = CatalystEvent.ChildAwaited.class, name = "ChildAwaited"),
         @JsonSubTypes.Type(value = CatalystEvent.ChildDiscarded.class, name = "ChildDiscarded"),
+        @JsonSubTypes.Type(value = CatalystEvent.CallRetried.class, name = "CallRetried"),
 })
 public sealed interface CatalystEvent {
 
@@ -161,6 +162,14 @@ public sealed interface CatalystEvent {
      * resuming it. Not a boundary, and no state change.
      */
     record ChildDiscarded(Instant at, String childRef, String childId) implements CatalystEvent {}
+
+    /**
+     * One attempt at a model or tool call failed and the call's {@code CallPolicy} is trying again,
+     * inside the same execution attempt. Informational: not a boundary and no state change, so a
+     * replay skips it and substitutes the call's recorded outcome. {@code call} is {@code model} or
+     * {@code tool <name>}; {@code attempt} is the failed attempt (1-based).
+     */
+    record CallRetried(Instant at, String call, int attempt, String error) implements CatalystEvent {}
 
     // ── Model boundary ───────────────────────────────────────────────────────
 
