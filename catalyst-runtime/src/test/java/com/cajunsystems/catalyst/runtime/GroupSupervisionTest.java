@@ -196,6 +196,67 @@ class GroupSupervisionTest {
         }
     }
 
+    /** The log a crash leaves after the group recorded discarding a and c (b failed) but before they unwound. */
+    private static ExecutionId[] crashedAfterDiscarding(EventLog log) {
+        java.time.Instant t = java.time.Instant.parse("2026-01-01T00:00:00Z");
+        ExecutionId parent = ExecutionId.random();
+        ExecutionId a = ExecutionId.random(), b = ExecutionId.random(), c = ExecutionId.random();
+        log.append(parent, new CatalystEvent.ExecutionCreated(t, Group.class.getName(), "novars", "cfg", ""));
+        log.append(parent, new CatalystEvent.ExecutionStarted(t, 1, "node-dead"));
+        log.append(parent, new CatalystEvent.ChildSpawned(t, "child-1", a.value(), A.class.getName()));
+        log.append(parent, new CatalystEvent.ChildSpawned(t, "child-2", b.value(), B.class.getName()));
+        log.append(parent, new CatalystEvent.ChildSpawned(t, "child-3", c.value(), C.class.getName()));
+        String[][] kids = {{a.value(), A.class.getName(), "child-1"}, {b.value(), B.class.getName(), "child-2"},
+                {c.value(), C.class.getName(), "child-3"}};
+        for (String[] kid : kids) {
+            ExecutionId child = ExecutionId.of(kid[0]);
+            log.append(child, new CatalystEvent.ExecutionCreated(t, kid[1], "novars", "cfg", "child:" + parent.value() + ":" + kid[2]));
+            log.append(child, new CatalystEvent.ExecutionStarted(t, 1, "node-dead")); // left RUNNING by the crash
+        }
+        log.append(b, new CatalystEvent.ExecutionFailed(t, "b broke", -1));
+        log.append(parent, new CatalystEvent.ChildCompleted(t, "child-2", b.value(), "FAILED", null, "b broke"));
+        log.append(parent, new CatalystEvent.ChildDiscarded(t, "child-1", a.value()));
+        log.append(parent, new CatalystEvent.ChildDiscarded(t, "child-3", c.value()));
+        log.append(parent, new CatalystEvent.TimerStarted(t, "timer-1", t.plus(Duration.ofHours(1)))); // long due
+        return new ExecutionId[] {parent, a, c};
+    }
+
+    private static CatalystRuntime systemClockRuntime(EventLog log) {
+        return CatalystRuntime.builder().log(log).model(MockModel.alwaysReturn("M"))
+                .task(Group.class, Group::new).task(A.class, A::new).task(B.class, B::new).task(C.class, C::new).build();
+    }
+
+    /** Recovery cancels a discarded child it finds RUNNING, rather than resuming it. */
+    @Test
+    void recoveryCancelsADiscardedChildInsteadOfResumingIt() {
+        policy = Supervision.restart(2).oneForAll().backoff(Duration.ofHours(1));
+        EventLog log = EventLogs.inMemory();
+        ExecutionId[] ids = crashedAfterDiscarding(log);
+        try (CatalystRuntime runtime = systemClockRuntime(log)) {
+            runtime.recoverAll();
+            await(() -> runtime.inspect(ids[0]).status() == Status.COMPLETED);
+            assertThat(runtime.resume(ids[0]).result()).isEqualTo("a1,b1,c1");
+            await(() -> runtime.inspect(ids[1]).status() == Status.CANCELLED && runtime.inspect(ids[2]).status() == Status.CANCELLED);
+            assertThat(List.of(runsOf("a"), runsOf("c"))).as("only the restarted generation ran").containsExactly(1, 1);
+        }
+    }
+
+    /** The parent's own replay re-runs its spawns, but does not revive a child it recorded discarding. */
+    @Test
+    void theParentsReplayDoesNotReviveADiscardedChild() {
+        policy = Supervision.restart(2).oneForAll().backoff(Duration.ofHours(1));
+        EventLog log = EventLogs.inMemory();
+        ExecutionId[] ids = crashedAfterDiscarding(log);
+        try (CatalystRuntime runtime = systemClockRuntime(log)) {
+            runtime.resume(ids[0]); // no recovery scan: only the parent's replay could touch a and c
+            await(() -> runtime.inspect(ids[0]).status() == Status.COMPLETED);
+            assertThat(runtime.resume(ids[0]).result()).isEqualTo("a1,b1,c1");
+            // The parent ended with a and c outstanding: the cascade cancels them, never having run them.
+            await(() -> runtime.inspect(ids[1]).status() == Status.CANCELLED && runtime.inspect(ids[2]).status() == Status.CANCELLED);
+            assertThat(List.of(runsOf("a"), runsOf("c"))).as("only the restarted generation ran").containsExactly(1, 1);
+        }
+    }
+
     private static void await(BooleanSupplier condition) {
         long deadline = System.nanoTime() + TimeUnit.SECONDS.toNanos(10);
         while (!condition.getAsBoolean()) {

@@ -115,6 +115,8 @@ public final class ReplayingContext implements Context {
     private final java.util.Map<String, ChildSpawned> spawnedChildren = new java.util.HashMap<>();
     /** The task each spawn in this attempt was given, by ref, so an await can create or resume it. */
     private final java.util.Map<String, Task<?>> spawnedTasks = new java.util.HashMap<>();
+    /** Spawned children this execution recorded giving up on, by ref: never revived on replay. */
+    private final java.util.Set<String> discardedChildren = new java.util.HashSet<>();
     /** Outcomes of spawned children this attempt recorded or substituted, by ref: awaiting again returns them. */
     private final java.util.Map<String, ChildCompleted> settledChildren = new java.util.HashMap<>();
     /** Children this attempt has reached, so far: child-1, child-2, … in task order. */
@@ -286,6 +288,7 @@ public final class ReplayingContext implements Context {
                     childTypes.put(cs.childRef(), cs.taskType());
                 }
                 case ChildAwaited ca -> { } // a wait, not a boundary: its outcome is the ChildCompleted after it
+                case ChildDiscarded cd -> discardedChildren.add(cd.childRef());
                 case ChildCompleted cc -> {
                     // The child boundary; the ChildStarted before it only named the child. Its "hash" is
                     // the child's task type: the same ref delegating to another task is a divergence.
@@ -805,7 +808,10 @@ public final class ReplayingContext implements Context {
             // A live attempt makes sure a recorded child exists and is going: a crash may have come
             // between recording the spawn and creating the child, or interrupted the child. Its outcome
             // is read when it is awaited. A pure replay touches nothing.
-            if (appendEnabled && childLauncher != null) childLauncher.ensure(id, ref, childId, task);
+            // A child the parent recorded giving up on is never revived: it is cancelled, not resumed.
+            if (appendEnabled && childLauncher != null && !discardedChildren.contains(ref)) {
+                childLauncher.ensure(id, ref, childId, task);
+            }
             return new ChildHandle<>(ref, childId);
         }
         if (childLauncher == null) {
@@ -914,9 +920,20 @@ public final class ReplayingContext implements Context {
         }
     }
 
-    /** Cancels a child the group no longer wants. Only a live attempt acts; a replay touches nothing. */
+    /**
+     * Gives up on a child the group no longer wants. {@code ChildDiscarded} is recorded first, once,
+     * so the decision survives a crash before the child unwinds: the replay will not revive it and
+     * recovery cancels it. Then it is cancelled. A resume repeats the cancel, which does nothing to an
+     * ended child. Only a live attempt acts; a pure replay touches nothing.
+     */
     private void cancelChild(ChildHandle<?> child) {
-        if (appendEnabled && childLauncher != null) childLauncher.cancel(child.id());
+        if (!appendEnabled || childLauncher == null) return;
+        if (!discardedChildren.contains(child.ref())) {
+            requireAppendable("discard " + child.ref());
+            append(new ChildDiscarded(now(), child.ref(), child.id().value()));
+            discardedChildren.add(child.ref());
+        }
+        childLauncher.cancel(child.id());
     }
 
     /**
