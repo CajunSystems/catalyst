@@ -127,6 +127,8 @@ public final class CatalystTracer {
                 case SignalReceived sr -> root.addEvent("signalled", attr("catalyst.signal", sr.name()), sr.at());
                 case TimerStarted ts -> root.addEvent("sleeping", attr("catalyst.timer", ts.timerId()), ts.at());
                 case TimerFired tf -> root.addEvent("woke", attr("catalyst.timer", tf.timerId()), tf.at());
+                case ChildStarted cs -> root.addEvent("child started", attr("catalyst.child", cs.childId()), cs.at());
+                case ChildCompleted cc -> root.addEvent("child completed", attr("catalyst.child", cc.childId()), cc.at());
                 case RetryRequested rr -> root.addEvent("retry", attr("catalyst.cause", rr.cause()), rr.at());
                 case ExecutionBranched b -> root.addEvent("branched", attr("catalyst.parent.id", b.parentId()), b.at());
                 case ExecutionCancelled c -> root.addEvent("cancelled", attr("catalyst.reason", c.reason()), c.at());

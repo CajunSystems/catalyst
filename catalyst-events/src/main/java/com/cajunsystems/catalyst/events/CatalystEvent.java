@@ -44,6 +44,8 @@ import java.time.Instant;
         @JsonSubTypes.Type(value = CatalystEvent.SignalReceived.class, name = "SignalReceived"),
         @JsonSubTypes.Type(value = CatalystEvent.TimerStarted.class, name = "TimerStarted"),
         @JsonSubTypes.Type(value = CatalystEvent.TimerFired.class, name = "TimerFired"),
+        @JsonSubTypes.Type(value = CatalystEvent.ChildStarted.class, name = "ChildStarted"),
+        @JsonSubTypes.Type(value = CatalystEvent.ChildCompleted.class, name = "ChildCompleted"),
 })
 public sealed interface CatalystEvent {
 
@@ -114,6 +116,26 @@ public sealed interface CatalystEvent {
      * id), substituted on replay so the sleep returns at once.
      */
     record TimerFired(Instant at, String timerId) implements CatalystEvent {}
+
+    /**
+     * The parent started a child execution with {@code ctx.child(task)}: {@code childRef} is the
+     * child's place in the parent's code ({@code child-1}, {@code child-2}, … in task order),
+     * {@code childId} its own execution. Recorded before the child is created, so a crash between the
+     * two leaves an intent the next attempt completes. The parent then waits as {@code WAITING},
+     * holding no thread. Like {@link TimerStarted} it is not a boundary, and it is recorded again if a
+     * live attempt reaches a child that has not finished, so the fold returns to WAITING.
+     */
+    record ChildStarted(Instant at, String childRef, String childId, String taskType) implements CatalystEvent {}
+
+    /**
+     * The child reached a terminal state: recorded by the parent's own attempt when it resumed and
+     * found the child done, so the parent's worker is still the only writer of the parent's stream.
+     * The {@code ctx.child} boundary (identity = {@code childRef}), substituted on replay.
+     * {@code result} is the child's recorded result when it completed. Otherwise {@code status}
+     * ({@code FAILED}/{@code CANCELLED}) and {@code error} say how it ended.
+     */
+    record ChildCompleted(Instant at, String childRef, String childId, String status, JsonNode result, String error)
+            implements CatalystEvent {}
 
     // ── Model boundary ───────────────────────────────────────────────────────
 

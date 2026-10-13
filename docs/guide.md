@@ -247,6 +247,39 @@ the task carries on.
 - `inspect(id).awaitingTimer()` gives the wake time of a sleeping execution. `awaitingSignal()` is
   empty for a timer wait, and `signal(...)` refuses it.
 
+## Child executions
+
+A task can hand work to another task and wait for its result. The other task runs as a **child
+execution**: its own id, its own stream, and it can be inspected, replayed and branched on its own.
+
+```java
+final class Coordinator implements Task<String> {
+    public String execute(Context ctx) {
+        String findings = ctx.child(new Research());   // durable: no thread held while it runs
+        String draft = ctx.child(new Draft());
+        return findings + "\n" + draft;
+    }
+}
+```
+
+`ctx.child` records `ChildStarted`, starts the child, and the parent waits as `WAITING`. When the
+child finishes, the parent is resumed, the earlier steps are substituted, and `ctx.child` returns
+the child's result. The parent records `ChildCompleted` itself, so a replay of the parent returns
+the recorded result without running the child again.
+- **A failed or cancelled child** surfaces as `ChildExecutionFailedException` (with the child's id,
+  status and error). It is a recorded outcome: catch it and carry on, and a replay throws it again
+  at the same point.
+- **Restarts:** a runtime started with `recoverOnStart(true)` resumes an unfinished child and wakes
+  its parent when the child finishes. Like any resume by id, that needs the parent's and the
+  child's task types **registered** (`.task(...)`). The runtime that started the child needs no
+  registration.
+- **Inputs:** vars aren't persisted, and the child does not inherit the parent's vars or options.
+  Pass a child's input through its constructor from values the parent got at a recorded boundary.
+- `inspect(id).awaitingChild()` gives the child a waiting parent is waiting on.
+- **Limits:** cancelling a parent does not cancel its children. A branch or an eval candidate that
+  reaches `ctx.child` past its fork point fails with `UnsupportedOperationException`; a child that
+  was already completed in the recorded prefix is substituted as usual.
+
 ## Signals: waiting for a human
 
 A task can stop and wait for input from outside, such as a reviewer's approval, a user's choice or a
