@@ -449,6 +449,29 @@ checkout's pom to `com.github.CajunSystems` before installing.
       `recordCancelled` append and a `REPLAY_TERMINAL` handle both complete with
       `CancellationException` without the parent being cancelled.
 
+- **Supervision (one-for-one)** — `SupervisionTest` (runtime, 5) + `SupervisionPolicyTest` (core) +
+  `SupervisionAcceptanceTest` + `Demo supervise` (CI gate).
+  - **Mechanism:** `ctx.child(task, Supervision)` loops in `ReplayingContext.child` over
+    `childAttempt(task, ref)`. The refs are `child-<n>`, then `child-<n>#2`, `#3`, … Each restart is
+    a fresh child with a new id. On a `ChildExecutionFailedException`, the loop adds the failure's
+    `at()` (its `ChildCompleted.at`, recorded or substituted) and asks `Supervision.restarts(status,
+    failures)`. Then it sleeps the backoff (a durable `ctx.sleep`) and goes round again. Otherwise
+    it throws `failed.afterRestarts(n - 1)`.
+  - **Determinism:** every decision is a pure function of recorded outcomes, so a replay or resume
+    walks the same refs. Using a live clock for a substituted `at` fails a test (mutation-checked).
+  - **Only `FAILED` restarts.** A `CANCELLED` child escalates at once.
+  - **The window** counts failures strictly after `latest - window`.
+  - **No runtime changes:** restarts are ordinary children (keys `child:<parent>:child-1#2`), so
+    the cascade, recovery and wakes all apply.
+  - **Bug found by the Gumbo demo, already in #48:** a durable log decodes a failed child's
+    absent `result` as a JSON `NullNode`. The substitution checked `result == null && status !=
+    COMPLETED`, so on Gumbo a recorded failure returned `null` as a success. It now decides **by
+    status only** (`ChildTest.aRecordedFailureWithANullNodeResultIsStillAFailure`), and so does the
+    reducer's timeline detail. **In-memory tests can't see this class of bug:** check event fields
+    against a durable log.
+  - **Mutation-checked:** never restart, ignore the window, restart a cancelled child, skip the
+    backoff, drop the restart count, and a live clock on replay each fail a test.
+
 - **Fenced runtime writes (Dist-1)** — `FencedWritesTest` (runtime: two runtimes over one log = two
   writers) + `FencedWritesAcceptanceTest` (the same over a real Gumbo log: storage refuses the zombie).
   Every runtime append goes through a `StreamCursor`: conditional when the log can fence, plain

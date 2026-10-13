@@ -698,17 +698,46 @@ public final class ReplayingContext implements Context {
     }
 
     @Override
-    @SuppressWarnings("unchecked")
     public <R> R child(Task<R> task) {
+        return child(task, Supervision.escalate());
+    }
+
+    /**
+     * One-for-one supervision. The first child is {@code child-<n>}; restart {@code k} is
+     * {@code child-<n>#<k+1>}, a fresh execution. Every decision is made from recorded outcomes (their
+     * status and recorded time), and the backoff is a durable sleep, so a replay or resume walks the
+     * same restarts, substituting each.
+     */
+    @Override
+    public <R> R child(Task<R> task, Supervision supervision) {
         java.util.Objects.requireNonNull(task, "task");
-        String childRef = "child-" + (++childCount);
+        java.util.Objects.requireNonNull(supervision, "supervision");
+        String base = "child-" + (++childCount);
+        java.util.List<java.time.Instant> failures = new java.util.ArrayList<>();
+        for (int n = 1; ; n++) {
+            try {
+                return childAttempt(task, n == 1 ? base : base + "#" + n);
+            } catch (ChildExecutionFailedException failed) {
+                failures.add(failed.at());
+                if (failed.at() == null || !supervision.restarts(failed.status(), failures)) {
+                    throw failed.afterRestarts(n - 1);
+                }
+                if (!supervision.backoff().isZero()) sleep(supervision.backoff());
+            }
+        }
+    }
+
+    @SuppressWarnings("unchecked")
+    private <R> R childAttempt(Task<R> task, String childRef) {
         String taskType = task.getClass().getName();
         Optional<Boundary> done = pollExpected(ChildCompleted.class, "child " + childRef);
         if (done.isPresent() && identityMatchesOrFork(done.get(), "child", childRef)
                 && childTypeMatchesOrFork(done.get().seq(), childRef, done.get().hash(), taskType)) {
             ChildCompleted cc = (ChildCompleted) done.get().event();
-            if (cc.result() == null && !"COMPLETED".equals(cc.status())) {
-                throw new ChildExecutionFailedException(ExecutionId.of(cc.childId()), cc.status(), cc.error());
+            // Decided by status, never by a null result: a durable log decodes the absent result of a
+            // failed child as a JSON null node, which read as a successful null.
+            if (!"COMPLETED".equals(cc.status())) {
+                throw new ChildExecutionFailedException(ExecutionId.of(cc.childId()), cc.status(), cc.error(), cc.at(), 0);
             }
             return (R) payloads.fromTree(cc.result());
         }
@@ -734,8 +763,9 @@ public final class ReplayingContext implements Context {
         Optional<ChildLauncher.Outcome> outcome = childLauncher.ensure(id, childRef, childId, task);
         if (outcome.isPresent()) {
             ChildLauncher.Outcome o = outcome.get();
-            append(new ChildCompleted(now(), childRef, childId.value(), o.status(), o.completed() ? o.result() : null, o.error()));
-            if (!o.completed()) throw new ChildExecutionFailedException(childId, o.status(), o.error());
+            java.time.Instant at = now();
+            append(new ChildCompleted(at, childRef, childId.value(), o.status(), o.completed() ? o.result() : null, o.error()));
+            if (!o.completed()) throw new ChildExecutionFailedException(childId, o.status(), o.error(), at, 0);
             return (R) payloads.fromTree(o.result());
         }
         if (started != null) {

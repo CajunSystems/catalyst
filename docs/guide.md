@@ -285,6 +285,30 @@ the recorded result without running the child again.
   reaches `ctx.child` past its fork point fails with `UnsupportedOperationException`; a child that
   was already completed in the recorded prefix is substituted as usual.
 
+### Supervising a child
+
+Pass a `Supervision` to restart a child that fails:
+
+```java
+String summary = ctx.child(new FetchFeed(),
+        Supervision.restart(3)                    // up to 3 restarts...
+                .within(Duration.ofMinutes(10))   // ...counting only failures within 10 minutes of the latest
+                .backoff(Duration.ofSeconds(30))); // a durable sleep before each restart
+```
+
+- **Each restart is a fresh child execution,** with its own id and stream, run from the top. Use
+  it when the child's own history is the problem, such as a stuck agent conversation. To retry a
+  child in place, with its successful steps substituted, use the runtime's `RetryPolicy`. It
+  applies to a child as to any execution, before the child is recorded as failed.
+- **Only a failed child is restarted.** A cancelled child was stopped on purpose, so its failure
+  reaches the parent at once.
+- **When restarts run out,** the last failure reaches the parent as `ChildExecutionFailedException`,
+  with `restarts()` saying how many were made. Catch it to recover, or let it fail the parent.
+- **Decisions replay exactly.** The parent decides from the outcomes it recorded, and measures the
+  window on their recorded times, never a live clock. The backoff is a `ctx.sleep`. A replay or a
+  resume after a crash therefore walks the same restarts, and a restart survives a runtime restart.
+- `ctx.child(task)` is `ctx.child(task, Supervision.escalate())`: no restarts.
+
 ## Signals: waiting for a human
 
 A task can stop and wait for input from outside, such as a reviewer's approval, a user's choice or a

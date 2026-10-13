@@ -98,6 +98,16 @@ public interface Context {
     }
 
     /**
+     * Like {@link #child(Task)}, supervised: a failed child is restarted as a fresh child execution
+     * as {@code supervision} allows, and the failure reaches this task only when restarts run out.
+     * Each restart is recorded, so a replay or resume makes the same decisions. The default throws,
+     * so other {@code Context} implementations still compile.
+     */
+    default <R> R child(Task<R> task, com.cajunsystems.catalyst.engine.Supervision supervision) {
+        throw new UnsupportedOperationException(getClass().getSimpleName() + " does not run child executions");
+    }
+
+    /**
      * Whether {@code failure}, thrown by {@link #call}, is the recorded result of that call: the tool
      * failed, and the failure is in the log as its {@code ToolCompleted}. That covers a live failure, a
      * failure substituted on replay or resume, and one reproduced by a branch. Code that handles tool
