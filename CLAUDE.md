@@ -51,6 +51,9 @@ checkout's pom to `com.github.CajunSystems` before installing.
   `catalyst-core` only — no templating engine, no web server. All interpolated log content is escaped.
 - `catalyst-agents` — `Agent`: a tool-calling loop built on `Task`. Not to be confused with
   `catalyst-agent`, the Byte Buddy javaagent. It depends on core only.
+- `catalyst-mcp` — `McpToolset`/`McpTool`: an MCP server's tools as Catalyst `Tool`s for agents,
+  on the official MCP Java SDK (`mcp-core` + `mcp-json-jackson2`). Opt-in, not in `catalyst-api`:
+  it brings Reactor.
 - `catalyst-eval` — `Eval`: the eval harness. It batches branch (M2) over recorded executions
   with candidate models/tasks, and scores with pure `Scorer`s into an `EvalReport`. It depends on
   core + runtime only; no new events.
@@ -485,6 +488,18 @@ checkout's pom to `com.github.CajunSystems` before installing.
       unlike a model/tool stall, which would leave it in doubt.
     - Resume needs a *named* task type registered on the survivor. A lambda's class differs per
       call site.
+
+- **MCP** — `McpAgentTest` (catalyst-mcp): `TicketMcpServer` is a **real MCP server spawned as a
+  JVM over stdio** (`java -cp $java.class.path`; surefire's manifest jar carries the classpath). Its
+  `call_count` tool is the proof that a replay never reached it.
+  - **Tools:** `McpTool` is a `Tool<JsonNode,String>`. Text content is joined with newlines, and
+    non-text content becomes a placeholder. `isError` → `McpToolError`, a recorded failure the agent
+    feeds back.
+  - **Discovery:** the toolset is sorted by name, so the request's tool order is stable whatever
+    order the server lists in. Schemas are canonicalised (map keys sorted) by
+    `AgentTool.withSchema`, because they feed every request hash.
+  - **Jackson:** the SDK 2.0.1 binding was built against Jackson 2.21 but resolves to Catalyst's
+    pinned 2.17.2 and works on the paths tested. Recheck if a Jackson-related failure appears.
 
 - **Eval harness** — `EvalTest` (catalyst-eval, 10) + `BranchTest` tool-replay cases +
   `EvalAcceptanceTest` + `Demo eval` (CI gate).

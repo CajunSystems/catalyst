@@ -188,6 +188,18 @@ public final class Agent {
             return this;
         }
 
+        /**
+         * Offers a tool that takes the model's arguments as JSON and brings its own input schema, such
+         * as one discovered from an MCP server ({@code catalyst-mcp}). See {@link AgentTool#withSchema}.
+         */
+        public <O> Builder tool(Tool<com.fasterxml.jackson.databind.JsonNode, O> tool, String description, String inputSchemaJson) {
+            AgentTool<com.fasterxml.jackson.databind.JsonNode, O> agentTool = AgentTool.withSchema(tool, description, inputSchemaJson);
+            if (tools.putIfAbsent(tool.name(), agentTool) != null) {
+                throw new IllegalArgumentException("Two tools are named '" + tool.name() + "'");
+            }
+            return this;
+        }
+
         /** The most model turns one run may take (default 10). */
         public Builder maxSteps(int maxSteps) {
             if (maxSteps < 1) throw new IllegalArgumentException("maxSteps must be at least 1");

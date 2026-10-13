@@ -413,4 +413,45 @@ class AgentTest {
         assertThatThrownBy(() -> Agent.builder().tool(lookup, "a").tool(new LookupTool(), "b"))
                 .isInstanceOf(IllegalArgumentException.class).hasMessageContaining("named 'lookup'");
     }
+
+    /** A tool that takes the model's arguments as JSON with its own schema (the MCP shape). */
+    static final class EchoJson implements Tool<com.fasterxml.jackson.databind.JsonNode, String> {
+        @Override public String name() { return "echo"; }
+        @Override public Class<com.fasterxml.jackson.databind.JsonNode> inputType() { return com.fasterxml.jackson.databind.JsonNode.class; }
+        @Override public String apply(com.fasterxml.jackson.databind.JsonNode args) { return "got " + args; }
+    }
+
+    @Test
+    void aToolWithItsOwnSchemaGetsTheArgumentsAsGivenUnderACanonicalSchema() {
+        Agent a = Agent.builder().tool(new EchoJson(), "Echo",
+                "{\"required\":[\"q\"],\"type\":\"object\",\"properties\":{\"q\":{\"type\":\"string\"}}}").build();
+        Agent b = Agent.builder().tool(new EchoJson(), "Echo",
+                "{\"type\":\"object\",\"properties\":{\"q\":{\"type\":\"string\"}},\"required\":[\"q\"]}").build();
+        assertThat(a.toolSpecs().get(0).inputSchema()).as("key order does not change the request hash")
+                .isEqualTo(b.toolSpecs().get(0).inputSchema())
+                .isEqualTo("{\"properties\":{\"q\":{\"type\":\"string\"}},\"required\":[\"q\"],\"type\":\"object\"}");
+
+        Model calls = new Model() {
+            int turn;
+            @Override public Completion complete(CompletionRequest request) {
+                turn++;
+                if (turn == 1) return new Completion("", List.of(new ToolCall("x", "echo", "{\"q\":\"hi\",\"extra\":1}")), Usage.ZERO, "tool_calls");
+                if (turn == 2) return new Completion("", List.of(new ToolCall("y", "echo", "[1,2]")), Usage.ZERO, "tool_calls");
+                List<Message> m = request.prompt().messages();
+                return Completion.ofText(m.get(m.size() - 3).content() + " | " + m.get(m.size() - 1).content());
+            }
+        };
+        try (CatalystRuntime runtime = CatalystRuntime.builder().log(EventLogs.inMemory()).model(calls).build()) {
+            assertThat(runtime.execute(ctx -> a.run(ctx, "go").answer(), ExecutionOptions.none()).result())
+                    .isEqualTo("got {\"q\":\"hi\",\"extra\":1} | error: arguments do not fit echo: arguments must be a JSON object");
+        }
+    }
+
+    @Test
+    void anExplicitSchemaIsOnlyForToolsThatTakeJson() {
+        assertThatThrownBy(() -> Agent.builder().tool((Tool) lookup, "x", "{\"type\":\"object\"}"))
+                .isInstanceOf(IllegalArgumentException.class).hasMessageContaining("inputType JsonNode");
+        assertThatThrownBy(() -> Agent.builder().tool(new EchoJson(), "x", "[]"))
+                .isInstanceOf(IllegalArgumentException.class).hasMessageContaining("not a JSON object schema");
+    }
 }

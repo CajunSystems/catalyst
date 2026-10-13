@@ -1,0 +1,45 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<project xmlns="http://maven.apache.org/POM/4.0.0"
+         xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance"
+         xsi:schemaLocation="http://maven.apache.org/POM/4.0.0 http://maven.apache.org/xsd/maven-4.0.0.xsd">
+    <modelVersion>4.0.0</modelVersion>
+
+    <parent>
+        <groupId>com.cajunsystems</groupId>
+        <artifactId>catalyst-parent</artifactId>
+        <version>0.1.0-SNAPSHOT</version>
+    </parent>
+
+    <artifactId>catalyst-mcp</artifactId>
+    <name>Catalyst MCP</name>
+    <description>MCP server tools as Catalyst Tools: every call a recorded boundary, so an agent using them resumes, replays and evaluates.</description>
+
+    <dependencies>
+        <!--
+          Opt-in, like catalyst-langchain4j: the MCP SDK brings Reactor and its own JSON layer, which apps
+          that never talk to an MCP server should not inherit, so catalyst-api does not include this.
+        -->
+        <dependency>
+            <groupId>com.cajunsystems</groupId>
+            <artifactId>catalyst-core</artifactId>
+        </dependency>
+        <dependency>
+            <groupId>com.cajunsystems</groupId>
+            <artifactId>catalyst-agents</artifactId>
+        </dependency>
+        <dependency>
+            <groupId>io.modelcontextprotocol.sdk</groupId>
+            <artifactId>mcp-core</artifactId>
+        </dependency>
+        <dependency>
+            <groupId>io.modelcontextprotocol.sdk</groupId>
+            <artifactId>mcp-json-jackson2</artifactId>
+        </dependency>
+
+        <dependency>
+            <groupId>com.cajunsystems</groupId>
+            <artifactId>catalyst-runtime</artifactId>
+            <scope>test</scope>
+        </dependency>
+    </dependencies>
+</project>
