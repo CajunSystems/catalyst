@@ -41,7 +41,9 @@ final class GroupDemo {
         @Override public String execute(Context ctx) {
             int run = runs.computeIfAbsent(name, k -> new AtomicInteger()).incrementAndGet();
             if (name.equals("factcheck") && run == 1) throw new IllegalStateException("source snapshot was stale");
-            if (!name.equals("factcheck")) ctx.sleep(Duration.ofMillis(400));
+            // Long enough that the fact-check's failure is handled while its siblings still wait, even on
+            // a loaded machine: a sibling that finished first would have its result discarded instead.
+            if (!name.equals("factcheck")) ctx.sleep(Duration.ofSeconds(3));
             return name + "=" + ctx.model().complete(CompletionRequest.of(Prompt.builder().user(name).build())).message();
         }
     }
