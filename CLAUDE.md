@@ -49,6 +49,8 @@ checkout's pom to `com.github.CajunSystems` before installing.
 - `catalyst-timeline` — `TimelineReport`: renders a folded `ExecutionState` as a self-contained HTML
   page (header + roll-ups + step table). Read-only, post-hoc, pure function of the log; depends on
   `catalyst-core` only — no templating engine, no web server. All interpolated log content is escaped.
+- `catalyst-agents` — `Agent`: a tool-calling loop built on `Task`. Not to be confused with
+  `catalyst-agent`, the Byte Buddy javaagent. It depends on core only.
 - `catalyst-eval` — `Eval`: the eval harness. It batches branch (M2) over recorded executions
   with candidate models/tasks, and scores with pure `Scorer`s into an `EvalReport`. It depends on
   core + runtime only; no new events.
@@ -126,6 +128,17 @@ checkout's pom to `com.github.CajunSystems` before installing.
   runtime (`isRetryable`: excludes `NonDeterministicReplayException`, `InDoubtException`,
   `InterruptedException`, `Error`) before the policy is consulted. Whole-task, not per-tool. A retried
   log still replays exactly.
+  **A recorded tool failure is a fact, never in doubt, even at the log tail.** A crash between
+  `ToolCompleted(error)` and the retry decision leaves it last. `call()` substitutes it as
+  `RecordedToolFailureException` and **attributes it to its seq** (`lastToolFailureSeq`, exactly as
+  `runToolLive` does for a live failure). So a retry names that boundary and the next attempt runs
+  the tool live, and a task that handled the failure (an agent) carries on identically. This
+  replaced an older rule that routed a tail failure through `InDoubtPolicy`, which was a workaround
+  for unattributed substituted failures (`RetryRequested(-1)` burning the budget). It made an agent
+  that crashed right after a tool failure end FAILED under the default policy.
+  Likewise **a failed in-doubt `RETRY` is recorded** (`handleInDoubt` appends `ToolCompleted(error)`,
+  attributed). Unrecorded, a task that handled it left a request that never completes behind later
+  boundaries: replay diverged and every resume found it in doubt again.
 - **v0.2 Auto-capture** — `AutoCaptureAcceptanceTest` + `Demo autocapture`: a task containing plain
   `Instant.now()` / `UUID.randomUUID()` / `Random` calls and **no** `ctx.effect` is recorded and
   replayed exactly, because `catalyst-agent` rewrote those call sites into `AutoCapture` calls that
@@ -443,6 +456,36 @@ checkout's pom to `com.github.CajunSystems` before installing.
     orphan handling, release keeping or dropping the request, or the create-for-claimed-key each fails a
     test.
 
+- **Agents** — `AgentTest` (catalyst-agents, 9) + `MessageToolCallTest` (core) +
+  `AgentAcceptanceTest` + `Demo agent` (CI gate).
+  - **Loop:** model turn → `ctx.call` per tool call, in listed order → results back → until no tool
+    calls or `maxSteps`. The conversation is rebuilt from boundary results only, so it is
+    deterministic. Missing call ids are filled with `call-<turn>-<i>`.
+  - **`Message` tool-call fields are additive:** `@JsonInclude` NON_EMPTY/NON_NULL keeps the
+    recorded JSON identical, and `Hashing.toolCallFields` adds to the request hash only when
+    present, with markers starting `~`. **Breaking either changes every recorded prompt hash, and
+    every old log diverges on replay.** `MessageToolCallTest` recomputes the legacy hash
+    independently.
+  - **Tool failures** are fed to the model as `error: <String.valueOf(e)>`. On replay the engine
+    throws `RecordedToolFailureException(recordedError)`, which must produce the same text.
+    Without it, the prompt after a failure diverged (mutation-checked).
+  - **Engine signals are rethrown,** never fed to the model: cancel, abandon, waiting, paused,
+    stale writer, divergence, in-doubt, unrecorded tool (mutation-checked).
+  - **Only a *recorded* tool failure reaches the model:** `Context.isRecordedToolFailure(e)` is
+    `e == lastToolFailureException`. That covers live, substituted, in-doubt RETRY and
+    branch-reproduced failures. Anything else from `ctx.call`, such as a failed log write, propagates.
+    Carrying on would record the next turn on top of a missing `ToolCompleted` (mutation-checked).
+  - **Tool inputs:** a flat record of scalars and enums, or one scalar wrapped as `{"value":…}`.
+    Every component is required, and a missing one is fed back as an error, never decoded to
+    null/0.
+    The schema is derived, and anything else is refused at `tool(...)`.
+  - **Tests and the demo:**
+    - The crash-mid-loop test uses a tool that `close()`s its own runtime. The next boundary
+      abandons before recording, which leaves the execution RUNNING with no dangling request,
+      unlike a model/tool stall, which would leave it in doubt.
+    - Resume needs a *named* task type registered on the survivor. A lambda's class differs per
+      call site.
+
 - **Eval harness** — `EvalTest` (catalyst-eval, 10) + `BranchTest` tool-replay cases +
   `EvalAcceptanceTest` + `Demo eval` (CI gate).
   - **Branch point** = just before the first `PromptBuilt`/`CompletionRequested`. **Not** before
@@ -455,6 +498,10 @@ checkout's pom to `com.github.CajunSystems` before installing.
       replay consumed, pulled back to `seq - 1` by `fork(seq)`. It is not `atSeq`: a candidate can
       fork earlier, and the parent's calls from there on are unused (review finding).
     - Repeats are consumed in order. Answering each with the first output made a poll loop forever.
+    - **Recorded failures are answers too** (`RecordedOutput.error`), reproduced as a recorded,
+      attributed `RecordedToolFailureException`. Dropping them made every run that recovered from a
+      failed call (an agent) unevaluable. A failure named by a `RetryRequested` is excluded: the
+      parent re-ran that call.
     - `raisedUnrecordedTool()` makes a swallowed refusal still fail the branch.
     - `BranchBuilder.childId()` is the *next* run's id; each `run()` takes it and mints a fresh one.
     `ReplayingContext.answerFromRecording` handles a forked, non-deterministic tool call: it records

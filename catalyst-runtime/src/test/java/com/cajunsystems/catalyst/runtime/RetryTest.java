@@ -194,61 +194,57 @@ class RetryTest {
         }
     }
 
+    /**
+     * A crash in the window between recording ToolCompleted(error) and deciding whether to retry: the
+     * log ends with the errored tool and no RetryRequested. On resume the recorded failure is
+     * substituted, so the interrupted decision is made now, and a retry of it names its boundary.
+     * The next attempt then re-runs the tool live, and this transient failure recovers with one retry.
+     * (Before the failure was attributed, the retry named seq -1 and every attempt substituted the
+     * same failure until the budget ran out.)
+     */
     @Test
-    void crashBetweenToolFailureAndRetryDoesNotBurnTheBudgetOnResume() {
-        // Simulate a crash in the window between recording ToolCompleted(error) and appending
-        // RetryRequested: the log ends with a trailing errored tool and no RetryRequested. On resume the
-        // failure is in-doubt (default FAIL) — it must fail immediately, not burn the whole retry budget
-        // on futile substitution-replay cycles.
+    void crashBetweenToolFailureAndRetryIsRetriedLiveOnResume() {
         InMemoryEventLog log = new InMemoryEventLog();
-        MockModel model = MockModel.alwaysReturn("m");
-        FlakyTool tool = new FlakyTool(0); // would succeed if actually re-run
+        FlakyTool tool = new FlakyTool(0); // succeeds when actually re-run
         Task<String> task = ctx -> ctx.call(tool, new In("x"));
+        ExecutionId id = crashedAfterToolFailure(log, task);
 
-        ExecutionId id = ExecutionId.random();
-        Instant t = Instant.now();
-        log.putKey("k", id);
-        log.append(id, new CatalystEvent.ExecutionCreated(t, task.getClass().getName(), "h", "cfg", "k"));
-        log.append(id, new CatalystEvent.ExecutionStarted(t, 1, "node-0"));
-        log.append(id, new CatalystEvent.ToolRequested(t, "flaky", NullNode.getInstance()));
-        log.append(id, new CatalystEvent.ToolCompleted(t, null, "transient", 1)); // crash right here
-
-        try (CatalystRuntime runtime = CatalystRuntime.builder().log(log).model(model)
+        try (CatalystRuntime runtime = CatalystRuntime.builder().log(log).model(MockModel.alwaysReturn("m"))
                 .retryPolicy(RetryPolicy.maxRetries(5, Duration.ofMillis(5))).build()) {
-            ExecutionHandle<String> h = runtime.execute(task, ExecutionOptions.withKey("k"));
-            catchThrowable(h::result);
-
-            assertThat(runtime.inspect(id).status()).isEqualTo(Status.FAILED);
-            assertThat(countOf(log::read, id, CatalystEvent.RetryRequested.class))
-                    .as("budget untouched: the in-doubt tail is not a retryable substitution").isZero();
+            assertThat(runtime.execute(task, ExecutionOptions.withKey("k")).result()).isEqualTo("ok:x");
+            assertThat(runtime.inspect(id).status()).isEqualTo(Status.COMPLETED);
+            assertThat(countOf(log::read, id, CatalystEvent.RetryRequested.class)).as("one retry, not the budget").isEqualTo(1);
+            assertThat(tool.invocations).as("re-run live once").hasValue(1);
         }
     }
 
+    /** With no retry policy, the resumed attempt makes the decision the crash interrupted: the failure is final. */
     @Test
-    void crashWindowToolIsReRunLiveUnderInDoubtRetry() {
-        // The same crash tail, but with InDoubtPolicy.RETRY: the in-doubt tool is genuinely re-run live
-        // and (being transient) now succeeds — the recovery the retry budget could never provide.
+    void crashBetweenToolFailureAndRetryFailsOnResumeWithoutRetries() {
         InMemoryEventLog log = new InMemoryEventLog();
-        MockModel model = MockModel.alwaysReturn("m");
         FlakyTool tool = new FlakyTool(0);
         Task<String> task = ctx -> ctx.call(tool, new In("x"));
+        ExecutionId id = crashedAfterToolFailure(log, task);
 
+        try (CatalystRuntime runtime = CatalystRuntime.builder().log(log).model(MockModel.alwaysReturn("m")).build()) {
+            catchThrowable(runtime.execute(task, ExecutionOptions.withKey("k"))::result);
+            assertThat(runtime.inspect(id).status()).isEqualTo(Status.FAILED);
+            assertThat(runtime.inspect(id).error()).contains("transient");
+            assertThat(tool.invocations).as("the recorded failure is substituted, not re-run").hasValue(0);
+        }
+    }
+
+    /** A log ending in a recorded tool failure, as a crash right after it leaves one. */
+    private static ExecutionId crashedAfterToolFailure(InMemoryEventLog log, Task<String> task) {
         ExecutionId id = ExecutionId.random();
         Instant t = Instant.now();
         log.putKey("k", id);
         log.append(id, new CatalystEvent.ExecutionCreated(t, task.getClass().getName(), "h", "cfg", "k"));
         log.append(id, new CatalystEvent.ExecutionStarted(t, 1, "node-0"));
-        log.append(id, new CatalystEvent.ToolRequested(t, "flaky", NullNode.getInstance()));
-        log.append(id, new CatalystEvent.ToolCompleted(t, null, "transient", 1)); // crash right here
-
-        try (CatalystRuntime runtime = CatalystRuntime.builder().log(log).model(model)
-                .inDoubtPolicy(InDoubtPolicy.RETRY).build()) {
-            ExecutionHandle<String> h = runtime.execute(task, ExecutionOptions.withKey("k"));
-
-            assertThat(h.result()).isEqualTo("ok:x");
-            assertThat(runtime.inspect(id).status()).isEqualTo(Status.COMPLETED);
-            assertThat(tool.invocations).as("the in-doubt tool ran live once").hasValue(1);
-        }
+        log.append(id, new CatalystEvent.ToolRequested(t, "flaky",
+                com.cajunsystems.catalyst.events.EventJson.shared().valueToTree(new In("x"))));
+        log.append(id, new CatalystEvent.ToolCompleted(t, null, "java.lang.RuntimeException: transient", 1)); // crash here
+        return id;
     }
 
     @Test

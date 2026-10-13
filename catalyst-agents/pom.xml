@@ -1,0 +1,38 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<project xmlns="http://maven.apache.org/POM/4.0.0"
+         xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance"
+         xsi:schemaLocation="http://maven.apache.org/POM/4.0.0 http://maven.apache.org/xsd/maven-4.0.0.xsd">
+    <modelVersion>4.0.0</modelVersion>
+
+    <parent>
+        <groupId>com.cajunsystems</groupId>
+        <artifactId>catalyst-parent</artifactId>
+        <version>0.1.0-SNAPSHOT</version>
+    </parent>
+
+    <!--
+      Not to be confused with catalyst-agent (singular): that is the Byte Buddy javaagent for
+      auto-capture. This module is AI agents, a reasoning loop built on Task.
+    -->
+    <artifactId>catalyst-agents</artifactId>
+    <name>Catalyst Agents</name>
+    <description>A tool-calling agent loop built on Task: every model turn and tool call is a recorded boundary (spec §12).</description>
+
+    <dependencies>
+        <!--
+          catalyst-core only. An agent is a consumer of the runtime, not part of it: it runs inside a
+          Task through Context like any other code, so resume, replay, branch, eval and the timeline
+          apply to it unchanged.
+        -->
+        <dependency>
+            <groupId>com.cajunsystems</groupId>
+            <artifactId>catalyst-core</artifactId>
+        </dependency>
+
+        <dependency>
+            <groupId>com.cajunsystems</groupId>
+            <artifactId>catalyst-runtime</artifactId>
+            <scope>test</scope>
+        </dependency>
+    </dependencies>
+</project>

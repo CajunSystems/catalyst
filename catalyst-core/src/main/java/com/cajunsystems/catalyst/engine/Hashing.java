@@ -31,6 +31,7 @@ public final class Hashing {
         for (Message m : request.prompt().messages()) {
             field(sb, m.role().name());
             field(sb, m.content());
+            toolCallFields(sb, m);
         }
         sb.append("tools:").append(request.tools().size()).append('\n');
         for (ToolSpec t : request.tools()) {
@@ -38,6 +39,26 @@ public final class Hashing {
             field(sb, t.inputSchema() == null ? "" : t.inputSchema());
         }
         return sha256(sb.toString());
+    }
+
+    /**
+     * A message's tool-call fields, appended only when present, so a message without them hashes
+     * exactly as it did before they existed. Each starts with a marker no role name can equal, which
+     * keeps the encoding unambiguous.
+     */
+    static void toolCallFields(StringBuilder sb, Message m) {
+        if (!m.toolCalls().isEmpty()) {
+            field(sb, "~calls:" + m.toolCalls().size());
+            for (com.cajunsystems.catalyst.model.ToolCall c : m.toolCalls()) {
+                field(sb, c.id() == null ? "" : c.id());
+                field(sb, c.name());
+                field(sb, c.argumentsJson() == null ? "" : c.argumentsJson());
+            }
+        }
+        if (m.toolCallId() != null) {
+            field(sb, "~result:" + m.toolCallId());
+            field(sb, m.toolName() == null ? "" : m.toolName());
+        }
     }
 
     /** Appends a length-prefixed field: {@code <byteLength>:<value>\n}. */

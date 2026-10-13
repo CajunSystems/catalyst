@@ -198,7 +198,6 @@ public final class ReplayingContext implements Context {
                 retriedFailures.add(rr.failedSeq());
             }
         }
-        long lastRecordedSeq = recorded.isEmpty() ? -1 : recorded.get(recorded.size() - 1).seq();
 
         String pendingRequestHash = null;
         CompletionRequested pendingCompletionRequest = null; // unmatched (in-doubt) if non-null at end
@@ -241,19 +240,13 @@ public final class ReplayingContext implements Context {
                         pendingToolRequest = null;
                         pendingToolRequestSeq = -1;
                         pendingToolInputHash = null;
-                    } else if (tc.error() != null && se.seq() == lastRecordedSeq && pendingToolRequest != null) {
-                        // An errored tool at the very tail with no RetryRequested naming it: the process
-                        // crashed between recording the failure and deciding whether to retry. Its side
-                        // effect is in-doubt on resume — route recovery through InDoubtPolicy (which may
-                        // re-run it) exactly as for a tool with no recorded completion, rather than
-                        // replaying the recorded failure (which would burn the retry budget on a boundary
-                        // that can never succeed by substitution).
-                        this.danglingTool = pendingToolRequest;
-                        this.danglingToolSeq = pendingToolRequestSeq;
-                        pendingToolRequest = null;
-                        pendingToolRequestSeq = -1;
-                        pendingToolInputHash = null;
                     } else {
+                        // A recorded failure is a fact, not a doubt: the tool ran and threw. That holds
+                        // even at the very tail, where a crash cut off the retry-or-fail decision. It is
+                        // substituted like any result: a task that handles failures (an agent feeding it
+                        // to the model) continues exactly as it did live, and one that does not throws it
+                        // again, so the interrupted decision is made now. A retry of it names its seq
+                        // (call() attributes substituted failures), which drops it here next attempt.
                         String name = pendingToolRequest != null ? pendingToolRequest.toolName() : null;
                         boundaries.add(new Boundary(se.seq(), e, name, pendingToolInputHash));
                         pendingToolRequest = null;
@@ -445,7 +438,10 @@ public final class ReplayingContext implements Context {
 
     private String canonicalPrompt(CompletionRequest request) {
         StringBuilder sb = new StringBuilder();
-        request.prompt().messages().forEach(m -> sb.append(m.role()).append(':').append(m.content()).append('\n'));
+        request.prompt().messages().forEach(m -> {
+            sb.append(m.role()).append(':').append(m.content()).append('\n');
+            Hashing.toolCallFields(sb, m); // nothing for a message without tool-call fields
+        });
         return sb.toString();
     }
 
@@ -467,7 +463,13 @@ public final class ReplayingContext implements Context {
                 }
                 ToolCompleted tc = (ToolCompleted) b.event();
                 if (tc.error() != null) {
-                    throw new RuntimeException("Recorded tool '" + tool.name() + "' failed: " + tc.error());
+                    // Attributed to its recorded boundary, exactly as a live failure is (runToolLive), so a
+                    // retry of it names this seq. The next attempt then drops the recorded failure and
+                    // re-runs the tool live, instead of substituting the same failure every attempt.
+                    RecordedToolFailureException failure = new RecordedToolFailureException(tool.name(), tc.error());
+                    lastToolFailureSeq = b.seq();
+                    lastToolFailureException = failure;
+                    throw failure;
                 }
                 if (isDeterministic(tool)) {
                     return applyUnchecked(tool, input); // re-execute rather than deserialize (spec §4)
@@ -502,14 +504,13 @@ public final class ReplayingContext implements Context {
         String inputHash = Hashing.canonicalJsonHash(inputTree);
         String key = BranchSpec.toolKey(tool.name(), inputHash);
         long replayedThrough = lastReplayedSeq;
-        java.util.List<com.fasterxml.jackson.databind.JsonNode> outputs = branchSpec.recordedToolResults()
+        java.util.List<BranchSpec.RecordedOutput> outputs = branchSpec.recordedToolResults()
                 .getOrDefault(key, java.util.List.of()).stream()
                 .filter(r -> r.seq() > replayedThrough)   // earlier ones were substituted by replay
-                .map(BranchSpec.RecordedOutput::output)
                 .toList();
         int next = recordedToolCursor.getOrDefault(key, 0);
-        com.fasterxml.jackson.databind.JsonNode recordedOutput = next < outputs.size() ? outputs.get(next) : null;
-        if (recordedOutput == null) {
+        BranchSpec.RecordedOutput recorded = next < outputs.size() ? outputs.get(next) : null;
+        if (recorded == null) {
             if (branchSpec.toolReplay() == BranchSpec.ToolReplay.RECORDED_ONLY) {
                 // Remembered, like the stop signals: a task that catches tool errors must not turn
                 // "the candidate took a path the recording cannot answer" into a completion.
@@ -521,8 +522,16 @@ public final class ReplayingContext implements Context {
         requireAppendable("tool " + tool.name());
         recordedToolCursor.put(key, next + 1);
         append(new ToolRequested(now(), tool.name(), inputTree));
-        append(new ToolCompleted(now(), recordedOutput, null, 0));
-        return (O) payloads.fromTree(recordedOutput);
+        if (recorded.error() != null) {
+            // The recorded call failed: fail the same way, recorded and attributed like any failure.
+            long failedSeq = append(new ToolCompleted(now(), null, recorded.error(), 0));
+            RecordedToolFailureException failure = new RecordedToolFailureException(tool.name(), recorded.error());
+            lastToolFailureSeq = failedSeq;
+            lastToolFailureException = failure;
+            throw failure;
+        }
+        append(new ToolCompleted(now(), recorded.output(), null, 0));
+        return (O) payloads.fromTree(recorded.output());
     }
 
     private <I, O> O runToolLive(Tool<I, O> tool, I input) {
@@ -557,7 +566,20 @@ public final class ReplayingContext implements Context {
             case RETRY -> {
                 requireAppendable("in-doubt retry of tool " + tool.name());
                 long t0 = System.nanoTime();
-                O output = applyUnchecked(tool, input);
+                O output;
+                try {
+                    output = applyUnchecked(tool, input);
+                } catch (RuntimeException ex) {
+                    // The retried call failed: that is its verdict, recorded exactly as runToolLive
+                    // records one, completing the dangling request. Left unrecorded, a task that handles
+                    // the failure (an agent telling the model) would record later boundaries after a
+                    // request that never completes: replay diverges there, and every resume would find
+                    // it in doubt again.
+                    long latencyMillis = (System.nanoTime() - t0) / 1_000_000;
+                    lastToolFailureSeq = append(new ToolCompleted(now(), null, String.valueOf(ex), latencyMillis));
+                    lastToolFailureException = ex;
+                    throw ex;
+                }
                 long latencyMillis = (System.nanoTime() - t0) / 1_000_000;
                 append(new ToolCompleted(now(), payloads.toTree(output), null, latencyMillis)); // completes the dangling request
                 yield output;
@@ -838,6 +860,12 @@ public final class ReplayingContext implements Context {
     /** Whether this context raised {@link ExecutionAbandonedSignal} — whether or not the task let it unwind. */
     public boolean raisedAbandon() {
         return raisedAbandon;
+    }
+
+    /** Attributed to a recorded {@code ToolCompleted(error)}: live, substituted, in-doubt retry or branch-reproduced. */
+    @Override
+    public boolean isRecordedToolFailure(Throwable failure) {
+        return failure != null && failure == lastToolFailureException;
     }
 
     public long failedBoundarySeq(Throwable propagating) {

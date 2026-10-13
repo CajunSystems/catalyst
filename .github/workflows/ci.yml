@@ -145,6 +145,21 @@ jobs:
       # substituted — bounded by the policy, and the retried log still replays exactly. The pair
       # "tool invocations: 3" + "model calls across retries: 1" is the whole semantics: substitute-
       # everything would show 1 invocation + FAILED, re-run-everything would show 3 model calls.
+      # The agent exit criterion: a tool-calling agent behaves as any execution does. It resumes
+      # mid-conversation without repeating a model turn or a tool call, replays with zero calls, and
+      # is evaluated without re-running a tool.
+      - name: Agent exit demo (crash mid-conversation → resume; exact replay; eval with no tool re-run)
+        run: |
+          set -uo pipefail
+          CP="catalyst-api/target/classes:$(cat catalyst-api/target/cp.txt)"
+          OUT="$(java -cp "$CP" com.cajunsystems.catalyst.api.Demo agent)" || { echo "$OUT"; exit 1; }
+          echo "$OUT"
+          echo "$OUT" | grep -q "\[agent\] model turns on resume: 2 " || { echo "FAIL: resume repeated a model turn"; exit 1; }
+          echo "$OUT" | grep -q "\[agent\] tool executions in total: lookup 1, page 1" || { echo "FAIL: a tool call was repeated"; exit 1; }
+          echo "$OUT" | grep -q "\[agent\] calls during a strict replay of the whole conversation: 0" || { echo "FAIL: replay made calls"; exit 1; }
+          echo "$OUT" | grep -q "\[agent\] tool executions during the evaluation: 0" || { echo "FAIL: eval re-ran a tool"; exit 1; }
+          echo "$OUT" | grep -q "Agent exit criterion holds" || exit 1
+
       # The eval harness exit criterion: recorded runs replayed against candidate models and a prompt
       # rewrite and scored, without re-running a single tool or calling the recorded model.
       - name: Eval harness exit demo (candidates scored against recorded runs; no tool re-run)

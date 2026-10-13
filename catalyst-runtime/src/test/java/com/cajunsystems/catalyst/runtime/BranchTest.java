@@ -306,4 +306,71 @@ class BranchTest {
             assertThat(second.status()).isEqualTo(com.cajunsystems.catalyst.Status.COMPLETED);
         }
     }
+
+    /** A tool that fails until its n-th call, counting real invocations. */
+    static final class FailingTool implements Tool<String, String> {
+        final java.util.concurrent.atomic.AtomicInteger calls = new java.util.concurrent.atomic.AtomicInteger();
+        final int failures;
+        FailingTool(int failures) { this.failures = failures; }
+        @Override public String name() { return "flaky"; }
+        @Override public Class<String> inputType() { return String.class; }
+        @Override public String apply(String in) {
+            if (calls.incrementAndGet() <= failures) throw new IllegalStateException("down");
+            return "up:" + in;
+        }
+    }
+
+    private static long beforeFirstPrompt(CatalystRuntime runtime, com.cajunsystems.catalyst.ExecutionId id) {
+        return runtime.log().read(id).stream()
+                .filter(e -> e.event() instanceof com.cajunsystems.catalyst.events.CatalystEvent.PromptBuilt)
+                .findFirst().orElseThrow().seq() - 1;
+    }
+
+    /**
+     * A run that recovered from a failed call (it caught the failure and went on) is re-run by a
+     * recorded-only branch without re-running the call: the recorded failure is reproduced, as a
+     * replay does. When failures were left out of the table, this was an unrecorded call.
+     */
+    @Test
+    void aRecordedOnlyBranchReproducesARecordedFailureTheRunRecoveredFrom() {
+        FailingTool tool = new FailingTool(99);
+        Task<String> recovers = ctx -> {
+            String m = ctx.model().complete(STEP1).message();
+            try {
+                return m + "|" + ctx.call(tool, m);
+            } catch (RuntimeException e) {
+                return m + "|fallback";
+            }
+        };
+        try (CatalystRuntime runtime = CatalystRuntime.builder().log(EventLogs.inMemory())
+                .model(MockModel.alwaysReturn("ops")).build()) {
+            var parent = runtime.execute(recovers, com.cajunsystems.catalyst.ExecutionOptions.none());
+            assertThat(parent.result()).isEqualTo("ops|fallback");
+            var child = runtime.branch(parent.id(), beforeFirstPrompt(runtime, parent.id()))
+                    .withModel(MockModel.alwaysReturn("ops"))
+                    .toolReplay(com.cajunsystems.catalyst.engine.BranchSpec.ToolReplay.RECORDED_ONLY).run(recovers);
+            assertThat(child.status()).isEqualTo(com.cajunsystems.catalyst.Status.COMPLETED);
+            assertThat(runtime.inspect(child.id()).result().toString()).contains("ops|fallback");
+            assertThat(tool.calls).as("not re-run").hasValue(1);
+        }
+    }
+
+    /** A failure a retry superseded is not reproduced: the parent re-ran that call, and its success counts. */
+    @Test
+    void aFailureARetrySupersededIsNotReproduced() {
+        FailingTool tool = new FailingTool(1);
+        Task<String> task = ctx -> ctx.model().complete(STEP1).message() + "|" + ctx.call(tool, "x");
+        try (CatalystRuntime runtime = CatalystRuntime.builder().log(EventLogs.inMemory())
+                .model(MockModel.alwaysReturn("ops"))
+                .retryPolicy(com.cajunsystems.catalyst.engine.RetryPolicy.maxRetries(2, java.time.Duration.ofMillis(1))).build()) {
+            var parent = runtime.execute(task, com.cajunsystems.catalyst.ExecutionOptions.none());
+            assertThat(parent.result()).isEqualTo("ops|up:x");
+            var child = runtime.branch(parent.id(), beforeFirstPrompt(runtime, parent.id()))
+                    .withModel(MockModel.alwaysReturn("ops"))
+                    .toolReplay(com.cajunsystems.catalyst.engine.BranchSpec.ToolReplay.RECORDED_ONLY).run(task);
+            assertThat(child.status()).isEqualTo(com.cajunsystems.catalyst.Status.COMPLETED);
+            assertThat(runtime.inspect(child.id()).result().toString()).contains("ops|up:x");
+            assertThat(tool.calls).as("answered from the recording").hasValue(2);
+        }
+    }
 }
