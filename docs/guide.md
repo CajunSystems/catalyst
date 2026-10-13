@@ -235,10 +235,13 @@ timer comes due, the execution is resumed, the earlier steps are substituted, th
 the task carries on.
 - **The wake time is fixed when the sleep is recorded**, from the runtime's clock, so a restart or a
   failover waits only for what is left.
-- **Who wakes it:** the runtime that started the sleep wakes it in-process. A runtime started with
+- **Who wakes it:** the runtime that started the sleep wakes it in-process, with the same task
+  instance and options it ran with, so it needs no registration. A runtime started with
   `recoverOnStart(true)` finds sleepers its predecessor left and wakes them when due, and a
-  distributed node's claim loop wakes due timers started on other nodes. Expect to wake at or
-  shortly after the wake time, never before it.
+  distributed node's claim loop wakes due timers started on other nodes. Like any resume by id,
+  those need the task type **registered** (`.task(...)`); vars aren't persisted, so pass a sleeping
+  task's input through a recorded boundary. Expect to wake at or shortly after the wake time,
+  never before it.
 - **A paused or cancelled sleeper is never woken.** `resume(id)` before the timer is due parks it
   again with the same wake time.
 - `inspect(id).awaitingTimer()` gives the wake time of a sleeping execution. `awaitingSignal()` is

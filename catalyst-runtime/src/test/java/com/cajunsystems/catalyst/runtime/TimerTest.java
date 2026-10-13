@@ -222,6 +222,44 @@ class TimerTest {
         }
     }
 
+    /**
+     * A task started with execute(task, opts) and never registered still wakes in this process: the
+     * wake carries the instance that parked and the options it ran with (vars are not persisted). With
+     * resume(id) alone it would need a registration, fail with a warning, and sleep forever.
+     */
+    @Test
+    void anUnregisteredSleeperWakesInProcessWithItsOwnOptions() {
+        MockModel model = MockModel.alwaysReturn("A");
+        Task<String> greet = ctx -> {
+            String name = ctx.var("name");
+            ctx.sleep(Duration.ofMillis(200));
+            return ctx.model().complete(STEP1).message() + ":" + name;
+        };
+        try (CatalystRuntime runtime = CatalystRuntime.builder().log(EventLogs.inMemory()).model(model).build()) { // no .task(...)
+            var run = runtime.execute(greet, ExecutionOptions.none().var("name", "ada"));
+            assertThatThrownBy(() -> run.result(Duration.ofSeconds(5))).isInstanceOf(ExecutionWaitingSignal.class);
+            await(() -> runtime.inspect(run.id()).status() == Status.COMPLETED);
+            assertThat(runtime.resume(run.id()).result()).isEqualTo("A:ada");
+        }
+    }
+
+    /** Asking for a sleeper before it is due reports the timer it sleeps on, not a signal. */
+    @Test
+    void anEarlyResumeReportsTheTimerNotASignal() {
+        FollowUp.sleep = Duration.ofHours(1);
+        try (CatalystRuntime runtime = runtime(EventLogs.inMemory(), MockModel.alwaysReturn("A"), new LeaseTest.TestClock())) {
+            var run = runtime.execute(new FollowUp(), ExecutionOptions.none());
+            assertThatThrownBy(() -> run.result(Duration.ofSeconds(5))).isInstanceOf(ExecutionWaitingSignal.class);
+            Instant wakeAt = runtime.inspect(run.id()).awaitingTimer().orElseThrow();
+            assertThatThrownBy(() -> runtime.resume(run.id()).result())
+                    .isInstanceOfSatisfying(ExecutionWaitingSignal.class, w -> {
+                        assertThat(w.wakeAt()).isEqualTo(wakeAt);
+                        assertThat(w.signalName()).isNull();
+                        assertThat(w.getMessage()).contains("sleeping until");
+                    });
+        }
+    }
+
     @Test
     void aContextWithoutDurableSleepRefusesIt() {
         Context bare = new Context() {

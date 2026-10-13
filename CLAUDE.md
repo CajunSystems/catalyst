@@ -369,6 +369,12 @@ checkout's pom to `com.github.CajunSystems` before installing.
       keyed `execute` and the claim-then-decide re-fold.
     - `wakeIfDue` re-folds under the id lock and only resumes a still-sleeping, due execution, so
       paused and cancelled sleepers stay put.
+    - **`sleepers`** carries the parked attempt's own `Task` and `ExecutionOptions` into the
+      in-process wake, and into this process's scan. An unregistered task then still wakes, with its
+      vars. Plain `resume(id)` needed a registration and lost the vars: the wake failed with a WARN,
+      and the execution slept forever (review finding). A wake after a restart still needs the
+      registration.
+    - `waitingHandle` reports a sleeper as a timer wait (`wakeAt`), not "signal 'null'".
     - `scheduledWakes` dedupes per id and `wakeAt`. The claim loop re-schedules every tick, and
       without the dedupe a long sleep would collect thousands of tasks.
   - **State:** `awaitingSignal()`/`awaitingSignalType()` stop at a SLEEPING step, so an earlier,
