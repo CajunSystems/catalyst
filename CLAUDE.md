@@ -501,7 +501,12 @@ checkout's pom to `com.github.CajunSystems` before installing.
     (mutation-checked by an `awaitAny` across a restart).
   - **No orphans:** the cascade now runs when a parent **ends** (completed/failed/cancelled), not
     only on a cancel.
-    - The `whenComplete` hook fires on anything but a park.
+    - The `whenComplete` hook fires on anything but a park, and **only for an attempt that
+      touched a child**. `Children.forAttempt` wraps the launcher and sets
+      `RunningAttempt.touchedChildren` on `ensure`. Unconditionally, every completed execution
+      paid an async fold on the timers thread. That extra full-log read landed inside
+      `SnapshotAcceptanceTest`'s read count on CI (506 vs 253) and passed locally only by timing.
+      Recovery's scan is the backstop for any child this skips.
     - `cascadeCancel` reads the log only if the fold has `CHILD_STARTED`/`CHILD_SPAWNED` steps.
     - `unfinishedChildren` includes spawns.
     - The backstop is `endedParentOf`.

@@ -128,7 +128,7 @@ public final class CatalystRuntime implements AutoCloseable {
     private final ConcurrentHashMap<ExecutionId, ExecutionId> childParents = new ConcurrentHashMap<>();
     /** A child execution's idempotency key is {@code child:<parent>:<ref>}: its stream names its parent. */
     private static final String CHILD_KEY_PREFIX = "child:";
-    private final ChildLauncher children = new Children();
+    private final Children children = new Children();
     /** Fires durable timers this process knows about ({@code ctx.sleep}); see {@link #scheduleWake}. */
     private final java.util.concurrent.ScheduledExecutorService timers =
             java.util.concurrent.Executors.newSingleThreadScheduledExecutor(r -> {
@@ -200,6 +200,12 @@ public final class CatalystRuntime implements AutoCloseable {
         volatile boolean leaseLost;
         final CancellationToken token = new CancellationToken(() -> closing || leaseLost);
         volatile Thread thread;
+        /**
+         * Set when this attempt started or touched a child execution. Only such an attempt can end
+         * with children outstanding, so only it schedules the cascade, which folds the execution and
+         * reads its log. Every other attempt ends without that extra read.
+         */
+        volatile boolean touchedChildren;
     }
 
     private enum Mode { FRESH, RESUME, REPLAY_TERMINAL }
@@ -398,7 +404,8 @@ public final class CatalystRuntime implements AutoCloseable {
             }
             // Ended (cancelled, failed or completed): cancel the children it started and has not heard
             // back from, such as spawned children it never awaited. A parked attempt has not ended.
-            if (!(cause instanceof ExecutionWaitingSignal)) cascadeCancelLater(id);
+            // Recovery's scan is the backstop for any child this misses.
+            if (attempt.touchedChildren && !(cause instanceof ExecutionWaitingSignal)) cascadeCancelLater(id);
             // A child execution finished an attempt: wake its parent, which re-checks whether it is done.
             ExecutionId parent = childParents.get(id);
             if (parent != null) wakeLater(parent);
@@ -1125,6 +1132,19 @@ public final class CatalystRuntime implements AutoCloseable {
             });
         }
 
+        /** The launcher an attempt's context uses: the same, but notes that the attempt touched a child. */
+        ChildLauncher forAttempt(RunningAttempt attempt) {
+            return new ChildLauncher() {
+                @Override public ExecutionId mint() {
+                    return Children.this.mint();
+                }
+                @Override public Optional<Outcome> ensure(ExecutionId parentId, String childRef, ExecutionId childId, Task<?> task) {
+                    attempt.touchedChildren = true;
+                    return Children.this.ensure(parentId, childRef, childId, task);
+                }
+            };
+        }
+
         private Outcome outcomeOf(ExecutionState child) {
             return new Outcome(child.status().name(), child.result(), child.error());
         }
@@ -1554,7 +1574,7 @@ public final class CatalystRuntime implements AutoCloseable {
                 ReplayingContext ctx = new ReplayingContext(id, log, defaultModel, info, opts.vars(),
                         eventMapper, payloads, inDoubtPolicy, costModel, replayMode, null, clock, logger,
                         recorded, /* appendEnabled */ true, runningAttempt.token, cursor);
-                ctx.setChildLauncher(children);
+                ctx.setChildLauncher(children.forAttempt(runningAttempt));
 
                 // The capture scope is per-attempt: a retry re-enters the task from the top, so its
                 // auto-capture counter restarts in step with the recorded prefix it replays.
