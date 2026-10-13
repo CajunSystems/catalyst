@@ -1000,6 +1000,10 @@ public final class CatalystRuntime implements AutoCloseable {
                     childParents.remove(childId);
                     return Optional.of(outcomeOf(child));
                 }
+                // Shutting down: start nothing. The parent parks, and the next start's recovery picks
+                // up the child (or creates it, for an empty stream) and wakes the parent. Failing here
+                // would record the parent FAILED for a shutdown, which Deploy-4 never does.
+                if (closing) return Optional.empty();
                 if (child.lastSeq() < 0) {
                     // First time here, or a crash between the parent recording ChildStarted and the child
                     // being created. The create is fenced at seq 0, so it happens once. The key names the
@@ -1020,6 +1024,8 @@ public final class CatalystRuntime implements AutoCloseable {
                     } catch (LeaseHeldException held) {
                         // Running on another node: the parent waits, and is woken once the child is done
                         // (that node's in-process wake, or the claim loop seeing a finished child).
+                    } catch (IllegalStateException refused) {
+                        if (!closing) throw refused; // close() landed after the check above: park, as for closing
                     }
                 }
                 // Otherwise it is running, waiting or paused: its own progress, then its completion, wakes the parent.
@@ -1347,6 +1353,9 @@ public final class CatalystRuntime implements AutoCloseable {
                         return StreamCursor.after(log, id, now.lastSeq())
                                 .append(new CatalystEvent.ExecutionCancelled(now(), "cancelled by request", now.lastSeq()));
                     });
+                    // No attempt ended, so no attempt's completion wakes a parent waiting on this child.
+                    ExecutionId parent = childParents.get(id);
+                    if (parent != null) wakeLater(parent);
                     return;
                 } catch (LeaseHeldException raced) {
                     if (i >= 2) throw raced;

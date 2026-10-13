@@ -354,4 +354,23 @@ class ChildTest {
             assertThat(runtime.resume(parent).result()).isEqualTo("found:M");
         }
     }
+    /** A parked child cancelled by id: no attempt ends, yet its parent is woken and sees the cancel. */
+    @Test
+    void cancellingAParkedChildWakesItsParent() {
+        Research.sleep = Duration.ofHours(1);
+        Research.fail = false;
+        Research.gate = null;
+        EventLog log = EventLogs.inMemory();
+        try (CatalystRuntime runtime = runtime(log, MockModel.alwaysReturn("M"), new LeaseTest.TestClock())) {
+            var run = runtime.execute(new Coordinator(), ExecutionOptions.none());
+            assertThatThrownBy(() -> run.result(Duration.ofSeconds(5))).isInstanceOf(ExecutionWaitingSignal.class);
+            ExecutionId child = childOf(log, run.id());
+            await(() -> runtime.inspect(child).status() == Status.WAITING);
+            runtime.cancel(child);
+            await(() -> runtime.inspect(run.id()).status() == Status.COMPLETED);
+            assertThat((String) runtime.resume(run.id()).result()).startsWith("M|recovered from CANCELLED");
+        } finally {
+            Research.sleep = Duration.ZERO;
+        }
+    }
 }

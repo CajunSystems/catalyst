@@ -384,7 +384,7 @@ checkout's pom to `com.github.CajunSystems` before installing.
     status-scoped `awaitingTimer`, the signal-read stop, or the in-process wake each fails a
     `TimerTest` case.
 
-- **Child executions** — `ChildTest` (runtime, 11) + `ChildAcceptanceTest` + `Demo child` (CI gate).
+- **Child executions** — `ChildTest` (runtime, 12) + `ChildAcceptanceTest` + `Demo child` (CI gate).
   - **Events:** `ctx.child(task)` (ref `child-<n>` per attempt) mints an id and records
     `ChildStarted(childRef, childId, taskType)`. It is not a boundary; it folds to WAITING, timeline
     `CHILD_STARTED`. It then asks the runtime's `ChildLauncher` (`Children`) to `ensure` the child:
@@ -418,6 +418,11 @@ checkout's pom to `com.github.CajunSystems` before installing.
     - **A child with an empty stream counts as done** for `childDone`. That is a crash between
       the parent's `ChildStarted` and the child's create, and only the parent's resumed attempt
       creates the child (`ensure`). Without this, recovery left the parent parked for good.
+    - **`cancel()` of a parked child wakes its parent.** No attempt ends, so no `whenComplete` fires
+      (mutation-checked).
+    - **`ensure` starts nothing while `closing`**, and treats `requireOpen`'s refusal as closing. The
+      parent parks, and the next start's recovery picks the child up. Failing would record the parent
+      FAILED for a shutdown. The race window can't be reached without a hook, so this one has no test.
   - **Known gaps:** no cancel cascade; `childParents` keeps an entry for a parent cancelled while
     its child runs, until the child finishes.
 
