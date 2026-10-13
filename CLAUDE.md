@@ -423,8 +423,24 @@ checkout's pom to `com.github.CajunSystems` before installing.
     - **`ensure` starts nothing while `closing`**, and treats `requireOpen`'s refusal as closing. The
       parent parks, and the next start's recovery picks the child up. Failing would record the parent
       FAILED for a shutdown. The race window can't be reached without a hook, so this one has no test.
-  - **Known gaps:** no cancel cascade; `childParents` keeps an entry for a parent cancelled while
-    its child runs, until the child finishes.
+  - **Cancel cascade:** when a parent is cancelled, `cascadeCancelLater(parent)` runs on the
+    timers executor. It folds the parent, and if it is CANCELLED, calls `cancel(child)` for each
+    `unfinishedChildren` (`ChildStarted` without `ChildCompleted`, read from the parent's log). It
+    also drops the `childParents` entry, which closes the leak the child review noted.
+    - **By id:** `cancel` trips a child in flight here and forwards to the lease row of a child
+      running elsewhere. A child's own cancel cascades to its children.
+    - **Hooks:** every site that records a cancel calls it: `cancel()`'s direct append, the
+      carried-request append in `scheduleAttempt`, the scan's carried append, and
+      `honourOrphanedCancel`. An attempt that records its own cancel calls it too, via the
+      `whenComplete` check for `CancellationException`.
+    - **Durable backstop:** `scan()` checks `cancelledParentOf(state)` first. A child's key is
+      `child:<parent>:<ref>` (`CHILD_KEY_PREFIX`), so its own stream names its parent. If that
+      parent is CANCELLED, the scan cancels the child instead of resuming it. This covers a crash
+      or shutdown that cut the cascade short.
+    - **Order is parent first, then children.** Cancelling the children first would wake the parent
+      with a `CANCELLED` child failure that it could handle and carry on from.
+    - **Mutation-checked:** the cancel hook, the in-flight hook and the backstop each fail a test.
+      The CANCELLED guard in `cascadeCancel` is defensive and untested.
 
 - **Fenced runtime writes (Dist-1)** — `FencedWritesTest` (runtime: two runtimes over one log = two
   writers) + `FencedWritesAcceptanceTest` (the same over a real Gumbo log: storage refuses the zombie).
