@@ -427,6 +427,9 @@ checkout's pom to `com.github.CajunSystems` before installing.
     timers executor. It folds the parent, and if it is CANCELLED, calls `cancel(child)` for each
     `unfinishedChildren` (`ChildStarted` without `ChildCompleted`, read from the parent's log). It
     also drops the `childParents` entry, which closes the leak the child review noted.
+    - **A child never created** (empty stream, the crash window between `ChildStarted` and the
+      create) is skipped. Cancelling it would write a stream with no `ExecutionCreated`, and only
+      the cancelled parent's attempt could create it (review finding, mutation-checked).
     - **By id:** `cancel` trips a child in flight here and forwards to the lease row of a child
       running elsewhere. A child's own cancel cascades to its children.
     - **Hooks:** every site that records a cancel calls it: `cancel()`'s direct append, the

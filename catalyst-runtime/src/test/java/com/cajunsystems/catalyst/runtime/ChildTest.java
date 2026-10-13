@@ -532,4 +532,21 @@ class ChildTest {
             await(() -> runtime.inspect(unrelated).status() == Status.COMPLETED);
         }
     }
+    /** A child the parent recorded but never created: the cascade leaves its stream empty. */
+    @Test
+    void cancellingAParentDoesNotWriteAStreamForAChildNeverCreated() {
+        EventLog log = EventLogs.inMemory();
+        ExecutionId parent = ExecutionId.random();
+        ExecutionId child = ExecutionId.random();
+        java.time.Instant t = java.time.Instant.parse("2026-01-01T00:00:00Z");
+        log.append(parent, new CatalystEvent.ExecutionCreated(t, Coordinator.class.getName(), "novars", "cfg", ""));
+        log.append(parent, new CatalystEvent.ExecutionStarted(t, 1, "node-dead"));
+        log.append(parent, new CatalystEvent.ChildStarted(t, "child-1", child.value(), Research.class.getName()));
+        try (CatalystRuntime runtime = cascadeRuntime(log, MockModel.alwaysReturn("M"))) {
+            runtime.cancel(parent);
+            assertThat(runtime.inspect(parent).status()).isEqualTo(Status.CANCELLED);
+            sleep(300); // the cascade runs on the timer thread
+            assertThat(log.read(child)).isEmpty();
+        }
+    }
 }

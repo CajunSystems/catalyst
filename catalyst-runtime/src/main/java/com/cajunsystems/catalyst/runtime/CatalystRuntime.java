@@ -974,6 +974,10 @@ public final class CatalystRuntime implements AutoCloseable {
             for (ExecutionId child : unfinishedChildren(parent)) {
                 childParents.remove(child);
                 try {
+                    // Never created (a crash between ChildStarted and the create): nothing to cancel, and
+                    // only the parent's attempt creates it, which a cancelled parent never runs. Cancelling
+                    // would write a stream with no ExecutionCreated.
+                    if (foldState(child).lastSeq() < 0) continue;
                     cancel(child);
                 } catch (RuntimeException e) {
                     LOG.warn("Could not cancel child {} of cancelled {}", child.value(), parent.value(), e);
