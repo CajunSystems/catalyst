@@ -148,7 +148,9 @@ public final class Reducer {
                 case RetryRequested rr -> {
                     // A failure retry: bump the crash-safe retry budget (distinct from `attempt`, which the
                     // following ExecutionResumed advances). Status stays RUNNING — a retry is not terminal.
-                    retries++;
+                    // A call's retry cut short by a shutdown is not a whole-task retry: it does not count
+                    // against the task's RetryPolicy budget.
+                    if (!rr.callRetry()) retries++;
                     timeline.add(new TimelineStep(se.seq(), TimelineStep.Kind.RETRY, rr.cause(), rr.at(), 0, null));
                 }
                 case ExecutionBranched b ->

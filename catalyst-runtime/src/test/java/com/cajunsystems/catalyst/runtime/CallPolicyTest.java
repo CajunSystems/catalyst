@@ -307,6 +307,7 @@ class CallPolicyTest {
         assertThat(count(log, id, CatalystEvent.ExecutionFailed.class)).as("a shutdown never fails it").isZero();
         assertThat(count(log, id, CatalystEvent.RetryRequested.class)).isEqualTo(1);
         try (CatalystRuntime next = runtime(log, MockModel.alwaysReturn("M"), CallPolicy.retries(5, Duration.ofSeconds(5)))) {
+            assertThat(next.inspect(id).retries()).as("not a whole-task retry: the task's budget is untouched").isZero();
             next.recoverAll();
             ExecutionId run = id;
             await(() -> next.inspect(run).status() == Status.COMPLETED);

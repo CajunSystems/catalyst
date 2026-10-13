@@ -214,8 +214,20 @@ public sealed interface CatalystEvent {
      * unhandled recorded boundary (a model/effect failure records no result, and a failure the task
      * caught and rethrew is not attributable to a boundary). The replay seeder drops that boundary so the
      * retry re-runs it live instead of substituting the recorded failure.
+     *
+     * <p>{@code callRetry} marks a retry of one call that a shutdown cut short (a {@code CallPolicy}
+     * still had retries left), rather than a whole-task retry. Replay treats both alike, but only a
+     * whole-task retry counts against the task's {@code RetryPolicy} budget. Omitted when false, so
+     * every other {@code RetryRequested} encodes exactly as before.
      */
-    record RetryRequested(Instant at, String cause, long backoffMillis, long failedSeq) implements CatalystEvent {}
+    record RetryRequested(Instant at, String cause, long backoffMillis, long failedSeq,
+                          @com.fasterxml.jackson.annotation.JsonInclude(com.fasterxml.jackson.annotation.JsonInclude.Include.NON_DEFAULT)
+                          boolean callRetry) implements CatalystEvent {
+        /** A whole-task retry. */
+        public RetryRequested(Instant at, String cause, long backoffMillis, long failedSeq) {
+            this(at, cause, backoffMillis, failedSeq, false);
+        }
+    }
 
     /** One execution forked into many at a branch point (reserved for M2 branching). */
     record ExecutionBranched(Instant at, String parentId, long branchPointSeq,

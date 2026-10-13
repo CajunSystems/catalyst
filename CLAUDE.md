@@ -582,7 +582,10 @@ checkout's pom to `com.github.CajunSystems` before installing.
       The caller then records the failure (tool) and `recordRetryOnRestart` appends
       `RetryRequested(failedSeq)`: the `ToolCompleted` seq for a tool, -1 for a model, which closes
       its request. The execution stays RUNNING, and the next start re-runs the call live with a fresh
-      budget; it counts one `retries`. This was a review finding: surfacing the raw failure instead
+      budget. The event carries **`callRetry = true`**, an additive field (`@JsonInclude NON_DEFAULT`,
+      so other `RetryRequested`s encode byte-identically). The reducer does not count it in
+      `retries`, so the task's `RetryPolicy` budget is untouched (review finding, mutation-checked).
+      This was a review finding: surfacing the raw failure instead
       went to `recordFailed` under `RetryPolicy.none()`, ending for good a call the policy would have
       retried.
     - **An interrupt during `withTimeout`'s wait with a cancel pending** surfaces as

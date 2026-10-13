@@ -31,6 +31,7 @@ class EventCodecTest {
                 new MemoryRead(t, "k", new TextNode("v")),
                 new MemoryWritten(t, "k", new TextNode("v")),
                 new RetryRequested(t, "timeout", 1000, 5),
+                new RetryRequested(t, "503", 0, -1, true),
                 new ExecutionBranched(t, "exec-parent", 12, "model"),
                 new ExecutionCompleted(t, new TextNode("result")),
                 new ExecutionFailed(t, "boom", 9),
@@ -47,5 +48,13 @@ class EventCodecTest {
     void discriminatorIsStable() {
         byte[] bytes = codec.encode(new ExecutionStarted(Instant.EPOCH, 1, "n"));
         assertThat(new String(bytes)).contains("\"@type\":\"ExecutionStarted\"");
+    }
+
+    @Test
+    void aWholeTaskRetryEncodesWithoutTheCallRetryField() {
+        String json = new String(codec.encode(new RetryRequested(Instant.EPOCH, "boom", 10, 3)), java.nio.charset.StandardCharsets.UTF_8);
+        assertThat(json).doesNotContain("callRetry");
+        String older = json; // a log written before the field existed reads as a whole-task retry
+        assertThat(((RetryRequested) codec.decode(older.getBytes(java.nio.charset.StandardCharsets.UTF_8))).callRetry()).isFalse();
     }
 }

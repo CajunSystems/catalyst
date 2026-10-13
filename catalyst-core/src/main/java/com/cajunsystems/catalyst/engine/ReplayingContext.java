@@ -1391,7 +1391,7 @@ public final class ReplayingContext implements Context {
      */
     private void recordRetryOnRestart(RuntimeException stop, long failedSeq) {
         if (stop instanceof ExecutionAbandonedSignal && stop.getSuppressed().length > 0) {
-            append(new RetryRequested(now(), String.valueOf(stop.getSuppressed()[0]), 0, failedSeq));
+            append(new RetryRequested(now(), String.valueOf(stop.getSuppressed()[0]), 0, failedSeq, true));
         }
     }
 
