@@ -472,6 +472,51 @@ checkout's pom to `com.github.CajunSystems` before installing.
   - **Mutation-checked:** never restart, ignore the window, restart a cancelled child, skip the
     backoff, drop the restart count, and a live clock on replay each fail a test.
 
+- **Fan-out** — `FanOutTest` (runtime, 10) + `FanOutAcceptanceTest` + `Demo fanout` (CI gate).
+  - **API:** `ctx.spawn(task)` → `ChildHandle(ref, id)`. Then `ctx.await(h)`, `awaitAll(hs)` (a
+    `Context` default: sequential awaits) or `awaitAny(hs)`. Refs share `childCount` with
+    `ctx.child`.
+  - **Events (additive):**
+    - `ChildSpawned` is the same shape as `ChildStarted` but does **not** fold to WAITING (timeline
+      `CHILD_SPAWNED`).
+    - `ChildAwaited(refs, ids)` folds to WAITING (timeline `CHILD_AWAITED`, with the ids as a JSON
+      array).
+    - Outcomes are ordinary `ChildCompleted` boundaries, recorded **in await order**. `awaitAny`
+      polls the next `ChildCompleted` and must find its ref among the handles, so the recorded
+      winner is replayed.
+  - **Engine state:**
+    - `spawnedChildren` holds the recorded spawns by ref.
+    - `spawnedTasks` holds the task per ref for this attempt, because `awaitLive` needs it to
+      `ensure`.
+    - `settledChildren` holds outcomes by ref, so awaiting again, or an `awaitAny` over an awaited
+      handle, returns at once.
+    - `awaitLive` checks the handles in the given order, records the first one ended, or appends
+      `ChildAwaited` and parks. It always re-records on a live reach (mutation-checked).
+  - **A recorded spawn re-runs `ensure`** on a live attempt. A crash between `ChildSpawned` and
+    the create would otherwise start the child only at its await, and a parent awaiting another
+    child first would serialize them (mutation-checked).
+  - **`ExecutionState`:** the four `awaiting*` accessors now share `currentWait()`, the latest
+    wait step of any kind. `awaitingChildren()` gives the any-of set, and `childDone` uses
+    `anyMatch` over it (mutation-checked). `scan`/`wakeIfResumable` link **every** awaited child
+    (mutation-checked by an `awaitAny` across a restart).
+  - **No orphans:** the cascade now runs when a parent **ends** (completed/failed/cancelled), not
+    only on a cancel.
+    - The `whenComplete` hook fires on anything but a park, and **only for an attempt that
+      touched a child**. `Children.forAttempt` wraps the launcher and sets
+      `RunningAttempt.touchedChildren` on `ensure`. Unconditionally, every completed execution
+      paid an async fold on the timers thread. That extra full-log read landed inside
+      `SnapshotAcceptanceTest`'s read count on CI (506 vs 253) and passed locally only by timing.
+      The flag is also set when the attempt's **recorded** prefix has a
+      `ChildStarted`/`ChildSpawned`. A parent cancelled during its replayed prefix unwinds at
+      `requireAppendable` before `ensure`, and would otherwise leave its running child until the next
+      recovery (review finding, mutation-checked:
+      `ChildTest.aParentCancelledBeforeReachingItsChildStillCancelsIt`). Recovery's scan is the
+      backstop for any child this skips.
+    - `cascadeCancel` reads the log only if the fold has `CHILD_STARTED`/`CHILD_SPAWNED` steps.
+    - `unfinishedChildren` includes spawns.
+    - The backstop is `endedParentOf`.
+    - Mutation-checked: the cascade only on cancel, and spawns missing from the unfinished set.
+
 - **Fenced runtime writes (Dist-1)** — `FencedWritesTest` (runtime: two runtimes over one log = two
   writers) + `FencedWritesAcceptanceTest` (the same over a real Gumbo log: storage refuses the zombie).
   Every runtime append goes through a `StreamCursor`: conditional when the log can fence, plain

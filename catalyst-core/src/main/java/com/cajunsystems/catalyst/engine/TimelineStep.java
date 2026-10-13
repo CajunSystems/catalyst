@@ -27,6 +27,8 @@ public record TimelineStep(long seq, Kind kind, String label, Instant at, long l
         WOKE,
         CHILD_STARTED,
         CHILD_COMPLETED,
+        CHILD_SPAWNED,
+        CHILD_AWAITED,
         PROMPT,
         MODEL,
         TOOL,

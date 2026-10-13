@@ -309,6 +309,32 @@ String summary = ctx.child(new FetchFeed(),
   resume after a crash therefore walks the same restarts, and a restart survives a runtime restart.
 - `ctx.child(task)` is `ctx.child(task, Supervision.escalate())`: no restarts.
 
+### Fan-out: several children at once
+
+`ctx.child` waits for its child. `ctx.spawn` starts one and returns at once, so several run at the
+same time:
+
+```java
+List<ChildHandle<String>> research = List.of(
+        ctx.spawn(new ResearchLogs()), ctx.spawn(new ResearchMetrics()), ctx.spawn(new ResearchTraces()));
+List<String> findings = ctx.awaitAll(research);      // every result, in this order
+
+ChildHandle<String> first = ctx.awaitAny(research);  // whichever ends first
+String fastest = ctx.await(first);
+```
+
+- **Waiting holds no thread.** `await`, `awaitAll` and `awaitAny` park the parent as `WAITING`
+  until a child it waits on ends, like `ctx.child`.
+- **Outcomes are recorded,** including which child won an `awaitAny`, so a replay or resume returns
+  the same ones in the same order.
+- **Failures:** `await` throws `ChildExecutionFailedException` for a child that failed or was
+  cancelled. `awaitAll` waits for each child in the order given, so it throws for the first failed
+  child in that order.
+- **No orphans.** When a parent ends, whether it completed, failed or was cancelled, any child it
+  spawned and never awaited is cancelled.
+- **Not yet:** `spawn` takes no `Supervision`; restarting is per `ctx.child` call for now. As with
+  `ctx.child`, a branch or eval candidate cannot spawn a child live.
+
 ## Signals: waiting for a human
 
 A task can stop and wait for input from outside, such as a reviewer's approval, a user's choice or a

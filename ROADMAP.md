@@ -493,8 +493,16 @@ below give the same capability natively.
      - **Only `FAILED` children are restarted.** When restarts run out, the last failure escalates
        as `ChildExecutionFailedException`, with `restarts()`.
      - **Exit demo:** `Demo supervise`.
-  3. **Fan-out:** start several children at once, then await all or any of them. Today `ctx.child`
-     blocks, so a parent runs one child at a time.
+  3. ✅ **Fan-out:** `ctx.spawn(task)` returns a `ChildHandle` at once. Then use `ctx.await(h)`,
+     `awaitAll(hs)` or `awaitAny(hs)`.
+     - **Events:** `ChildSpawned` (not a wait) and `ChildAwaited(refs, ids)`, which folds to WAITING
+       on any of the children.
+     - **Waking:** any awaited child ending wakes the parent. Outcomes, and which child won an
+       `awaitAny`, are recorded as `ChildCompleted` in await order, so a replay is exact.
+     - **No orphans:** a parent that ends (completed, failed or cancelled) cancels the children it
+       never awaited.
+     - **Supervision for spawned children** comes with item 4.
+     - **Exit demo:** `Demo fanout`.
   4. **One-for-all and rest-for-one,** once fan-out exists. A failed child cancels and restarts its
      siblings (all of them, or the ones started after it).
 - **Per-call retries and timeouts** for model and tool calls. Boudin has per-activity

@@ -46,6 +46,8 @@ import java.time.Instant;
         @JsonSubTypes.Type(value = CatalystEvent.TimerFired.class, name = "TimerFired"),
         @JsonSubTypes.Type(value = CatalystEvent.ChildStarted.class, name = "ChildStarted"),
         @JsonSubTypes.Type(value = CatalystEvent.ChildCompleted.class, name = "ChildCompleted"),
+        @JsonSubTypes.Type(value = CatalystEvent.ChildSpawned.class, name = "ChildSpawned"),
+        @JsonSubTypes.Type(value = CatalystEvent.ChildAwaited.class, name = "ChildAwaited"),
 })
 public sealed interface CatalystEvent {
 
@@ -136,6 +138,20 @@ public sealed interface CatalystEvent {
      */
     record ChildCompleted(Instant at, String childRef, String childId, String status, JsonNode result, String error)
             implements CatalystEvent {}
+
+    /**
+     * The parent started a child with {@code ctx.spawn(task)} and carried on without waiting (fan-out).
+     * The same fields as {@link ChildStarted}, but the parent stays running. Not a boundary. Its
+     * outcome is recorded as a {@link ChildCompleted} when the parent awaits it.
+     */
+    record ChildSpawned(Instant at, String childRef, String childId, String taskType) implements CatalystEvent {}
+
+    /**
+     * The parent waits, holding no thread, until any one of these spawned children ends
+     * ({@code ctx.await} names one, {@code ctx.awaitAny} several). Folds to {@code WAITING}. Not a
+     * boundary, and recorded again if a live attempt reaches the same wait unfinished.
+     */
+    record ChildAwaited(Instant at, java.util.List<String> childRefs, java.util.List<String> childIds) implements CatalystEvent {}
 
     // ── Model boundary ───────────────────────────────────────────────────────
 

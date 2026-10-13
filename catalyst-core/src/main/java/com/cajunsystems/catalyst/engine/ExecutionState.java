@@ -46,65 +46,77 @@ public record ExecutionState(
     }
 
     /**
-     * The signal a {@code WAITING} execution is parked on, or empty if it is not waiting. Derived from
-     * the timeline (the latest {@code WAITING} step) rather than stored, so the folded state and its
-     * snapshots keep their shape.
+     * The step a {@code WAITING} execution is parked at: the latest wait in its timeline (a signal,
+     * a timer, a child or a set of spawned children). Only waits fold to {@code WAITING}, so the latest
+     * one is the current one. Every {@code awaiting...} accessor reads it, so none can mistake an
+     * earlier, answered wait of another kind for the current one.
      */
-    public java.util.Optional<String> awaitingSignal() {
+    private java.util.Optional<TimelineStep> currentWait() {
         if (status != Status.WAITING) return java.util.Optional.empty();
         for (int i = timeline.size() - 1; i >= 0; i--) {
-            if (timeline.get(i).kind() == TimelineStep.Kind.SLEEPING
-                    || timeline.get(i).kind() == TimelineStep.Kind.CHILD_STARTED) return java.util.Optional.empty(); // a timer or child wait
-            if (timeline.get(i).kind() == TimelineStep.Kind.WAITING) return java.util.Optional.ofNullable(timeline.get(i).label());
+            TimelineStep step = timeline.get(i);
+            switch (step.kind()) {
+                case WAITING, SLEEPING, CHILD_STARTED, CHILD_AWAITED -> {
+                    return java.util.Optional.of(step);
+                }
+                default -> { }
+            }
         }
         return java.util.Optional.empty();
+    }
+
+    /**
+     * The signal a {@code WAITING} execution is parked on, or empty if it is not waiting on one.
+     * Derived from the timeline rather than stored, so the folded state and its snapshots keep their
+     * shape.
+     */
+    public java.util.Optional<String> awaitingSignal() {
+        return currentWait().filter(step -> step.kind() == TimelineStep.Kind.WAITING).map(TimelineStep::label);
     }
 
     /**
      * When a {@code WAITING} execution's timer comes due ({@code ctx.sleep}), or empty if it is not
-     * waiting on a timer (a signal wait, or not waiting at all). Derived from the timeline, like
-     * {@link #awaitingSignal()}.
+     * waiting on a timer.
      */
     public java.util.Optional<java.time.Instant> awaitingTimer() {
-        if (status != Status.WAITING) return java.util.Optional.empty();
-        for (int i = timeline.size() - 1; i >= 0; i--) {
-            TimelineStep step = timeline.get(i);
-            if (step.kind() == TimelineStep.Kind.WAITING || step.kind() == TimelineStep.Kind.CHILD_STARTED) return java.util.Optional.empty();
-            if (step.kind() == TimelineStep.Kind.SLEEPING && step.detail() != null) {
-                return java.util.Optional.of(java.time.Instant.parse(step.detail().asText()));
-            }
-        }
-        return java.util.Optional.empty();
+        return currentWait().filter(step -> step.kind() == TimelineStep.Kind.SLEEPING && step.detail() != null)
+                .map(step -> java.time.Instant.parse(step.detail().asText()));
     }
 
     /** The payload type a {@code WAITING} execution's signal must have (a class name), or empty. */
     public java.util.Optional<String> awaitingSignalType() {
-        if (status != Status.WAITING) return java.util.Optional.empty();
-        for (int i = timeline.size() - 1; i >= 0; i--) {
-            TimelineStep step = timeline.get(i);
-            if (step.kind() == TimelineStep.Kind.SLEEPING || step.kind() == TimelineStep.Kind.CHILD_STARTED) return java.util.Optional.empty();
-            if (step.kind() == TimelineStep.Kind.WAITING) {
-                return step.detail() == null || !step.detail().isTextual()
-                        ? java.util.Optional.empty() : java.util.Optional.of(step.detail().asText());
-            }
-        }
-        return java.util.Optional.empty();
+        return currentWait().filter(step -> step.kind() == TimelineStep.Kind.WAITING
+                        && step.detail() != null && step.detail().isTextual())
+                .map(step -> step.detail().asText());
     }
 
     /**
-     * The child execution a {@code WAITING} parent waits on ({@code ctx.child}), or empty if it is not
-     * waiting on a child. Derived from the timeline, like {@link #awaitingSignal()}.
+     * The child execution a {@code WAITING} parent waits on, or empty if it is not waiting on a child.
+     * For a wait on several spawned children ({@code ctx.awaitAny}), the first of them; see
+     * {@link #awaitingChildren()}.
      */
     public java.util.Optional<com.cajunsystems.catalyst.ExecutionId> awaitingChild() {
-        if (status != Status.WAITING) return java.util.Optional.empty();
-        for (int i = timeline.size() - 1; i >= 0; i--) {
-            TimelineStep step = timeline.get(i);
-            if (step.kind() == TimelineStep.Kind.WAITING || step.kind() == TimelineStep.Kind.SLEEPING) return java.util.Optional.empty();
+        List<com.cajunsystems.catalyst.ExecutionId> children = awaitingChildren();
+        return children.isEmpty() ? java.util.Optional.empty() : java.util.Optional.of(children.get(0));
+    }
+
+    /**
+     * The child executions a {@code WAITING} parent waits on, any one of which ending wakes it:
+     * one for {@code ctx.child} and {@code ctx.await}, several for {@code ctx.awaitAny}. Empty if it
+     * is not waiting on children.
+     */
+    public List<com.cajunsystems.catalyst.ExecutionId> awaitingChildren() {
+        return currentWait().map(step -> {
             if (step.kind() == TimelineStep.Kind.CHILD_STARTED && step.detail() != null) {
-                return java.util.Optional.of(com.cajunsystems.catalyst.ExecutionId.of(step.detail().asText()));
+                return List.of(com.cajunsystems.catalyst.ExecutionId.of(step.detail().asText()));
             }
-        }
-        return java.util.Optional.empty();
+            if (step.kind() == TimelineStep.Kind.CHILD_AWAITED && step.detail() != null) {
+                List<com.cajunsystems.catalyst.ExecutionId> ids = new java.util.ArrayList<>();
+                step.detail().forEach(id -> ids.add(com.cajunsystems.catalyst.ExecutionId.of(id.asText())));
+                return List.copyOf(ids);
+            }
+            return List.<com.cajunsystems.catalyst.ExecutionId>of();
+        }).orElse(List.of());
     }
 
     /** The aggregated timeline view: model/tool counts, token usage, cost and latency roll-ups. */
