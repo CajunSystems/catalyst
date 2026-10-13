@@ -42,6 +42,8 @@ import java.time.Instant;
         @JsonSubTypes.Type(value = CatalystEvent.ExecutionCancelled.class, name = "ExecutionCancelled"),
         @JsonSubTypes.Type(value = CatalystEvent.SignalAwaited.class, name = "SignalAwaited"),
         @JsonSubTypes.Type(value = CatalystEvent.SignalReceived.class, name = "SignalReceived"),
+        @JsonSubTypes.Type(value = CatalystEvent.TimerStarted.class, name = "TimerStarted"),
+        @JsonSubTypes.Type(value = CatalystEvent.TimerFired.class, name = "TimerFired"),
 })
 public sealed interface CatalystEvent {
 
@@ -96,6 +98,22 @@ public sealed interface CatalystEvent {
      * recovery resumes, rather than a waiting one whose signal nothing will ever consume.
      */
     record SignalReceived(Instant at, String name, JsonNode payload) implements CatalystEvent {}
+
+    /**
+     * A durable timer was started by {@code ctx.sleep(duration)}, waking at {@code wakeAt} (the
+     * runtime clock at the sleep, plus the duration). The execution folds to {@code WAITING} and
+     * holds no thread. Like {@link SignalAwaited} it is not a boundary: it records <em>when</em> to
+     * wake, so a resume, on any node, after any restart, waits only for what is left. Recorded again
+     * if a live attempt reaches a timer that has not come due, so the fold returns to WAITING.
+     */
+    record TimerStarted(Instant at, String timerId, Instant wakeAt) implements CatalystEvent {}
+
+    /**
+     * The timer came due: recorded by the attempt that resumed at or after {@code wakeAt}, so the
+     * execution's own worker is still the only writer. The sleep's boundary (identity = the timer
+     * id), substituted on replay so the sleep returns at once.
+     */
+    record TimerFired(Instant at, String timerId) implements CatalystEvent {}
 
     // ── Model boundary ───────────────────────────────────────────────────────
 

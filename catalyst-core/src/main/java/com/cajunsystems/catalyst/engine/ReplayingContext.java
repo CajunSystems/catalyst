@@ -106,6 +106,10 @@ public final class ReplayingContext implements Context {
      * waiting. Reaching it again parks the attempt without recording a second wait.
      */
     private String awaitingSignal;
+    /** Timers started and not yet fired, by id: when each comes due. A resume waits only for what is left. */
+    private final java.util.Map<String, java.time.Instant> pendingTimers = new java.util.HashMap<>();
+    /** Timers this attempt has reached, so far: ids are timer-1, timer-2, … in task order, like auto-capture. */
+    private int timerCount;
 
     /** Result-bearing recorded boundaries, in order, consumed as the task replays its prefix. */
     private final Deque<Boundary> boundaries = new ArrayDeque<>();
@@ -256,6 +260,12 @@ public final class ReplayingContext implements Context {
                 }
                 case EffectRecorded er -> boundaries.add(new Boundary(se.seq(), e, er.label(), null));
                 case SignalAwaited sa -> this.awaitingSignal = sa.name();
+                case TimerStarted ts -> pendingTimers.put(ts.timerId(), ts.wakeAt());
+                case TimerFired tf -> {
+                    // The sleep's boundary; the TimerStarted before it only said when to wake.
+                    boundaries.add(new Boundary(se.seq(), e, tf.timerId(), null));
+                    pendingTimers.remove(tf.timerId());
+                }
                 case SignalReceived sr -> {
                     // The await boundary's result; the SignalAwaited before it carries no result of its own.
                     boundaries.add(new Boundary(se.seq(), e, sr.name(), null));
@@ -658,6 +668,41 @@ public final class ReplayingContext implements Context {
         requireAppendable("await signal " + name);
         append(new SignalAwaited(now(), name, type.getName()));
         throw raisedWaiting = new ExecutionWaitingSignal(name, "Execution " + id + " is waiting for signal '" + name + "'");
+    }
+
+    // ── Durable timers ─────────────────────────────────────────────────────────
+
+    @Override
+    public void sleep(java.time.Duration duration) {
+        if (duration == null || duration.isNegative()) throw new IllegalArgumentException("duration must be zero or positive");
+        String timerId = "timer-" + (++timerCount);
+        Optional<Boundary> fired = pollExpected(TimerFired.class, "timer " + timerId);
+        if (fired.isPresent() && identityMatchesOrFork(fired.get(), "timer", timerId)) return; // already slept
+        java.time.Instant wakeAt = pendingTimers.remove(timerId);
+        boolean recorded = wakeAt != null;
+        if (recorded && !appendEnabled) {
+            throw raisedWaiting = sleepingUntil(timerId, wakeAt); // a pure replay ends at the wait
+        }
+        requireAppendable("sleep " + timerId);
+        if (!recorded) {
+            wakeAt = now().plus(duration);
+            append(new TimerStarted(now(), timerId, wakeAt));
+        }
+        if (!now().isBefore(wakeAt)) {
+            append(new TimerFired(now(), timerId)); // due: this attempt wakes it, as the stream's only writer
+            return;
+        }
+        if (recorded) {
+            // Not due yet, and only reachable after something folded the execution out of WAITING (a
+            // pause, then a resume). Record the wait again, with the same wake time, so the fold
+            // returns to WAITING. Otherwise it stays RUNNING and every recovery re-resumes it early.
+            append(new TimerStarted(now(), timerId, wakeAt));
+        }
+        throw raisedWaiting = sleepingUntil(timerId, wakeAt);
+    }
+
+    private ExecutionWaitingSignal sleepingUntil(String timerId, java.time.Instant wakeAt) {
+        return new ExecutionWaitingSignal(null, wakeAt, "Execution " + id + " is sleeping until " + wakeAt + " (" + timerId + ")");
     }
 
     /** Whether this context parked the attempt on a signal — whether or not the task let it unwind. */

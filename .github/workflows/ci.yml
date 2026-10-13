@@ -145,6 +145,18 @@ jobs:
       # substituted — bounded by the policy, and the retried log still replays exactly. The pair
       # "tool invocations: 3" + "model calls across retries: 1" is the whole semantics: substitute-
       # everything would show 1 invocation + FAILED, re-run-everything would show 3 model calls.
+      # The durable timer exit criterion: a sleep survives its runtime shutting down, the next runtime's
+      # startup recovery wakes it when due (never early), no model call repeats, and it replays exactly.
+      - name: Durable timer exit demo (sleep → restart → wake on time; exact replay)
+        run: |
+          set -uo pipefail
+          CP="catalyst-api/target/classes:$(cat catalyst-api/target/cp.txt)"
+          OUT="$(java -cp "$CP" com.cajunsystems.catalyst.api.Demo timer)" || { echo "$OUT"; exit 1; }
+          echo "$OUT"
+          echo "$OUT" | grep -q "\[timer\] model calls: before the sleep 1, after the wake 1" || { echo "FAIL: a model call repeated"; exit 1; }
+          echo "$OUT" | grep -q "\[timer\] calls during a strict replay: 0" || { echo "FAIL: replay made calls"; exit 1; }
+          echo "$OUT" | grep -q "Durable timer exit criterion holds" || exit 1
+
       # The agent exit criterion: a tool-calling agent behaves as any execution does. It resumes
       # mid-conversation without repeating a model turn or a tool call, replays with zero calls, and
       # is evaluated without re-running a tool.

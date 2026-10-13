@@ -449,11 +449,30 @@ The substrate becomes a platform. This is where the other CajunSystems component
   - **Limits:** the tool list is part of the recording, so replay needs the same tools and schemas.
     Text-only results.
 
-### Signals & human-in-the-loop — Boudin integration (spec §5 lifecycle, §12)
-*Pulled forward as Deploy-6 above; Boudin workflow invocation stays here.*
-- Activate the reserved **`WAITING`** state: a task pauses, awaits an external signal, schedules
-  future work, or invokes a long-running Boudin workflow. Human-in-the-loop lands here.
-- `await`/signal APIs on `Context` — no schema change needed (the slot is reserved).
+### Waiting, delegation and resilience (ideas from Boudin)
+Signals and human-in-the-loop shipped as Deploy-6. A review of Boudin (CajunSystems' Temporal-style
+workflow engine on Gumbo, 2026-10-13) found these worth bringing into Catalyst, best first. A direct
+Catalyst↔Boudin bridge (a task invoking a Boudin workflow) was **dropped as low value**: the items
+below give the same capability natively.
+- ✅ **Durable timers: `ctx.sleep(Duration)`.**
+  - **Mechanism:** records `TimerStarted(timerId, wakeAt)`, which folds to WAITING. The attempt ends
+    holding no thread, an improvement on Boudin, which parks a virtual thread. A wake is a resume
+    after `wakeAt`. The resumed attempt replays to the sleep and records `TimerFired` itself, so the
+    single-writer rule holds.
+  - **Who wakes it:** an in-process scheduler (deduplicated per execution), startup recovery and the
+    distributed claim loop. A due timer counts as resumable everywhere, and a paused or cancelled
+    sleeper is never woken.
+  - **Exit demo:** `Demo timer`.
+- **Child executions.** A task (an agent) starts another execution and waits for its result, with
+  failures propagated. This is multi-agent orchestration with each sub-agent durable, replayable and
+  evaluable on its own. It builds on WAITING and the execution index.
+- **Per-call retries and timeouts** for model and tool calls. Boudin has per-activity
+  `startToClose`/`maxAttempts`/backoff; Catalyst retries the whole task, and a hung provider call
+  has no limit.
+- **Logging context and live metrics.** The execution id in MDC, plus counters for running
+  executions, retries and lease takeovers. Today all observability is post-hoc (OTel, timeline).
+- **Remote result handles:** wait for an execution's result from any process. A keyed submit that
+  loses the race to another node currently gets `LeaseHeldException`.
 
 ### Distributed execution (spec §12)
 *Sequenced as `Dist-0`…`Dist-5` above; the bullets below are design and status, not order.*

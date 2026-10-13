@@ -60,6 +60,23 @@ public interface Context {
     Logger log();
 
     /**
+     * Sleeps durably for {@code duration}: the timer is recorded, the attempt ends holding no thread,
+     * and the execution waits as {@code WAITING} until the timer comes due. It is then resumed, on
+     * this node or (distributed) any node, after any restarts, and the sleep returns. On replay or
+     * resume of a timer that already fired, it returns at once.
+     *
+     * <p>The wake time is fixed when the sleep is first recorded, from the runtime's clock, so a
+     * resume waits only for what is left. Expect to wake at or shortly after it, not exactly at it:
+     * a runtime fires due timers in-process, and also at startup recovery and on each claim-loop
+     * tick when distributed.
+     *
+     * <p>The default throws, so other {@code Context} implementations still compile.
+     */
+    default void sleep(java.time.Duration duration) {
+        throw new UnsupportedOperationException(getClass().getSimpleName() + " does not support durable sleep");
+    }
+
+    /**
      * Whether {@code failure}, thrown by {@link #call}, is the recorded result of that call: the tool
      * failed, and the failure is in the log as its {@code ToolCompleted}. That covers a live failure, a
      * failure substituted on replay or resume, and one reproduced by a branch. Code that handles tool
