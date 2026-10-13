@@ -506,7 +506,12 @@ checkout's pom to `com.github.CajunSystems` before installing.
       `RunningAttempt.touchedChildren` on `ensure`. Unconditionally, every completed execution
       paid an async fold on the timers thread. That extra full-log read landed inside
       `SnapshotAcceptanceTest`'s read count on CI (506 vs 253) and passed locally only by timing.
-      Recovery's scan is the backstop for any child this skips.
+      The flag is also set when the attempt's **recorded** prefix has a
+      `ChildStarted`/`ChildSpawned`. A parent cancelled during its replayed prefix unwinds at
+      `requireAppendable` before `ensure`, and would otherwise leave its running child until the next
+      recovery (review finding, mutation-checked:
+      `ChildTest.aParentCancelledBeforeReachingItsChildStillCancelsIt`). Recovery's scan is the
+      backstop for any child this skips.
     - `cascadeCancel` reads the log only if the fold has `CHILD_STARTED`/`CHILD_SPAWNED` steps.
     - `unfinishedChildren` includes spawns.
     - The backstop is `endedParentOf`.

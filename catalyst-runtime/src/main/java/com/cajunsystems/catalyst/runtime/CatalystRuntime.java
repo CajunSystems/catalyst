@@ -201,7 +201,8 @@ public final class CatalystRuntime implements AutoCloseable {
         final CancellationToken token = new CancellationToken(() -> closing || leaseLost);
         volatile Thread thread;
         /**
-         * Set when this attempt started or touched a child execution. Only such an attempt can end
+         * Set when this attempt started or touched a child execution, or its stream already records
+         * one. Only such an attempt can end
          * with children outstanding, so only it schedules the cascade, which folds the execution and
          * reads its log. Every other attempt ends without that extra read.
          */
@@ -1575,6 +1576,12 @@ public final class CatalystRuntime implements AutoCloseable {
                         eventMapper, payloads, inDoubtPolicy, costModel, replayMode, null, clock, logger,
                         recorded, /* appendEnabled */ true, runningAttempt.token, cursor);
                 ctx.setChildLauncher(children.forAttempt(runningAttempt));
+                // Children recorded before this attempt count too: one cancelled before its code reaches
+                // them (a cancel tripped during the replayed prefix) never calls ensure, yet must cascade.
+                if (!runningAttempt.touchedChildren && recorded.stream().anyMatch(se ->
+                        se.event() instanceof CatalystEvent.ChildStarted || se.event() instanceof CatalystEvent.ChildSpawned)) {
+                    runningAttempt.touchedChildren = true;
+                }
 
                 // The capture scope is per-attempt: a retry re-enters the task from the top, so its
                 // auto-capture counter restarts in step with the recorded prefix it replays.

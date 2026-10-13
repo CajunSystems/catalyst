@@ -568,4 +568,48 @@ class ChildTest {
             assertThat(runtime.inspect(parent).status()).isEqualTo(Status.FAILED);
         }
     }
+    /** Blocks before its child call when a latch is set, so a cancel can land before the child is reached. */
+    static final class SlowToReach implements Task<String> {
+        static volatile java.util.concurrent.CountDownLatch beforeChild = null;
+        static final java.util.concurrent.CountDownLatch reached = new java.util.concurrent.CountDownLatch(1);
+        @Override public String execute(Context ctx) {
+            java.util.concurrent.CountDownLatch gate = beforeChild;
+            if (gate != null) {
+                reached.countDown();
+                try {
+                    gate.await();
+                } catch (InterruptedException e) {
+                    Thread.currentThread().interrupt();
+                }
+            }
+            return ctx.child(new Research());
+        }
+    }
+
+    /** A resumed parent cancelled before its code reaches its running child still cancels the child. */
+    @Test
+    void aParentCancelledBeforeReachingItsChildStillCancelsIt() {
+        Research.sleep = Duration.ZERO;
+        Research.fail = false;
+        Research.gate = new java.util.concurrent.CountDownLatch(1);
+        EventLog log = EventLogs.inMemory();
+        try (CatalystRuntime runtime = CatalystRuntime.builder().log(log).model(MockModel.alwaysReturn("M"))
+                .task(SlowToReach.class, SlowToReach::new).task(Research.class, Research::new).build()) {
+            var run = runtime.execute(new SlowToReach(), ExecutionOptions.none());
+            await(() -> runtime.inspect(run.id()).status() == Status.WAITING);
+            ExecutionId child = childOf(log, run.id());
+            await(() -> runtime.inspect(child).status() == Status.RUNNING); // blocked on the gate
+            runtime.pause(run.id());
+            SlowToReach.beforeChild = new java.util.concurrent.CountDownLatch(1);
+            runtime.resume(run.id());
+            assertThat(awaitLatch(SlowToReach.reached)).isTrue(); // in flight, before ctx.child
+            runtime.cancel(run.id()); // trips the token; the attempt unwinds at ctx.child, before ensure
+            await(() -> runtime.inspect(run.id()).status() == Status.CANCELLED);
+            await(() -> runtime.inspect(child).status() == Status.CANCELLED);
+        } finally {
+            SlowToReach.beforeChild = null;
+            Research.gate.countDown();
+            Research.gate = null;
+        }
+    }
 }
