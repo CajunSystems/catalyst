@@ -1442,8 +1442,8 @@ public final class CatalystRuntime implements AutoCloseable {
      * Pauses an execution. A no-op on an already-terminal execution (never reopens a closed log).
      * This execution's lock + the in-flight guard avoid a race: an execution running in this process
      * appends its own events on a worker thread, so injecting a pause event concurrently could land
-     * after {@code ExecutionCompleted}. Refuse while it is in flight here. (v0.1 has no live
-     * pause/cancel of a running task — that lands with the reserved WAITING/signal APIs in v1.)
+     * after {@code ExecutionCompleted}. Refuse while it is in flight here: a running task cannot
+     * be paused, only cancelled ({@link #cancel}), and a waiting one can be paused.
      */
     public void pause(ExecutionId id) {
         requireOwned(id);
@@ -2220,7 +2220,8 @@ public final class CatalystRuntime implements AutoCloseable {
          *       {@link CatalystRuntime#recoverAll()} skips what other nodes hold and takes over what
          *       dead nodes left.</li>
          * </ul>
-         * The claim loop, which keeps watching for work instead of only scanning at startup, is Dist-4.
+         * A claim loop keeps watching for work instead of only scanning at startup: every
+         * {@link #claimInterval}, it takes over what no live node holds.
          */
         public Builder distributed() {
             this.distributed = true;

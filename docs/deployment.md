@@ -1,10 +1,11 @@
 # Deploying Catalyst
 
 This guide covers running Catalyst as a service: one node first, then several nodes sharded by
-idempotency key. It describes what the runtime does today (Deploy-1 to Deploy-5 in
-[`ROADMAP.md`](../ROADMAP.md)). Distributed execution — several nodes sharing one log and taking over
-each other's work — is the separate Dist track in [`distribution.md`](distribution.md) and is **not**
-available yet.
+idempotency key, then several nodes sharing one log. It describes what the runtime does today
+(Deploy-1 to Deploy-6 and Dist-0 to Dist-4 in [`ROADMAP.md`](../ROADMAP.md)). Distributed execution,
+where several nodes share a FoundationDB-backed log and take over each other's work, works end to
+end and is a preview: see [Several nodes sharing one log](#several-nodes-sharing-one-log-preview)
+below, and [`distribution.md`](distribution.md) for the design.
 
 ## The shape of a node
 
@@ -49,7 +50,9 @@ StatefulSet the old pod is gone before its replacement starts.
 `recoverOnStart(true)` makes `build()` scan the execution index and resume every execution the
 previous process left **crash-interrupted** (`NEW`, `STARTING`, `RUNNING`, `RESUMING`). Executions
 that are `PAUSED` stay paused: that state is recorded on purpose, by `pause(id)` or by
-`InDoubtPolicy.ASK`, and a restart must not undo it.
+`InDoubtPolicy.ASK`, and a restart must not undo it. `WAITING` ones stay put too (a signal, a timer
+or a child), except that a sleeper whose timer is due and a parent whose child has finished are
+woken.
 
 - **Register every task type before `build()`.** Recovery reconstructs tasks from the registry by
   their recorded type. An execution whose type isn't registered is reported in
@@ -208,8 +211,20 @@ things follow:
 Each shard is still a single node. If a shard's node is down, its executions wait until it comes back
 (on Kubernetes, until its pod is rescheduled with its volume). No other shard can take them over,
 because no other node can open that shard's log. Failover between nodes needs a log that several
-nodes can write safely. That is the Dist track (`docs/distribution.md`), and it is not available yet.
-Most of it exists:
+nodes can write safely, which is the next section.
+
+## Several nodes sharing one log (preview)
+
+```java
+EventLog log = GumboEventLog.foundationDB(clusterFile, "catalyst", sharedBlobStore);
+CatalystRuntime runtime = Catalyst.builder().log(log).model(model)
+        .task(TriageTask.class, TriageTask::new)
+        .nodeId("node-a").distributed().recoverOnStart(true).build();
+```
+
+Every node runs the same build against the same FoundationDB root, each with its own `nodeId`.
+`distributed()` refuses a log that cannot fence writes, hold leases and take several writers, and it
+can't be combined with `shard(...)`.
 - **The log:** `GumboEventLog.foundationDB(...)` is a log several nodes can write without
   corrupting a stream.
 - **Leases:** a runtime built with `.nodeId("node-a").distributed()` claims a lease before writing to
@@ -219,7 +234,6 @@ Most of it exists:
   out the lease duration. Don't set it short to speed up failover: a live node that pauses past its
   lease loses the execution, and the call it had in flight is found in doubt by the node that takes
   over. Under the default `InDoubtPolicy.FAIL`, that fails the execution.
-
 - **Claim loop (`claimInterval`, default 10s):** every node scans the shared index and takes over
   what no live node holds. A crashed node's work moves within about one lease duration plus one
   interval, with no operator action.
@@ -228,6 +242,6 @@ Most of it exists:
   it is on one node.
 - **Keys:** two nodes taking the same new idempotency key create one execution.
 
-This is new; treat multi-node runs as a preview. `Demo distributed` (CI, and
-`scripts/fdb-tests.sh --demo` locally) kills a node mid-run and shows the rest of the cluster
-finishing its work.
+This is new; treat multi-node runs as a preview. The `distributed-a`/`distributed-b` demo (two JVMs
+on one FoundationDB root; CI's `fdb` job, and `scripts/fdb-tests.sh --demo` locally) kills a node
+mid-run and shows the rest of the cluster finishing its work.

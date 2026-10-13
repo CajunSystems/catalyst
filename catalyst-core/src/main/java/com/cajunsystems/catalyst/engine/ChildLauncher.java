@@ -23,7 +23,6 @@ public interface ChildLauncher {
      */
     Optional<Outcome> ensure(ExecutionId parentId, String childRef, ExecutionId childId, Task<?> task);
 
-    /** How a child ended: its recorded result, or its terminal status and error. */
     /**
      * Cancels a child the parent no longer wants (a supervised group restarting it, or giving up).
      * Idempotent: cancelling a child that has ended does nothing.
@@ -32,6 +31,7 @@ public interface ChildLauncher {
         throw new UnsupportedOperationException("this launcher cannot cancel children");
     }
 
+    /** How a child ended: its recorded result, or its terminal status and error. */
     record Outcome(String status, JsonNode result, String error) {
         public boolean completed() {
             return "COMPLETED".equals(status);

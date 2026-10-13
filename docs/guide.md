@@ -11,9 +11,13 @@ inspecting executions, and how the log underneath works. For running Catalyst as
 - [Effects, memory and vars](#effects-memory-and-vars)
 - [Idempotency keys and resuming](#idempotency-keys-and-resuming)
 - [Failures: retries and in-doubt calls](#failures-retries-and-in-doubt-calls)
+- [Durable timers](#durable-timers)
+- [Child executions](#child-executions): supervision, fan-out, supervised groups
 - [Signals: waiting for a human](#signals-waiting-for-a-human)
 - [Cancel, pause, resume](#cancel-pause-resume)
 - [Inspect, replay, branch](#inspect-replay-branch)
+- [Agents](#agents)
+- [Evaluating models and prompts](#evaluating-models-and-prompts)
 - [Streaming completions](#streaming-completions)
 - [Timeline reports and OpenTelemetry](#timeline-reports-and-opentelemetry)
 - [Auto-capture: nondeterminism without the ceremony](#auto-capture-nondeterminism-without-the-ceremony)
@@ -184,8 +188,9 @@ CatalystRuntime runtime = Catalyst.builder(dir)
 runtime.resume(executionId);              // or resume one execution explicitly
 ```
 
-`recoverOnStart` resumes executions left `STARTING`/`RUNNING`/`RESUMING` and leaves `PAUSED` ones
-alone. `runtime.startupRecovery()` reports what it did, including any it couldn't recover (usually an
+`recoverOnStart` resumes executions left `NEW`/`STARTING`/`RUNNING`/`RESUMING`. It leaves
+`PAUSED` and `WAITING` ones alone, except that it wakes a sleeper whose timer is due and a parent
+whose child has finished. `runtime.startupRecovery()` reports what it did, including any it couldn't recover (usually an
 unregistered task type).
 
 ## Failures: retries and in-doubt calls
@@ -275,9 +280,11 @@ the recorded result without running the child again.
   registration.
 - **Inputs:** vars aren't persisted, and the child does not inherit the parent's vars or options.
   Pass a child's input through its constructor from values the parent got at a recorded boundary.
-- `inspect(id).awaitingChild()` gives the child a waiting parent is waiting on.
-- **Cancelling a parent cancels its children:** every child it started and has no outcome for, and
-  their children in turn, whether they are running, waiting or paused, and on whichever node. If
+- `inspect(id).awaitingChild()` gives the child a waiting parent is waiting on, and
+  `awaitingChildren()` all of them for an `awaitAny` wait.
+- **A parent that ends cancels its unfinished children:** whether it completed, failed or was
+  cancelled, every child it started and has no outcome for is cancelled, and their children in
+  turn, whether they are running, waiting or paused, and on whichever node. If
   the process stops before the cascade reaches a child, the next start's recovery cancels it rather
   than resuming it. Cancelling a child on its own does not cancel the parent: the parent wakes and
   gets `ChildExecutionFailedException` with status `CANCELLED`.
@@ -743,15 +750,19 @@ hierarchy covering:
 - lifecycle: created, started, resumed, paused, completed, failed, cancelled, retry requested, branched
 - boundaries: prompt built, completion requested/received, tool requested/completed, effect recorded,
   memory read/written
+- waits: signal awaited/received, timer started/fired, child started/spawned/awaited/completed/discarded
 
 Each event gets a dense, per-execution `seq` (0, 1, 2, …). Execution state, the timeline, token counts
 and cost are all **folds** over those events (`Reducer`). Nothing is stored that the log can't rebuild.
 
-Two `EventLog` implementations sit behind one SPI:
+Three `EventLog` implementations sit behind one SPI:
 
 - **`InMemoryEventLog`**: tests and ephemeral use; `CatalystRuntime.builder().log(EventLogs.inMemory())`.
 - **`GumboEventLog`**: durable and file-backed, the embedded production mode; it's what
   `Catalyst.builder(dir)` uses.
+- **`GumboEventLog.foundationDB(clusterFile, root, sharedBlobStore)`**: a log several nodes can
+  write, for distributed mode (`.nodeId("node-a").distributed()`). It needs the optional `fdb-java`
+  dependency and a blob store every node can read.
 
 **On Gumbo:**
 - Each execution is one Gumbo `LogTag` (`catalyst-exec/<id>`), and Gumbo's per-tag `streamVersion`
@@ -768,5 +779,5 @@ Two `EventLog` implementations sit behind one SPI:
   store (`<dir>/blobs` by default, or your own with `Catalyst.builder(dir).blobStore(store)`) and
   rehydrated transparently on read.
 - **Schema evolution:** older logs stay readable. See [`schema-evolution.md`](schema-evolution.md).
-- **Distributed execution:** where the log is heading for that is in
-  [`distribution.md`](distribution.md).
+- **Distributed execution:** see [`deployment.md`](deployment.md) for running it and
+  [`distribution.md`](distribution.md) for the design.

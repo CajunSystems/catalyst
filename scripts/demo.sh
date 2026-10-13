@@ -3,9 +3,14 @@
 #
 #   scripts/demo.sh replay                 # single-process demos: replay, branch, snapshot, cancel,
 #                                          #   retry, resumeid, tools, collections, blob, schema,
-#                                          #   streaming, timeline, otel, autocapture, shutdown, signal, recover, eval, agent, timer
+#                                          #   streaming, timeline, otel, autocapture, shutdown, signal, recover,
+#                                          #   eval, agent, timer, child, supervise, fanout, group
 #   scripts/demo.sh /tmp/demo record       # two-process crash demo: record, then (new process) resume
 #   scripts/demo.sh /tmp/demo resume
+#   scripts/demo.sh /tmp/many crashmany    # startup recovery: crash several executions, then
+#   scripts/demo.sh /tmp/many recover      #   (new process) recover them all
+#   scripts/demo.sh <fdb-root> distributed-a   # two nodes on one FoundationDB root (run -b in a
+#   scripts/demo.sh <fdb-root> distributed-b   #   second JVM); needs a cluster: scripts/fdb-tests.sh --demo
 #
 # Build first with `mvn install -DskipTests`; the script resolves the classpath the same way CI does.
 set -euo pipefail

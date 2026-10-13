@@ -146,7 +146,8 @@ scripts/demo.sh /tmp/catalyst-demo resume   # a new process resumes it
 
 Other demos: `scripts/demo.sh replay`, `branch`, `agent`, `eval`, `timer`, `child`, `supervise`, `fanout`, `group`, `signal`, `retry`, `cancel`, `shutdown`, `streaming`,
 `timeline`, `otel`, `autocapture`, and more. The full list is at the top of `scripts/demo.sh`, and CI
-runs every one of them as a gate.
+runs every one of them as a gate (the two-node `distributed-a`/`distributed-b` demo in its
+FoundationDB job).
 
 ## The ideas you need
 
@@ -154,6 +155,7 @@ runs every one of them as a gate.
   another process.
 - **Context (`ctx`):** the only way a task touches the outside world: `ctx.model()`,
   `ctx.call(tool, input)`, `ctx.effect(label, supplier)`, `ctx.memory()`, `ctx.awaitSignal(name, type)`,
+  `ctx.sleep(d)`, `ctx.child(task)`, `ctx.spawn(task)`/`ctx.await(h)`, `ctx.supervise(supervision, tasks)`,
   `ctx.var(name)`. Each call is a **boundary**, and its result is recorded.
 - **Execution:** one run of a task, with an `ExecutionId` and an event log. Give it an **idempotency
   key** (`ExecutionOptions.withKey(...)`) and resubmitting that key never runs the work twice.
@@ -195,6 +197,8 @@ runs every one of them as a gate.
 - recovery on startup, graceful shutdown and drain timeouts
 - choosing failure policies, and backups
 - scaling out by sharding on idempotency key
+- several nodes sharing one FoundationDB-backed log and taking over each other's work
+  (`.nodeId(...).distributed()`, a preview)
 
 ## Modules
 
