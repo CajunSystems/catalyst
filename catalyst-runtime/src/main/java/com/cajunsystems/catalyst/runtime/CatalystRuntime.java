@@ -11,6 +11,7 @@ import com.cajunsystems.catalyst.TaskFactory;
 import com.cajunsystems.catalyst.TaskRegistry;
 import com.cajunsystems.catalyst.Cost;
 import com.cajunsystems.catalyst.engine.BranchSpec;
+import com.cajunsystems.catalyst.engine.ChildExecutionFailedException;
 import com.cajunsystems.catalyst.engine.ChildLauncher;
 import com.cajunsystems.catalyst.engine.CancellationSignal;
 import com.cajunsystems.catalyst.engine.CancellationToken;
@@ -999,13 +1000,22 @@ public final class CatalystRuntime implements AutoCloseable {
                     // being created. The create is fenced at seq 0, so it happens once. The key names the
                     // parent and the child's place in it, which links the two in the log.
                     String taskType = task.getClass().getName();
-                    underLease(childId, () -> {
-                        createExecution(childId, taskType, "child:" + parentId.value() + ":" + childRef, ExecutionOptions.none());
-                        return scheduleAttempt(task, childId, taskType, ExecutionOptions.none(), Mode.FRESH);
-                    });
+                    try {
+                        underLease(childId, () -> {
+                            createExecution(childId, taskType, "child:" + parentId.value() + ":" + childRef, ExecutionOptions.none());
+                            return scheduleAttempt(task, childId, taskType, ExecutionOptions.none(), Mode.FRESH);
+                        });
+                    } catch (LeaseHeldException held) {
+                        // Another node got to it first; the parent waits like for any running child.
+                    }
                 } else if (liveAttempt(childId) == null && isCrashInterrupted(child.status())) {
                     // A child a crash left behind: bring it back, with this task instance if its type is not registered.
-                    resume(childId, ExecutionOptions.none(), task);
+                    try {
+                        resume(childId, ExecutionOptions.none(), task);
+                    } catch (LeaseHeldException held) {
+                        // Running on another node: the parent waits, and is woken once the child is done
+                        // (that node's in-process wake, or the claim loop seeing a finished child).
+                    }
                 }
                 // Otherwise it is running, waiting or paused: its own progress, then its completion, wakes the parent.
                 return Optional.empty();
@@ -1591,6 +1601,9 @@ public final class CatalystRuntime implements AutoCloseable {
         for (int depth = 0; cause != null && depth < 64; cause = cause.getCause(), depth++) {
             if (cause instanceof NonDeterministicReplayException
                     || cause instanceof InDoubtException
+                    // A child's failure is recorded in the parent (ChildCompleted) and substituted into
+                    // every later attempt, so retrying the parent can only meet it again.
+                    || cause instanceof ChildExecutionFailedException
                     || cause instanceof InterruptedException
                     || cause instanceof Error) {
                 return false;

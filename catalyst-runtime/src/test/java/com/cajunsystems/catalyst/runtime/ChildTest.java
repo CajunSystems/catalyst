@@ -38,8 +38,17 @@ class ChildTest {
     static final class Research implements Task<String> {
         static volatile Duration sleep = Duration.ZERO;
         static volatile boolean fail = false;
+        static volatile java.util.concurrent.CountDownLatch gate = null;
         @Override public String execute(Context ctx) {
             if (!sleep.isZero()) ctx.sleep(sleep);
+            java.util.concurrent.CountDownLatch g = gate;
+            if (g != null) {
+                try {
+                    g.await();
+                } catch (InterruptedException e) {
+                    Thread.currentThread().interrupt();
+                }
+            }
             if (fail) throw new IllegalStateException("source unavailable");
             return "found:" + ctx.model().complete(RESEARCH).message();
         }
@@ -54,6 +63,20 @@ class ChildTest {
             } catch (ChildExecutionFailedException e) {
                 return plan + "|recovered from " + e.status() + ": " + e.error();
             }
+        }
+    }
+
+    /** Lets a child's failure escape, and delegates to the flag (to test a changed delegation). */
+    static final class Uncaught implements Task<String> {
+        static volatile boolean other = false;
+        @Override public String execute(Context ctx) {
+            return other ? ctx.child(new OtherResearch()) : ctx.child(new Research());
+        }
+    }
+
+    static final class OtherResearch implements Task<String> {
+        @Override public String execute(Context ctx) {
+            return "other";
         }
     }
 
@@ -237,6 +260,77 @@ class ChildTest {
         while (!condition.getAsBoolean()) {
             if (System.nanoTime() > deadline) throw new AssertionError("condition not met within 10s");
             sleep(20);
+        }
+    }
+    @Test
+    void aFailedChildIsNotRetriedThroughItsParent() {
+        Research.sleep = Duration.ZERO;
+        Research.fail = true;
+        Research.gate = null;
+        Uncaught.other = false;
+        EventLog log = EventLogs.inMemory();
+        try (CatalystRuntime runtime = CatalystRuntime.builder().log(log).model(MockModel.alwaysReturn("M"))
+                .retryPolicy(com.cajunsystems.catalyst.engine.RetryPolicy.maxRetries(3, Duration.ofMillis(5)))
+                .task(Uncaught.class, Uncaught::new).task(Research.class, Research::new).build()) {
+            var run = runtime.execute(new Uncaught(), ExecutionOptions.none());
+            await(() -> runtime.inspect(run.id()).status() == Status.FAILED);
+            // The recorded failure is substituted into every retry, so a retry could only meet it again.
+            assertThat(runtime.inspect(run.id()).retries()).isZero();
+        } finally {
+            Research.fail = false;
+        }
+    }
+
+    @Test
+    void delegatingToAnotherTaskTypeIsADivergence() {
+        Research.sleep = Duration.ZERO;
+        Research.fail = false;
+        Research.gate = null;
+        Uncaught.other = false;
+        EventLog log = EventLogs.inMemory();
+        try (CatalystRuntime runtime = CatalystRuntime.builder().log(log).model(MockModel.alwaysReturn("M"))
+                .task(Uncaught.class, Uncaught::new).task(Research.class, Research::new).build()) {
+            var run = runtime.execute(new Uncaught(), ExecutionOptions.none());
+            await(() -> runtime.inspect(run.id()).status() == Status.COMPLETED);
+            assertThat(runtime.replay(run.id(), new Uncaught()).status()).isEqualTo(Status.COMPLETED);
+            Uncaught.other = true;
+            assertThatThrownBy(() -> runtime.replay(run.id(), new Uncaught()))
+                    .isInstanceOf(com.cajunsystems.catalyst.engine.NonDeterministicReplayException.class)
+                    .hasMessageContaining(OtherResearch.class.getName());
+        } finally {
+            Uncaught.other = false;
+        }
+    }
+
+    @Test
+    void aParentWhoseChildRunsOnAnotherNodeWaitsInsteadOfFailing() {
+        Research.sleep = Duration.ZERO;
+        Research.fail = false;
+        Research.gate = new java.util.concurrent.CountDownLatch(1);
+        SharedLog log = SharedLog.distributable();
+        java.util.function.Function<String, CatalystRuntime> node = id -> CatalystRuntime.builder().log(log)
+                .model(MockModel.alwaysReturn("M")).nodeId(id).distributed()
+                .lease(Duration.ofSeconds(30), Duration.ofMillis(50)).claimInterval(Duration.ofMillis(50))
+                .task(Coordinator.class, Coordinator::new).task(Research.class, Research::new).build();
+        try (CatalystRuntime a = node.apply("node-a"); CatalystRuntime b = node.apply("node-b")) {
+            var run = a.execute(new Coordinator(), ExecutionOptions.withKey("lease-held-child"));
+            await(() -> a.inspect(run.id()).status() == Status.WAITING);
+            ExecutionId child = childOf(log, run.id());
+            await(() -> a.inspect(child).status() == Status.RUNNING); // held by node A, blocked on the gate
+            // Node B pauses and resumes the parent: its attempt finds the child running under A's lease.
+            b.pause(run.id());
+            await(() -> b.inspect(run.id()).status() == Status.PAUSED);
+            try {
+                b.resume(run.id()).result(Duration.ofSeconds(10));
+            } catch (ExecutionWaitingSignal parked) {
+                // expected: the parent waits for its child again
+            }
+            assertThat(b.inspect(run.id()).status()).isEqualTo(Status.WAITING);
+            Research.gate.countDown();
+            await(() -> a.inspect(run.id()).status() == Status.COMPLETED);
+        } finally {
+            Research.gate.countDown();
+            Research.gate = null;
         }
     }
 }

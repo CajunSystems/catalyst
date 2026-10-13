@@ -109,6 +109,8 @@ public final class ReplayingContext implements Context {
     private String awaitingSignal;
     /** Children started and not yet recorded as finished, by child ref. */
     private final java.util.Map<String, ChildStarted> pendingChildren = new java.util.HashMap<>();
+    /** The task type each recorded child ref was started with, so a different one is a divergence. */
+    private final java.util.Map<String, String> childTypes = new java.util.HashMap<>();
     /** Children this attempt has reached, so far: child-1, child-2, … in task order. */
     private int childCount;
     /** The runtime's side of {@code ctx.child}; null where children cannot run (a branch, a plain replay). */
@@ -269,10 +271,14 @@ public final class ReplayingContext implements Context {
                 case EffectRecorded er -> boundaries.add(new Boundary(se.seq(), e, er.label(), null));
                 case SignalAwaited sa -> this.awaitingSignal = sa.name();
                 case TimerStarted ts -> pendingTimers.put(ts.timerId(), ts.wakeAt());
-                case ChildStarted cs -> pendingChildren.put(cs.childRef(), cs);
+                case ChildStarted cs -> {
+                    pendingChildren.put(cs.childRef(), cs);
+                    childTypes.put(cs.childRef(), cs.taskType());
+                }
                 case ChildCompleted cc -> {
-                    // The child boundary; the ChildStarted before it only named the child.
-                    boundaries.add(new Boundary(se.seq(), e, cc.childRef(), null));
+                    // The child boundary; the ChildStarted before it only named the child. Its "hash" is
+                    // the child's task type: the same ref delegating to another task is a divergence.
+                    boundaries.add(new Boundary(se.seq(), e, cc.childRef(), childTypes.get(cc.childRef())));
                     pendingChildren.remove(cc.childRef());
                 }
                 case TimerFired tf -> {
@@ -696,8 +702,10 @@ public final class ReplayingContext implements Context {
     public <R> R child(Task<R> task) {
         java.util.Objects.requireNonNull(task, "task");
         String childRef = "child-" + (++childCount);
+        String taskType = task.getClass().getName();
         Optional<Boundary> done = pollExpected(ChildCompleted.class, "child " + childRef);
-        if (done.isPresent() && identityMatchesOrFork(done.get(), "child", childRef)) {
+        if (done.isPresent() && identityMatchesOrFork(done.get(), "child", childRef)
+                && childTypeMatchesOrFork(done.get().seq(), childRef, done.get().hash(), taskType)) {
             ChildCompleted cc = (ChildCompleted) done.get().event();
             if (cc.result() == null && !"COMPLETED".equals(cc.status())) {
                 throw new ChildExecutionFailedException(ExecutionId.of(cc.childId()), cc.status(), cc.error());
@@ -705,6 +713,9 @@ public final class ReplayingContext implements Context {
             return (R) payloads.fromTree(cc.result());
         }
         ChildStarted started = pendingChildren.remove(childRef);
+        if (started != null && !childTypeMatchesOrFork(-1, childRef, started.taskType(), taskType)) {
+            started = null; // BRANCH: forked, so this is a new child (which a branch cannot start)
+        }
         if (started != null && !appendEnabled) {
             throw raisedWaiting = waitingOnChild(ExecutionId.of(started.childId())); // a pure replay ends at the wait
         }
@@ -716,7 +727,7 @@ public final class ReplayingContext implements Context {
         ExecutionId childId;
         if (started == null) {
             childId = childLauncher.mint();
-            append(new ChildStarted(now(), childRef, childId.value(), task.getClass().getName()));
+            append(new ChildStarted(now(), childRef, childId.value(), taskType));
         } else {
             childId = ExecutionId.of(started.childId());
         }
@@ -734,6 +745,12 @@ public final class ReplayingContext implements Context {
             append(new ChildStarted(now(), childRef, childId.value(), started.taskType()));
         }
         throw raisedWaiting = waitingOnChild(childId);
+    }
+
+    private boolean childTypeMatchesOrFork(long seq, String childRef, String recordedType, String actualType) {
+        if (recordedType == null || recordedType.equals(actualType)) return true;
+        forkOrThrow(seq, "child " + childRef + " of " + recordedType, "child " + childRef + " of " + actualType);
+        return false;
     }
 
     private ExecutionWaitingSignal waitingOnChild(ExecutionId childId) {

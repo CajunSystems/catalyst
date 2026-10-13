@@ -384,7 +384,7 @@ checkout's pom to `com.github.CajunSystems` before installing.
     status-scoped `awaitingTimer`, the signal-read stop, or the in-process wake each fails a
     `TimerTest` case.
 
-- **Child executions** — `ChildTest` (runtime, 7) + `ChildAcceptanceTest` + `Demo child` (CI gate).
+- **Child executions** — `ChildTest` (runtime, 10) + `ChildAcceptanceTest` + `Demo child` (CI gate).
   - **Events:** `ctx.child(task)` (ref `child-<n>` per attempt) mints an id and records
     `ChildStarted(childRef, childId, taskType)`. It is not a boundary; it folds to WAITING, timeline
     `CHILD_STARTED`. It then asks the runtime's `ChildLauncher` (`Children`) to `ensure` the child:
@@ -405,6 +405,16 @@ checkout's pom to `com.github.CajunSystems` before installing.
   - **Early resume** re-records `ChildStarted` with the same child id (mutation-checked).
   - **No launcher** (branch/eval context) past the fork → `UnsupportedOperationException`.
     `waitingHandle` reports a child wait as such.
+  - **Review fixes (each mutation-checked):**
+    - `ChildExecutionFailedException` is **not retryable** (`isRetryable`). The recorded
+      `ChildCompleted` is substituted into every retry, so a parent retry policy only slept through
+      its backoffs and then failed. Restarting a child is the supervision item on the roadmap.
+    - `ensure` treats a **`LeaseHeldException`** as "running elsewhere" and returns empty, so the
+      parent re-parks. Before this, a parent resumed on node B while its child ran on node A was
+      recorded FAILED.
+    - The `ChildCompleted` boundary's hash is the child's **task type** (taken from its
+      `ChildStarted`). Delegating the same ref to another type is a divergence, both on a completed
+      child and on a pending one.
   - **Known gaps:** no cancel cascade; `childParents` keeps an entry for a parent cancelled while
     its child runs, until the child finishes.
 
