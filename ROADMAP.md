@@ -476,6 +476,24 @@ below give the same capability natively.
   - **Not yet:** cancelling a parent does not cascade to its children, and a branch cannot start a
     child live.
   - **Exit demo:** `Demo child`.
+- **Supervision for child executions.** Follow-ups to `ctx.child`, in this order:
+  1. **Cancel cascade (propagate down).** Cancelling a parent cancels its running children. Every
+     supervision strategy needs it, and it closes the known gap above.
+  2. **Supervision v1: one-for-one.** For example `ctx.child(task, Supervision.restart(3).fresh())`.
+     - **Restart modes:** *resume* retries on the child's own stream, so its successful prefix is
+       substituted (for transient failures). *Fresh* starts a new child execution from scratch (for
+       when the child's own history is the problem, such as a stuck agent conversation).
+     - **Deterministic decisions:** the restart decision is made by the parent from outcomes it has
+       already recorded. Each restart records a new `ChildStarted` (`child-1#2`, …) and its outcome,
+       so a replay makes the same decision.
+     - **Restart intensity** (at most N restarts in T) is computed from the recorded
+       `ChildCompleted.at` times, never a live clock.
+     - **When restarts run out**, the failure escalates to the parent as
+       `ChildExecutionFailedException`, as it does today.
+  3. **Fan-out:** start several children at once, then await all or any of them. Today `ctx.child`
+     blocks, so a parent runs one child at a time.
+  4. **One-for-all and rest-for-one,** once fan-out exists. A failed child cancels and restarts its
+     siblings (all of them, or the ones started after it).
 - **Per-call retries and timeouts** for model and tool calls. Boudin has per-activity
   `startToClose`/`maxAttempts`/backoff; Catalyst retries the whole task, and a hung provider call
   has no limit.
