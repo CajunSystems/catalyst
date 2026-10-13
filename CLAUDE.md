@@ -553,7 +553,7 @@ checkout's pom to `com.github.CajunSystems` before installing.
     - No cancel on restart is caught **only** by the give-up test. In the one-for-all test, the
       parent's end-of-life cascade also cancels the stray child.
 
-- **Per-call retries and timeouts** — `CallPolicyTest` (runtime, 9) + `CallPolicyUnitTest` (core) +
+- **Per-call retries and timeouts** — `CallPolicyTest` (runtime, 10) + `CallPolicyUnitTest` (core) +
   `CallsAcceptanceTest` + `Demo calls` (CI gate).
   - **API:** `CallPolicy.retries(n, backoff)` (exponential ×2, `maxBackoff` default 30s),
     `.timeout(d)` / `timeoutAfter(d)`, and `.retryOn(predicate)`. The runtime-wide default is
@@ -580,7 +580,9 @@ checkout's pom to `com.github.CajunSystems` before installing.
       `raisedCancellation` set. A plain failure with a cancel pending would record FAILED.
     - An **abandon** surfaces the failure itself: Deploy-4's drain rule, which closes a model
       request instead of leaving it in doubt.
-    - The tool path records `lastRealFailure`, the suppressed cause, as the `ToolCompleted` error.
+    - Both tool paths, `runToolLive` and the in-doubt `RETRY` in `handleInDoubt`, record
+      `lastRealFailure` (the suppressed cause) as the `ToolCompleted` error. The in-doubt one was a
+      review finding, mutation-checked.
       The agent rethrows signals before treating anything as a recorded tool failure.
   - **Mutation-checked:** never retrying, no `CallRetried`, no timeout, a stream retried after
     chunks, a cancel not surfaced, and recording the signal's text each fail a test.

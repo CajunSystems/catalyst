@@ -668,7 +668,7 @@ public final class ReplayingContext implements Context {
                     // request that never completes: replay diverges there, and every resume would find
                     // it in doubt again.
                     long latencyMillis = (System.nanoTime() - t0) / 1_000_000;
-                    lastToolFailureSeq = append(new ToolCompleted(now(), null, String.valueOf(ex), latencyMillis));
+                    lastToolFailureSeq = append(new ToolCompleted(now(), null, String.valueOf(lastRealFailure(ex)), latencyMillis));
                     lastToolFailureException = ex;
                     throw ex;
                 }

@@ -269,6 +269,30 @@ class CallPolicyTest {
         }
     }
 
+    /** The in-doubt RETRY path runs the call under its policy too, and a cancel there records the real failure. */
+    @Test
+    void anInDoubtRetryCancelledDuringItsRetriesRecordsTheRealFailure() {
+        failFirst = 100;
+        EventLog log = EventLogs.inMemory();
+        ExecutionId id = ExecutionId.random();
+        java.time.Instant t = java.time.Instant.parse("2026-01-01T00:00:00Z");
+        log.append(id, new CatalystEvent.ExecutionCreated(t, UsesToolDefault.class.getName(), "novars", "cfg", ""));
+        log.append(id, new CatalystEvent.ExecutionStarted(t, 1, "node-dead"));
+        log.append(id, new CatalystEvent.ToolRequested(t, "flaky", com.fasterxml.jackson.databind.node.TextNode.valueOf("x")));
+        try (CatalystRuntime runtime = CatalystRuntime.builder().log(log).model(MockModel.alwaysReturn("M"))
+                .inDoubtPolicy(com.cajunsystems.catalyst.engine.InDoubtPolicy.RETRY)
+                .callPolicy(CallPolicy.retries(5, Duration.ofSeconds(5)))
+                .task(UsesToolDefault.class, UsesToolDefault::new).build()) {
+            runtime.recoverAll(); // resumes it: the dangling request is retried under the call policy
+            await(() -> invocations.get() == 1);
+            runtime.cancel(id);
+            await(() -> runtime.inspect(id).status() == Status.CANCELLED);
+            assertThat(log.read(id).stream().map(se -> se.event())
+                    .filter(e -> e instanceof CatalystEvent.ToolCompleted).map(e -> ((CatalystEvent.ToolCompleted) e).error()).toList())
+                    .singleElement().asString().contains("transient 1");
+        }
+    }
+
     private static void await(BooleanSupplier condition) {
         long deadline = System.nanoTime() + TimeUnit.SECONDS.toNanos(10);
         while (!condition.getAsBoolean()) {
