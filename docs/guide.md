@@ -318,10 +318,18 @@ same time:
 List<ChildHandle<String>> research = List.of(
         ctx.spawn(new ResearchLogs()), ctx.spawn(new ResearchMetrics()), ctx.spawn(new ResearchTraces()));
 List<String> findings = ctx.awaitAll(research);      // every result, in this order
-
-ChildHandle<String> first = ctx.awaitAny(research);  // whichever ends first
-String fastest = ctx.await(first);
 ```
+
+Or take whichever finishes first:
+
+```java
+List<ChildHandle<String>> mirrors = List.of(ctx.spawn(new FetchFromEu()), ctx.spawn(new FetchFromUs()));
+ChildHandle<String> first = ctx.awaitAny(mirrors);   // whichever ends first
+String page = ctx.await(first);                      // its outcome, at once
+```
+
+A child already awaited counts as ended, so `awaitAny` over handles you have already awaited
+returns the first of them at once.
 
 - **Waiting holds no thread.** `await`, `awaitAll` and `awaitAny` park the parent as `WAITING`
   until a child it waits on ends, like `ctx.child`.
@@ -332,8 +340,36 @@ String fastest = ctx.await(first);
   child in that order.
 - **No orphans.** When a parent ends, whether it completed, failed or was cancelled, any child it
   spawned and never awaited is cancelled.
-- **Not yet:** `spawn` takes no `Supervision`; restarting is per `ctx.child` call for now. As with
-  `ctx.child`, a branch or eval candidate cannot spawn a child live.
+- **Supervised groups:** to restart children that fail, run them as a group with `ctx.supervise`
+  (below). As with `ctx.child`, a branch or eval candidate cannot spawn a child live.
+
+### Supervised groups: one-for-all and rest-for-one
+
+`ctx.supervise` runs children at the same time, restarts the ones that fail, and returns every
+result in order:
+
+```java
+List<String> parts = ctx.supervise(
+        Supervision.restart(2).oneForAll().backoff(Duration.ofSeconds(10)),
+        List.of(new Draft(), new FactCheck(), new Summary()));
+```
+
+The strategy says which children a failure restarts:
+
+| Strategy | Restarts | Use it when |
+|---|---|---|
+| default (one-for-one) | the failed child | the children are independent |
+| `.oneForAll()` | every child | the children only make sense together, e.g. built from one snapshot |
+| `.restForOne()` | the failed child and those listed after it | later children depend on earlier ones |
+
+- **Restarted children start fresh.** One still running is cancelled first, and a result one already
+  returned is discarded.
+- **The limit counts failures across the group.** `restart(n)` and `within(window)` work as they do
+  for a single child.
+- **When restarts run out,** the children still running are cancelled and the failure reaches the
+  parent as `ChildExecutionFailedException`.
+- **Only a failed child triggers a restart,** as for a single child.
+- **Every decision comes from recorded outcomes,** so a replay or resume walks the same restarts.
 
 ## Signals: waiting for a human
 

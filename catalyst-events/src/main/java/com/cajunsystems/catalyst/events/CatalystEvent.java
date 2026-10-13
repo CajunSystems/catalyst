@@ -48,6 +48,7 @@ import java.time.Instant;
         @JsonSubTypes.Type(value = CatalystEvent.ChildCompleted.class, name = "ChildCompleted"),
         @JsonSubTypes.Type(value = CatalystEvent.ChildSpawned.class, name = "ChildSpawned"),
         @JsonSubTypes.Type(value = CatalystEvent.ChildAwaited.class, name = "ChildAwaited"),
+        @JsonSubTypes.Type(value = CatalystEvent.ChildDiscarded.class, name = "ChildDiscarded"),
 })
 public sealed interface CatalystEvent {
 
@@ -152,6 +153,14 @@ public sealed interface CatalystEvent {
      * boundary, and recorded again if a live attempt reaches the same wait unfinished.
      */
     record ChildAwaited(Instant at, java.util.List<String> childRefs, java.util.List<String> childIds) implements CatalystEvent {}
+
+    /**
+     * The parent gave up on a spawned child (a supervised group restarting it, or escalating), and
+     * is cancelling it. Recorded in the parent's stream before the cancel, so the decision survives a
+     * crash: the parent's replay never revives the child, and recovery cancels it rather than
+     * resuming it. Not a boundary, and no state change.
+     */
+    record ChildDiscarded(Instant at, String childRef, String childId) implements CatalystEvent {}
 
     // ── Model boundary ───────────────────────────────────────────────────────
 

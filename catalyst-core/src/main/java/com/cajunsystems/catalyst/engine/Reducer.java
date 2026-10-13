@@ -94,6 +94,8 @@ public final class Reducer {
                 }
                 case ChildSpawned cs -> timeline.add(new TimelineStep(se.seq(), TimelineStep.Kind.CHILD_SPAWNED,
                         cs.childRef(), cs.at(), 0, com.fasterxml.jackson.databind.node.TextNode.valueOf(cs.childId())));
+                case ChildDiscarded cd -> timeline.add(new TimelineStep(se.seq(), TimelineStep.Kind.CHILD_DISCARDED,
+                        cd.childRef(), cd.at(), 0, com.fasterxml.jackson.databind.node.TextNode.valueOf(cd.childId())));
                 case ChildAwaited ca -> {
                     status = Status.WAITING;
                     com.fasterxml.jackson.databind.node.ArrayNode ids = com.fasterxml.jackson.databind.node.JsonNodeFactory.instance.arrayNode();

@@ -29,6 +29,7 @@ public record TimelineStep(long seq, Kind kind, String label, Instant at, long l
         CHILD_COMPLETED,
         CHILD_SPAWNED,
         CHILD_AWAITED,
+        CHILD_DISCARDED,
         PROMPT,
         MODEL,
         TOOL,

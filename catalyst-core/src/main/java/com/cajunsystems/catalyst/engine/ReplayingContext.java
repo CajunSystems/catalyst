@@ -115,6 +115,8 @@ public final class ReplayingContext implements Context {
     private final java.util.Map<String, ChildSpawned> spawnedChildren = new java.util.HashMap<>();
     /** The task each spawn in this attempt was given, by ref, so an await can create or resume it. */
     private final java.util.Map<String, Task<?>> spawnedTasks = new java.util.HashMap<>();
+    /** Spawned children this execution recorded giving up on, by ref: never revived on replay. */
+    private final java.util.Set<String> discardedChildren = new java.util.HashSet<>();
     /** Outcomes of spawned children this attempt recorded or substituted, by ref: awaiting again returns them. */
     private final java.util.Map<String, ChildCompleted> settledChildren = new java.util.HashMap<>();
     /** Children this attempt has reached, so far: child-1, child-2, … in task order. */
@@ -286,6 +288,7 @@ public final class ReplayingContext implements Context {
                     childTypes.put(cs.childRef(), cs.taskType());
                 }
                 case ChildAwaited ca -> { } // a wait, not a boundary: its outcome is the ChildCompleted after it
+                case ChildDiscarded cd -> discardedChildren.add(cd.childRef());
                 case ChildCompleted cc -> {
                     // The child boundary; the ChildStarted before it only named the child. Its "hash" is
                     // the child's task type: the same ref delegating to another task is a divergence.
@@ -805,7 +808,10 @@ public final class ReplayingContext implements Context {
             // A live attempt makes sure a recorded child exists and is going: a crash may have come
             // between recording the spawn and creating the child, or interrupted the child. Its outcome
             // is read when it is awaited. A pure replay touches nothing.
-            if (appendEnabled && childLauncher != null) childLauncher.ensure(id, ref, childId, task);
+            // A child the parent recorded giving up on is never revived: it is cancelled, not resumed.
+            if (appendEnabled && childLauncher != null && !discardedChildren.contains(ref)) {
+                childLauncher.ensure(id, ref, childId, task);
+            }
             return new ChildHandle<>(ref, childId);
         }
         if (childLauncher == null) {
@@ -858,6 +864,76 @@ public final class ReplayingContext implements Context {
             if (child.ref().equals(first.childRef())) return child;
         }
         throw new IllegalStateException("awaitAny recorded a child it was not given: " + first.childRef());
+    }
+
+    /**
+     * A supervised group: spawn every task, then collect outcomes as they end (an awaitAny over the
+     * ones still pending, so the order is recorded). A failure asks the supervision whether to
+     * restart; the strategy picks which children restart with it. Each one still running is cancelled
+     * first. After the backoff (a durable sleep), each is spawned again as a fresh child. Giving up
+     * cancels the children still running and throws. The cancels are side effects on other streams
+     * and are not recorded: a resume repeats them, and cancelling an ended child does nothing.
+     */
+    @Override
+    @SuppressWarnings({"unchecked", "rawtypes"})
+    public <R> java.util.List<R> supervise(Supervision supervision, java.util.List<? extends Task<? extends R>> tasks) {
+        java.util.Objects.requireNonNull(supervision, "supervision");
+        java.util.Objects.requireNonNull(tasks, "tasks");
+        int n = tasks.size();
+        java.util.List<ChildHandle> handles = new java.util.ArrayList<>(n);
+        for (Task<? extends R> task : tasks) handles.add(spawn(task));
+        Object[] results = new Object[n];
+        boolean[] done = new boolean[n];
+        java.util.List<java.time.Instant> failures = new java.util.ArrayList<>();
+        int restarts = 0;
+        while (true) {
+            java.util.List<ChildHandle> pending = new java.util.ArrayList<>();
+            for (int i = 0; i < n; i++) if (!done[i]) pending.add(handles.get(i));
+            if (pending.isEmpty()) {
+                java.util.List<R> out = new java.util.ArrayList<>(n);
+                for (Object r : results) out.add((R) r);
+                return out;
+            }
+            ChildHandle ended = awaitAny((java.util.List) pending);
+            int i = handles.indexOf(ended);
+            try {
+                results[i] = await(ended);
+                done[i] = true;
+            } catch (ChildExecutionFailedException failed) {
+                failures.add(failed.at());
+                if (failed.at() == null || !supervision.restarts(failed.status(), failures)) {
+                    for (int j = 0; j < n; j++) if (j != i && !done[j]) cancelChild(handles.get(j));
+                    throw failed.afterRestarts(restarts);
+                }
+                restarts++;
+                // The children that restart: [from, to] in list order.
+                int from = supervision.strategy() == Supervision.Strategy.ONE_FOR_ALL ? 0 : i;
+                int to = supervision.strategy() == Supervision.Strategy.ONE_FOR_ONE ? i : n - 1;
+                for (int j = from; j <= to; j++) {
+                    if (j != i && !done[j]) cancelChild(handles.get(j));
+                    done[j] = false;
+                    results[j] = null;
+                }
+                if (!supervision.backoff().isZero()) sleep(supervision.backoff());
+                for (int j = from; j <= to; j++) handles.set(j, spawn(tasks.get(j)));
+            }
+        }
+    }
+
+    /**
+     * Gives up on a child the group no longer wants. {@code ChildDiscarded} is recorded first, once,
+     * so the decision survives a crash before the child unwinds: the replay will not revive it and
+     * recovery cancels it. Then it is cancelled. A resume repeats the cancel, which does nothing to an
+     * ended child. Only a live attempt acts; a pure replay touches nothing.
+     */
+    private void cancelChild(ChildHandle<?> child) {
+        if (!appendEnabled || childLauncher == null) return;
+        if (!discardedChildren.contains(child.ref())) {
+            requireAppendable("discard " + child.ref());
+            append(new ChildDiscarded(now(), child.ref(), child.id().value()));
+            discardedChildren.add(child.ref());
+        }
+        childLauncher.cancel(child.id());
     }
 
     /**

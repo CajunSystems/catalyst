@@ -25,16 +25,28 @@ import java.util.Optional;
  */
 public final class Supervision {
 
-    private static final Supervision ESCALATE = new Supervision(0, null, Duration.ZERO);
+    /** Which children a failure restarts, in a group run with {@code ctx.supervise}. */
+    public enum Strategy {
+        /** Only the failed child. */
+        ONE_FOR_ONE,
+        /** Every child in the group: the others are cancelled (or their results discarded) and all start again. */
+        ONE_FOR_ALL,
+        /** The failed child and every child listed after it; the ones before it keep their results. */
+        REST_FOR_ONE
+    }
+
+    private static final Supervision ESCALATE = new Supervision(0, null, Duration.ZERO, Strategy.ONE_FOR_ONE);
 
     private final int maxRestarts;
     private final Duration window;
     private final Duration backoff;
+    private final Strategy strategy;
 
-    private Supervision(int maxRestarts, Duration window, Duration backoff) {
+    private Supervision(int maxRestarts, Duration window, Duration backoff, Strategy strategy) {
         this.maxRestarts = maxRestarts;
         this.window = window;
         this.backoff = backoff;
+        this.strategy = strategy;
     }
 
     /** No restarts: a failed child's failure reaches the parent at once. The default for {@code ctx.child(task)}. */
@@ -45,7 +57,7 @@ public final class Supervision {
     /** Restart a failed child up to {@code maxRestarts} times in all (or within {@link #within}), then escalate. */
     public static Supervision restart(int maxRestarts) {
         if (maxRestarts < 0) throw new IllegalArgumentException("maxRestarts must be zero or positive");
-        return new Supervision(maxRestarts, null, Duration.ZERO);
+        return new Supervision(maxRestarts, null, Duration.ZERO, Strategy.ONE_FOR_ONE);
     }
 
     /**
@@ -55,14 +67,32 @@ public final class Supervision {
     public Supervision within(Duration window) {
         Objects.requireNonNull(window, "window");
         if (window.isNegative() || window.isZero()) throw new IllegalArgumentException("window must be positive");
-        return new Supervision(maxRestarts, window, backoff);
+        return new Supervision(maxRestarts, window, backoff, strategy);
+    }
+
+    /**
+     * In a group ({@code ctx.supervise}), a failure restarts every child. For children that only make
+     * sense together: the others are cancelled, any results they already returned are discarded, and
+     * the whole group starts again. Has no effect on a single {@code ctx.child}.
+     */
+    public Supervision oneForAll() {
+        return new Supervision(maxRestarts, window, backoff, Strategy.ONE_FOR_ALL);
+    }
+
+    /**
+     * In a group ({@code ctx.supervise}), a failure restarts the failed child and every child listed
+     * after it, which may depend on it. The children before it keep their results. Has no effect on a
+     * single {@code ctx.child}.
+     */
+    public Supervision restForOne() {
+        return new Supervision(maxRestarts, window, backoff, Strategy.REST_FOR_ONE);
     }
 
     /** Waits {@code delay} (a durable {@code ctx.sleep}) before each restart. */
     public Supervision backoff(Duration delay) {
         Objects.requireNonNull(delay, "delay");
         if (delay.isNegative()) throw new IllegalArgumentException("delay must be zero or positive");
-        return new Supervision(maxRestarts, window, delay);
+        return new Supervision(maxRestarts, window, delay, strategy);
     }
 
     public int maxRestarts() {
@@ -75,6 +105,10 @@ public final class Supervision {
 
     public Duration backoff() {
         return backoff;
+    }
+
+    public Strategy strategy() {
+        return strategy;
     }
 
     /**
@@ -100,6 +134,7 @@ public final class Supervision {
     public String toString() {
         return maxRestarts == 0 ? "Supervision.escalate()"
                 : "Supervision.restart(" + maxRestarts + ")" + (window == null ? "" : ".within(" + window + ")")
-                + (backoff.isZero() ? "" : ".backoff(" + backoff + ")");
+                + (backoff.isZero() ? "" : ".backoff(" + backoff + ")")
+                + (strategy == Strategy.ONE_FOR_ALL ? ".oneForAll()" : strategy == Strategy.REST_FOR_ONE ? ".restForOne()" : "");
     }
 }

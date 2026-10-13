@@ -1007,18 +1007,28 @@ public final class CatalystRuntime implements AutoCloseable {
 
     /** The children {@code parent} recorded starting and has no recorded outcome for, in start order. */
     private List<ExecutionId> unfinishedChildren(ExecutionId parent) {
+        return childrenOf(parent).unfinished();
+    }
+
+    /** A parent's view of its children, from one read of its log. */
+    private record ChildRecord(List<ExecutionId> unfinished, java.util.Set<ExecutionId> discarded) {}
+
+    private ChildRecord childrenOf(ExecutionId parent) {
         java.util.LinkedHashSet<String> open = new java.util.LinkedHashSet<>();
+        java.util.Set<ExecutionId> discarded = new java.util.HashSet<>();
         for (SequencedEvent se : log.read(parent)) {
             if (se.event() instanceof CatalystEvent.ChildStarted cs) open.add(cs.childId());
             else if (se.event() instanceof CatalystEvent.ChildSpawned cs) open.add(cs.childId());
             else if (se.event() instanceof CatalystEvent.ChildCompleted cc) open.remove(cc.childId());
+            else if (se.event() instanceof CatalystEvent.ChildDiscarded cd) discarded.add(ExecutionId.of(cd.childId()));
         }
-        return open.stream().map(ExecutionId::of).toList();
+        return new ChildRecord(open.stream().map(ExecutionId::of).toList(), discarded);
     }
 
     /**
      * The parent of a not-yet-terminal child execution, if that parent has ended (cancelled, failed
-     * or completed): a child outlives its parent only if the cascade never reached it. A child is
+     * or completed) or recorded discarding it: a child outlives either only if the cancel never
+     * reached it. A child is
      * created with the key {@code child:<parent>:<ref>}, so its own stream names its parent. Caller
      * keys are not namespaced, so the key alone proves nothing: the parent must also have recorded
      * starting this very child. A cancel is terminal, and must never land on an unrelated execution.
@@ -1030,8 +1040,12 @@ public final class CatalystRuntime implements AutoCloseable {
         if (ref <= CHILD_KEY_PREFIX.length()) return Optional.empty();
         try {
             ExecutionId parent = ExecutionId.of(key.substring(CHILD_KEY_PREFIX.length(), ref));
-            return foldState(parent).isTerminal() && unfinishedChildren(parent).contains(id)
-                    ? Optional.of(parent) : Optional.empty();
+            ChildRecord children = childrenOf(parent);
+            // Abandoned: the parent has ended with this child outstanding, or recorded giving up on it
+            // (a supervised group restarting or escalating) while itself still running or waiting.
+            boolean abandoned = children.discarded().contains(id)
+                    || (foldState(parent).isTerminal() && children.unfinished().contains(id));
+            return abandoned ? Optional.of(parent) : Optional.empty();
         } catch (RuntimeException notAParent) {
             return Optional.empty(); // a caller's own key that only looks like a child's
         }
@@ -1133,6 +1147,23 @@ public final class CatalystRuntime implements AutoCloseable {
             });
         }
 
+        /**
+         * Cancels a child its parent no longer wants. The link is dropped first, so the child ending
+         * does not wake the parent for nothing. Best-effort: a cancel that cannot be made (another node
+         * refusing it, say) leaves a child whose result nobody reads, and it is cancelled when the
+         * parent ends.
+         */
+        @Override
+        public void cancel(ExecutionId childId) {
+            childParents.remove(childId);
+            try {
+                if (foldState(childId).lastSeq() < 0) return; // never created: nothing to cancel
+                CatalystRuntime.this.cancel(childId);
+            } catch (RuntimeException e) {
+                LOG.warn("Could not cancel child {}", childId.value(), e);
+            }
+        }
+
         /** The launcher an attempt's context uses: the same, but notes that the attempt touched a child. */
         ChildLauncher forAttempt(RunningAttempt attempt) {
             return new ChildLauncher() {
@@ -1142,6 +1173,9 @@ public final class CatalystRuntime implements AutoCloseable {
                 @Override public Optional<Outcome> ensure(ExecutionId parentId, String childRef, ExecutionId childId, Task<?> task) {
                     attempt.touchedChildren = true;
                     return Children.this.ensure(parentId, childRef, childId, task);
+                }
+                @Override public void cancel(ExecutionId childId) {
+                    Children.this.cancel(childId);
                 }
             };
         }
