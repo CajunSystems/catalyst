@@ -108,6 +108,47 @@ public interface Context {
     }
 
     /**
+     * Starts {@code task} as a child execution and returns at once, without waiting (fan-out). The
+     * child runs on its own, durably, while this task carries on, so several can run at the same
+     * time. Get its outcome with {@link #await}, {@link #awaitAll} or {@link #awaitAny}. A child this
+     * task never awaits is cancelled when this execution ends. The default throws, so other
+     * {@code Context} implementations still compile.
+     */
+    default <R> com.cajunsystems.catalyst.engine.ChildHandle<R> spawn(Task<R> task) {
+        throw new UnsupportedOperationException(getClass().getSimpleName() + " does not run child executions");
+    }
+
+    /**
+     * The outcome of a spawned child: its result, or a
+     * {@link com.cajunsystems.catalyst.engine.ChildExecutionFailedException} if it failed or was
+     * cancelled. If it has not finished, this execution waits as {@code WAITING}, holding no thread,
+     * and is resumed when it does. The outcome is recorded, so a replay returns it again.
+     */
+    default <R> R await(com.cajunsystems.catalyst.engine.ChildHandle<R> child) {
+        throw new UnsupportedOperationException(getClass().getSimpleName() + " does not run child executions");
+    }
+
+    /**
+     * Every child's result, in the order given. The children run concurrently; this waits for each
+     * in turn, so a failure surfaces as the first failed child in that order.
+     */
+    default <R> java.util.List<R> awaitAll(java.util.List<com.cajunsystems.catalyst.engine.ChildHandle<R>> children) {
+        java.util.List<R> results = new java.util.ArrayList<>(children.size());
+        for (com.cajunsystems.catalyst.engine.ChildHandle<R> child : children) results.add(await(child));
+        return results;
+    }
+
+    /**
+     * The first of {@code children} to end, waiting (as {@code WAITING}, no thread held) if none has.
+     * Which one won is recorded, so a replay picks the same one. Pass the returned handle to
+     * {@link #await} for its outcome, which is then returned at once. A child already awaited
+     * counts as ended.
+     */
+    default <R> com.cajunsystems.catalyst.engine.ChildHandle<R> awaitAny(java.util.List<com.cajunsystems.catalyst.engine.ChildHandle<R>> children) {
+        throw new UnsupportedOperationException(getClass().getSimpleName() + " does not run child executions");
+    }
+
+    /**
      * Whether {@code failure}, thrown by {@link #call}, is the recorded result of that call: the tool
      * failed, and the failure is in the log as its {@code ToolCompleted}. That covers a live failure, a
      * failure substituted on replay or resume, and one reproduced by a branch. Code that handles tool

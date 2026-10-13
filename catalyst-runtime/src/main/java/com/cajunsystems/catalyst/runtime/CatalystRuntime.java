@@ -396,8 +396,9 @@ public final class CatalystRuntime implements AutoCloseable {
                 sleepers.put(id, Map.entry(task, opts));
                 wakeLater(id);
             }
-            // Cancelled: cancel the children it started and has not heard back from.
-            if (cause instanceof CancellationException) cascadeCancelLater(id);
+            // Ended (cancelled, failed or completed): cancel the children it started and has not heard
+            // back from, such as spawned children it never awaited. A parked attempt has not ended.
+            if (!(cause instanceof ExecutionWaitingSignal)) cascadeCancelLater(id);
             // A child execution finished an attempt: wake its parent, which re-checks whether it is done.
             ExecutionId parent = childParents.get(id);
             if (parent != null) wakeLater(parent);
@@ -787,8 +788,8 @@ public final class CatalystRuntime implements AutoCloseable {
                     // deliberate PAUSED or WAITING (Deploy-2). A live lease held elsewhere means it is
                     // running there.
                     ExecutionState unleased = foldState(id);
-                    if (cancelledParentOf(id, unleased).isPresent()) {
-                        // A child whose parent was cancelled, and the cascade never reached it (the
+                    if (endedParentOf(id, unleased).isPresent()) {
+                        // A child whose parent has ended, and the cascade never reached it (the
                         // process stopped first, say): cancel it now. Recovery is the durable backstop.
                         cancel(id); // reentrant on the id lock; forwarded if another node runs it
                         leftAlone.put(id, foldState(id).status());
@@ -800,7 +801,7 @@ public final class CatalystRuntime implements AutoCloseable {
                         unleased.awaitingTimer().ifPresent(wakeAt -> scheduleWake(id, wakeAt));
                         // A parent waiting on a child that has not finished: remember the link, so the
                         // child finishing in this process (recovered by this same scan, say) wakes it.
-                        unleased.awaitingChild().ifPresent(child -> childParents.put(child, id));
+                        unleased.awaitingChildren().forEach(child -> childParents.put(child, id));
                         leftAlone.put(id, honourOrphanedCancel(id, unleased));
                         return;
                     }
@@ -918,10 +919,11 @@ public final class CatalystRuntime implements AutoCloseable {
     private boolean childDone(ExecutionState state) {
         // An empty child stream is a crash between the parent recording ChildStarted and creating the
         // child: only the parent's resumed attempt creates it (ensure), so the parent must not stay parked.
-        return state.awaitingChild().map(child -> {
+        // Any one of the awaited children ending wakes it (one for ctx.child/await, several for awaitAny).
+        return state.awaitingChildren().stream().anyMatch(child -> {
             ExecutionState c = foldState(child);
             return c.isTerminal() || c.lastSeq() < 0;
-        }).orElse(false);
+        });
     }
 
     /** Waiting on a timer that has come due by this runtime's clock. */
@@ -952,11 +954,11 @@ public final class CatalystRuntime implements AutoCloseable {
     }
 
     /**
-     * Cancels, off this thread, the children a cancelled {@code parent} started and has no outcome
-     * for. Each is cancelled by id, so a child running on another node gets the request on its lease
-     * row, and a child's own children follow from its cancel. Best-effort: recovery's scan cancels
-     * any child whose parent is cancelled, so a cascade cut short by a crash or a shutdown still
-     * completes on the next start.
+     * Cancels, off this thread, the children an ended {@code parent} (cancelled, failed or completed)
+     * started and has no outcome for: a child outlives its parent only by accident. Each is cancelled
+     * by id, so a child running on another node gets the request on its lease row, and a child's own
+     * children follow from its cancel. Best-effort: recovery's scan cancels any child whose parent has
+     * ended, so a cascade cut short by a crash or a shutdown still completes on the next start.
      */
     private void cascadeCancelLater(ExecutionId parent) {
         if (closing) return;
@@ -970,22 +972,29 @@ public final class CatalystRuntime implements AutoCloseable {
     private void cascadeCancel(ExecutionId parent) {
         if (closing) return;
         try {
-            if (foldState(parent).status() != Status.CANCELLED) return;
+            ExecutionState state = foldState(parent);
+            // Only an ended execution that started children: the log is read only for those.
+            if (!state.isTerminal() || !startedChildren(state)) return;
             for (ExecutionId child : unfinishedChildren(parent)) {
                 childParents.remove(child);
                 try {
                     // Never created (a crash between ChildStarted and the create): nothing to cancel, and
-                    // only the parent's attempt creates it, which a cancelled parent never runs. Cancelling
+                    // only the parent's attempt creates it, which an ended parent never runs. Cancelling
                     // would write a stream with no ExecutionCreated.
                     if (foldState(child).lastSeq() < 0) continue;
                     cancel(child);
                 } catch (RuntimeException e) {
-                    LOG.warn("Could not cancel child {} of cancelled {}", child.value(), parent.value(), e);
+                    LOG.warn("Could not cancel child {} of ended {}", child.value(), parent.value(), e);
                 }
             }
         } catch (RuntimeException e) {
-            LOG.warn("Could not cascade the cancel of {}", parent.value(), e);
+            LOG.warn("Could not cancel the children of ended {}", parent.value(), e);
         }
+    }
+
+    private static boolean startedChildren(ExecutionState state) {
+        return state.trajectory().stream().anyMatch(step -> step.kind() == TimelineStep.Kind.CHILD_STARTED
+                || step.kind() == TimelineStep.Kind.CHILD_SPAWNED);
     }
 
     /** The children {@code parent} recorded starting and has no recorded outcome for, in start order. */
@@ -993,25 +1002,27 @@ public final class CatalystRuntime implements AutoCloseable {
         java.util.LinkedHashSet<String> open = new java.util.LinkedHashSet<>();
         for (SequencedEvent se : log.read(parent)) {
             if (se.event() instanceof CatalystEvent.ChildStarted cs) open.add(cs.childId());
+            else if (se.event() instanceof CatalystEvent.ChildSpawned cs) open.add(cs.childId());
             else if (se.event() instanceof CatalystEvent.ChildCompleted cc) open.remove(cc.childId());
         }
         return open.stream().map(ExecutionId::of).toList();
     }
 
     /**
-     * The parent of a not-yet-terminal child execution, if that parent is cancelled. A child is
+     * The parent of a not-yet-terminal child execution, if that parent has ended (cancelled, failed
+     * or completed): a child outlives its parent only if the cascade never reached it. A child is
      * created with the key {@code child:<parent>:<ref>}, so its own stream names its parent. Caller
      * keys are not namespaced, so the key alone proves nothing: the parent must also have recorded
      * starting this very child. A cancel is terminal, and must never land on an unrelated execution.
      */
-    private Optional<ExecutionId> cancelledParentOf(ExecutionId id, ExecutionState state) {
+    private Optional<ExecutionId> endedParentOf(ExecutionId id, ExecutionState state) {
         String key = state.idempotencyKey();
         if (state.isTerminal() || key == null || !key.startsWith(CHILD_KEY_PREFIX)) return Optional.empty();
         int ref = key.lastIndexOf(':');
         if (ref <= CHILD_KEY_PREFIX.length()) return Optional.empty();
         try {
             ExecutionId parent = ExecutionId.of(key.substring(CHILD_KEY_PREFIX.length(), ref));
-            return foldState(parent).status() == Status.CANCELLED && unfinishedChildren(parent).contains(id)
+            return foldState(parent).isTerminal() && unfinishedChildren(parent).contains(id)
                     ? Optional.of(parent) : Optional.empty();
         } catch (RuntimeException notAParent) {
             return Optional.empty(); // a caller's own key that only looks like a child's
@@ -1047,7 +1058,7 @@ public final class CatalystRuntime implements AutoCloseable {
                     // A timer this clock says is early: try again when it is due. A child still going:
                     // its own completion wakes this one.
                     state.awaitingTimer().ifPresent(wakeAt -> scheduleWake(id, wakeAt));
-                    state.awaitingChild().ifPresent(child -> childParents.put(child, id));
+                    state.awaitingChildren().forEach(child -> childParents.put(child, id));
                     return;
                 }
                 Map.Entry<Task<?>, ExecutionOptions> sleeper = sleepers.remove(id);

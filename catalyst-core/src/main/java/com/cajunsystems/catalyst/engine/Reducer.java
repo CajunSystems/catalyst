@@ -92,6 +92,15 @@ public final class Reducer {
                     timeline.add(new TimelineStep(se.seq(), TimelineStep.Kind.CHILD_COMPLETED, cc.childRef(), cc.at(), 0,
                             "COMPLETED".equals(cc.status()) ? cc.result() : com.fasterxml.jackson.databind.node.TextNode.valueOf(cc.status() + ": " + cc.error())));
                 }
+                case ChildSpawned cs -> timeline.add(new TimelineStep(se.seq(), TimelineStep.Kind.CHILD_SPAWNED,
+                        cs.childRef(), cs.at(), 0, com.fasterxml.jackson.databind.node.TextNode.valueOf(cs.childId())));
+                case ChildAwaited ca -> {
+                    status = Status.WAITING;
+                    com.fasterxml.jackson.databind.node.ArrayNode ids = com.fasterxml.jackson.databind.node.JsonNodeFactory.instance.arrayNode();
+                    ca.childIds().forEach(ids::add);
+                    timeline.add(new TimelineStep(se.seq(), TimelineStep.Kind.CHILD_AWAITED, String.join(",", ca.childRefs()),
+                            ca.at(), 0, ids));
+                }
                 case TimerFired tf -> {
                     status = Status.RUNNING; // recorded by the attempt that woke, which is running
                     timeline.add(new TimelineStep(se.seq(), TimelineStep.Kind.WOKE, tf.timerId(), tf.at(), 0, null));

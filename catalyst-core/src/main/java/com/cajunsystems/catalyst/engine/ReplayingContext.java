@@ -111,6 +111,12 @@ public final class ReplayingContext implements Context {
     private final java.util.Map<String, ChildStarted> pendingChildren = new java.util.HashMap<>();
     /** The task type each recorded child ref was started with, so a different one is a divergence. */
     private final java.util.Map<String, String> childTypes = new java.util.HashMap<>();
+    /** Every recorded ctx.spawn, by ref: a spawn re-run on resume or replay gets the same child. */
+    private final java.util.Map<String, ChildSpawned> spawnedChildren = new java.util.HashMap<>();
+    /** The task each spawn in this attempt was given, by ref, so an await can create or resume it. */
+    private final java.util.Map<String, Task<?>> spawnedTasks = new java.util.HashMap<>();
+    /** Outcomes of spawned children this attempt recorded or substituted, by ref: awaiting again returns them. */
+    private final java.util.Map<String, ChildCompleted> settledChildren = new java.util.HashMap<>();
     /** Children this attempt has reached, so far: child-1, child-2, … in task order. */
     private int childCount;
     /** The runtime's side of {@code ctx.child}; null where children cannot run (a branch, a plain replay). */
@@ -275,6 +281,11 @@ public final class ReplayingContext implements Context {
                     pendingChildren.put(cs.childRef(), cs);
                     childTypes.put(cs.childRef(), cs.taskType());
                 }
+                case ChildSpawned cs -> {
+                    spawnedChildren.put(cs.childRef(), cs);
+                    childTypes.put(cs.childRef(), cs.taskType());
+                }
+                case ChildAwaited ca -> { } // a wait, not a boundary: its outcome is the ChildCompleted after it
                 case ChildCompleted cc -> {
                     // The child boundary; the ChildStarted before it only named the child. Its "hash" is
                     // the child's task type: the same ref delegating to another task is a divergence.
@@ -775,6 +786,126 @@ public final class ReplayingContext implements Context {
             append(new ChildStarted(now(), childRef, childId.value(), started.taskType()));
         }
         throw raisedWaiting = waitingOnChild(childId);
+    }
+
+    // ── Fan-out: spawn and await ───────────────────────────────────────────────
+
+    @Override
+    public <R> ChildHandle<R> spawn(Task<R> task) {
+        java.util.Objects.requireNonNull(task, "task");
+        String ref = "child-" + (++childCount);
+        String taskType = task.getClass().getName();
+        ChildSpawned recorded = spawnedChildren.get(ref);
+        if (recorded != null && !childTypeMatchesOrFork(-1, ref, recorded.taskType(), taskType)) {
+            recorded = null; // BRANCH: forked, so this is a new child (which a branch cannot start)
+        }
+        spawnedTasks.put(ref, task);
+        if (recorded != null) {
+            ExecutionId childId = ExecutionId.of(recorded.childId());
+            // A live attempt makes sure a recorded child exists and is going: a crash may have come
+            // between recording the spawn and creating the child, or interrupted the child. Its outcome
+            // is read when it is awaited. A pure replay touches nothing.
+            if (appendEnabled && childLauncher != null) childLauncher.ensure(id, ref, childId, task);
+            return new ChildHandle<>(ref, childId);
+        }
+        if (childLauncher == null) {
+            throw new UnsupportedOperationException("Child executions cannot be started here (a branch or a replay"
+                    + " that reached ctx.spawn live); " + ref + " has no recorded spawn to substitute");
+        }
+        requireAppendable("spawn " + ref);
+        ExecutionId childId = childLauncher.mint();
+        append(new ChildSpawned(now(), ref, childId.value(), taskType));
+        childLauncher.ensure(id, ref, childId, task);
+        return new ChildHandle<>(ref, childId);
+    }
+
+    @Override
+    public <R> R await(ChildHandle<R> child) {
+        java.util.Objects.requireNonNull(child, "child");
+        ChildCompleted outcome = settledChildren.get(child.ref());
+        if (outcome == null) {
+            Optional<Boundary> done = pollExpected(ChildCompleted.class, "child " + child.ref());
+            if (done.isPresent() && identityMatchesOrFork(done.get(), "child", child.ref())) {
+                outcome = (ChildCompleted) done.get().event();
+                settledChildren.put(child.ref(), outcome);
+            }
+        }
+        if (outcome == null) outcome = awaitLive(java.util.List.of(child));
+        return outcomeOf(outcome);
+    }
+
+    @Override
+    public <R> ChildHandle<R> awaitAny(java.util.List<ChildHandle<R>> children) {
+        java.util.Objects.requireNonNull(children, "children");
+        if (children.isEmpty()) throw new IllegalArgumentException("awaitAny needs at least one child");
+        for (ChildHandle<R> child : children) {
+            if (settledChildren.containsKey(child.ref())) return child; // already ended, and awaited
+        }
+        String what = "any of " + children.stream().map(ChildHandle::ref).toList();
+        Optional<Boundary> done = pollExpected(ChildCompleted.class, what);
+        if (done.isPresent()) {
+            ChildCompleted cc = (ChildCompleted) done.get().event();
+            for (ChildHandle<R> child : children) {
+                if (child.ref().equals(cc.childRef())) {
+                    settledChildren.put(child.ref(), cc);
+                    return child; // the recorded winner
+                }
+            }
+            forkOrThrow(done.get().seq(), "child " + cc.childRef(), what);
+        }
+        ChildCompleted first = awaitLive(children);
+        for (ChildHandle<R> child : children) {
+            if (child.ref().equals(first.childRef())) return child;
+        }
+        throw new IllegalStateException("awaitAny recorded a child it was not given: " + first.childRef());
+    }
+
+    /**
+     * Records the outcome of the first of {@code children} (in the order given) that has ended, or
+     * records the wait and parks until one does. The order makes a live choice deterministic among
+     * children found ended together; the choice is recorded either way.
+     */
+    private ChildCompleted awaitLive(java.util.List<? extends ChildHandle<?>> children) {
+        java.util.List<String> refs = children.stream().map(ChildHandle::ref).toList();
+        java.util.List<ExecutionId> ids = children.stream().map(c -> (ExecutionId) c.id()).toList();
+        if (!appendEnabled) throw raisedWaiting = waitingOnChildren(ids); // a pure replay ends at the wait
+        if (childLauncher == null) {
+            throw new UnsupportedOperationException("Child executions cannot be awaited here (a branch or a replay"
+                    + " that reached ctx.await live); " + refs + " have no recorded outcome to substitute");
+        }
+        requireAppendable("await " + refs);
+        for (ChildHandle<?> child : children) {
+            Task<?> task = spawnedTasks.get(child.ref());
+            if (task == null) {
+                throw new IllegalArgumentException(child + " was not spawned by this execution");
+            }
+            Optional<ChildLauncher.Outcome> outcome = childLauncher.ensure(id, child.ref(), child.id(), task);
+            if (outcome.isPresent()) {
+                ChildLauncher.Outcome o = outcome.get();
+                ChildCompleted cc = new ChildCompleted(now(), child.ref(), child.id().value(), o.status(),
+                        o.completed() ? o.result() : null, o.error());
+                append(cc);
+                settledChildren.put(child.ref(), cc);
+                return cc;
+            }
+        }
+        // None has ended. Recorded even when this exact wait was recorded before: a live attempt only
+        // gets here then after something folded the execution out of WAITING (a pause, then a resume).
+        append(new ChildAwaited(now(), refs, ids.stream().map(ExecutionId::value).toList()));
+        throw raisedWaiting = waitingOnChildren(ids);
+    }
+
+    @SuppressWarnings("unchecked")
+    private <R> R outcomeOf(ChildCompleted cc) {
+        if (!"COMPLETED".equals(cc.status())) {
+            throw new ChildExecutionFailedException(ExecutionId.of(cc.childId()), cc.status(), cc.error(), cc.at(), 0);
+        }
+        return (R) payloads.fromTree(cc.result());
+    }
+
+    private ExecutionWaitingSignal waitingOnChildren(java.util.List<ExecutionId> ids) {
+        return new ExecutionWaitingSignal(null, null, ids.get(0),
+                "Execution " + id + " is waiting for child execution" + (ids.size() == 1 ? " " + ids.get(0) : "s " + ids));
     }
 
     private boolean childTypeMatchesOrFork(long seq, String childRef, String recordedType, String actualType) {
