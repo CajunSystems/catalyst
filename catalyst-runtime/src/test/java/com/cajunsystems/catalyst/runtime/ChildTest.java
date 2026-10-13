@@ -391,7 +391,7 @@ class ChildTest {
     private static CatalystRuntime cascadeRuntime(EventLog log, MockModel model) {
         return CatalystRuntime.builder().log(log).model(model).clock(new LeaseTest.TestClock())
                 .task(Coordinator.class, Coordinator::new).task(Research.class, Research::new)
-                .task(Middle.class, Middle::new).task(Top.class, Top::new).build();
+                .task(Middle.class, Middle::new).task(Top.class, Top::new).task(Uncaught.class, Uncaught::new).build();
     }
 
     @Test
@@ -547,6 +547,25 @@ class ChildTest {
             assertThat(runtime.inspect(parent).status()).isEqualTo(Status.CANCELLED);
             sleep(300); // the cascade runs on the timer thread
             assertThat(log.read(child)).isEmpty();
+        }
+    }
+    /** A durable log decodes a failed child's absent result as a JSON null node: it is still a failure. */
+    @Test
+    void aRecordedFailureWithANullNodeResultIsStillAFailure() {
+        Uncaught.other = false;
+        EventLog log = EventLogs.inMemory();
+        ExecutionId parent = ExecutionId.random();
+        ExecutionId child = ExecutionId.random();
+        java.time.Instant t = java.time.Instant.parse("2026-01-01T00:00:00Z");
+        log.append(parent, new CatalystEvent.ExecutionCreated(t, Uncaught.class.getName(), "novars", "cfg", ""));
+        log.append(parent, new CatalystEvent.ExecutionStarted(t, 1, "node-dead"));
+        log.append(parent, new CatalystEvent.ChildStarted(t, "child-1", child.value(), Research.class.getName()));
+        log.append(parent, new CatalystEvent.ChildCompleted(t, "child-1", child.value(), "FAILED",
+                com.fasterxml.jackson.databind.node.NullNode.getInstance(), "boom"));
+        try (CatalystRuntime runtime = cascadeRuntime(log, MockModel.alwaysReturn("M"))) {
+            runtime.recoverAll();
+            await(() -> runtime.inspect(parent).isTerminal());
+            assertThat(runtime.inspect(parent).status()).isEqualTo(Status.FAILED);
         }
     }
 }

@@ -144,7 +144,7 @@ scripts/demo.sh /tmp/catalyst-demo resume   # a new process resumes it
 [resume] model calls THIS run: 1 (step 1 was substituted from the log; only step 2 ran live)
 ```
 
-Other demos: `scripts/demo.sh replay`, `branch`, `agent`, `eval`, `timer`, `child`, `signal`, `retry`, `cancel`, `shutdown`, `streaming`,
+Other demos: `scripts/demo.sh replay`, `branch`, `agent`, `eval`, `timer`, `child`, `supervise`, `signal`, `retry`, `cancel`, `shutdown`, `streaming`,
 `timeline`, `otel`, `autocapture`, and more. The full list is at the top of `scripts/demo.sh`, and CI
 runs every one of them as a gate.
 
@@ -175,6 +175,7 @@ runs every one of them as a gate.
 | resume crashed work after a restart | `.task(...)` + `.recoverOnStart(true)` | [Resuming](docs/guide.md#idempotency-keys-and-resuming) |
 | wait hours or days, then continue (durably) | `ctx.sleep(Duration.ofDays(3))` | [Timers](docs/guide.md#durable-timers) |
 | hand work to a sub-task (a sub-agent) and wait for it | `ctx.child(new SubTask())` | [Children](docs/guide.md#child-executions) |
+| restart a sub-task that fails | `ctx.child(task, Supervision.restart(3).backoff(d))` | [Supervision](docs/guide.md#supervising-a-child) |
 | wait for a human's approval, then continue | `ctx.awaitSignal(name, type)` + `runtime.signal(id, name, payload)` | [Signals](docs/guide.md#signals-waiting-for-a-human) |
 | cancel or pause an execution | `runtime.cancel(id)`, `pause(id)`, `resume(id)` | [Control](docs/guide.md#cancel-pause-resume) |
 | check that my task code is deterministic | `runtime.replay(id, task)` | [Replay](docs/guide.md#inspect-replay-branch) |

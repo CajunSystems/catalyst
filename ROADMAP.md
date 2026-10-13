@@ -479,17 +479,20 @@ below give the same capability natively.
   1. ✅ **Cancel cascade (propagate down).** Cancelling a parent cancels every child it has no
      outcome for, recursively, by id (so a child on another node gets the request on its lease row).
      Recovery is the durable backstop: a child whose parent is cancelled is cancelled, not resumed.
-  2. **Supervision v1: one-for-one.** For example `ctx.child(task, Supervision.restart(3).fresh())`.
-     - **Restart modes:** *resume* retries on the child's own stream, so its successful prefix is
-       substituted (for transient failures). *Fresh* starts a new child execution from scratch (for
-       when the child's own history is the problem, such as a stuck agent conversation).
-     - **Deterministic decisions:** the restart decision is made by the parent from outcomes it has
-       already recorded. Each restart records a new `ChildStarted` (`child-1#2`, …) and its outcome,
-       so a replay makes the same decision.
+  2. ✅ **Supervision v1: one-for-one.** `ctx.child(task, Supervision.restart(3).within(w).backoff(d))`.
+     - **Restarts are fresh:** each restart is a new child execution, run from the top.
+     - **Retrying in place** (*resume*, with the successful prefix substituted) is the runtime's
+       `RetryPolicy`, which already applies to every child. A per-child policy is deferred, because
+       per-execution options aren't persisted, so a child resumed after a restart would lose it.
+     - **Deterministic decisions:** the parent decides from outcomes it has already recorded. Each
+       restart records a new `ChildStarted` (`child-1#2`, …) and its outcome, so a replay makes the
+       same decision.
      - **Restart intensity** (at most N restarts in T) is computed from the recorded
        `ChildCompleted.at` times, never a live clock.
-     - **When restarts run out**, the failure escalates to the parent as
-       `ChildExecutionFailedException`, as it does today.
+     - **Backoff** is a durable `ctx.sleep`.
+     - **Only `FAILED` children are restarted.** When restarts run out, the last failure escalates
+       as `ChildExecutionFailedException`, with `restarts()`.
+     - **Exit demo:** `Demo supervise`.
   3. **Fan-out:** start several children at once, then await all or any of them. Today `ctx.child`
      blocks, so a parent runs one child at a time.
   4. **One-for-all and rest-for-one,** once fan-out exists. A failed child cancels and restarts its
