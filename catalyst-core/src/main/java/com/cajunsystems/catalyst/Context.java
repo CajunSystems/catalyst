@@ -149,6 +149,21 @@ public interface Context {
     }
 
     /**
+     * Runs {@code tasks} as a supervised group of child executions, at the same time, and returns
+     * every result in the order given. A failed child is restarted as {@code supervision} allows, and
+     * its {@link com.cajunsystems.catalyst.engine.Supervision.Strategy} says which others restart with
+     * it: only that child (one-for-one), every child (one-for-all), or that child and the ones listed
+     * after it (rest-for-one). A restarted child that is still running is cancelled first. When
+     * restarts run out, the running children are cancelled and the failure reaches this task. Every
+     * decision is made from recorded outcomes, so a replay walks the same restarts. The default
+     * throws, so other {@code Context} implementations still compile.
+     */
+    default <R> java.util.List<R> supervise(com.cajunsystems.catalyst.engine.Supervision supervision,
+                                            java.util.List<? extends Task<? extends R>> tasks) {
+        throw new UnsupportedOperationException(getClass().getSimpleName() + " does not run child executions");
+    }
+
+    /**
      * Whether {@code failure}, thrown by {@link #call}, is the recorded result of that call: the tool
      * failed, and the failure is in the log as its {@code ToolCompleted}. That covers a live failure, a
      * failure substituted on replay or resume, and one reproduced by a branch. Code that handles tool

@@ -1133,6 +1133,23 @@ public final class CatalystRuntime implements AutoCloseable {
             });
         }
 
+        /**
+         * Cancels a child its parent no longer wants. The link is dropped first, so the child ending
+         * does not wake the parent for nothing. Best-effort: a cancel that cannot be made (another node
+         * refusing it, say) leaves a child whose result nobody reads, and it is cancelled when the
+         * parent ends.
+         */
+        @Override
+        public void cancel(ExecutionId childId) {
+            childParents.remove(childId);
+            try {
+                if (foldState(childId).lastSeq() < 0) return; // never created: nothing to cancel
+                CatalystRuntime.this.cancel(childId);
+            } catch (RuntimeException e) {
+                LOG.warn("Could not cancel child {}", childId.value(), e);
+            }
+        }
+
         /** The launcher an attempt's context uses: the same, but notes that the attempt touched a child. */
         ChildLauncher forAttempt(RunningAttempt attempt) {
             return new ChildLauncher() {
@@ -1142,6 +1159,9 @@ public final class CatalystRuntime implements AutoCloseable {
                 @Override public Optional<Outcome> ensure(ExecutionId parentId, String childRef, ExecutionId childId, Task<?> task) {
                     attempt.touchedChildren = true;
                     return Children.this.ensure(parentId, childRef, childId, task);
+                }
+                @Override public void cancel(ExecutionId childId) {
+                    Children.this.cancel(childId);
                 }
             };
         }

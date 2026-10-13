@@ -503,8 +503,15 @@ below give the same capability natively.
        never awaited.
      - **Supervision for spawned children** comes with item 4.
      - **Exit demo:** `Demo fanout`.
-  4. **One-for-all and rest-for-one,** once fan-out exists. A failed child cancels and restarts its
-     siblings (all of them, or the ones started after it).
+  4. ✅ **Supervised groups: one-for-all and rest-for-one.**
+     `ctx.supervise(Supervision.restart(n).oneForAll() | .restForOne(), tasks)` spawns the group and
+     collects outcomes with `awaitAny`, so the order is recorded.
+     - **On a failure:** the strategy picks which children restart. Any still running are cancelled
+       (`ChildLauncher.cancel`, which is idempotent and not recorded, so a resume repeats it). After
+       the backoff, they are re-spawned fresh.
+     - **Limit and escalation:** the restart limit is counted across the group. Giving up cancels the
+       children still running, then escalates.
+     - **Exit demo:** `Demo group`.
 - **Per-call retries and timeouts** for model and tool calls. Boudin has per-activity
   `startToClose`/`maxAttempts`/backoff; Catalyst retries the whole task, and a hung provider call
   has no limit.

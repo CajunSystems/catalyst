@@ -861,6 +861,65 @@ public final class ReplayingContext implements Context {
     }
 
     /**
+     * A supervised group: spawn every task, then collect outcomes as they end (an awaitAny over the
+     * ones still pending, so the order is recorded). A failure asks the supervision whether to
+     * restart; the strategy picks which children restart with it. Each one still running is cancelled
+     * first. After the backoff (a durable sleep), each is spawned again as a fresh child. Giving up
+     * cancels the children still running and throws. The cancels are side effects on other streams
+     * and are not recorded: a resume repeats them, and cancelling an ended child does nothing.
+     */
+    @Override
+    @SuppressWarnings({"unchecked", "rawtypes"})
+    public <R> java.util.List<R> supervise(Supervision supervision, java.util.List<? extends Task<? extends R>> tasks) {
+        java.util.Objects.requireNonNull(supervision, "supervision");
+        java.util.Objects.requireNonNull(tasks, "tasks");
+        int n = tasks.size();
+        java.util.List<ChildHandle> handles = new java.util.ArrayList<>(n);
+        for (Task<? extends R> task : tasks) handles.add(spawn(task));
+        Object[] results = new Object[n];
+        boolean[] done = new boolean[n];
+        java.util.List<java.time.Instant> failures = new java.util.ArrayList<>();
+        int restarts = 0;
+        while (true) {
+            java.util.List<ChildHandle> pending = new java.util.ArrayList<>();
+            for (int i = 0; i < n; i++) if (!done[i]) pending.add(handles.get(i));
+            if (pending.isEmpty()) {
+                java.util.List<R> out = new java.util.ArrayList<>(n);
+                for (Object r : results) out.add((R) r);
+                return out;
+            }
+            ChildHandle ended = awaitAny((java.util.List) pending);
+            int i = handles.indexOf(ended);
+            try {
+                results[i] = await(ended);
+                done[i] = true;
+            } catch (ChildExecutionFailedException failed) {
+                failures.add(failed.at());
+                if (failed.at() == null || !supervision.restarts(failed.status(), failures)) {
+                    for (int j = 0; j < n; j++) if (j != i && !done[j]) cancelChild(handles.get(j));
+                    throw failed.afterRestarts(restarts);
+                }
+                restarts++;
+                // The children that restart: [from, to] in list order.
+                int from = supervision.strategy() == Supervision.Strategy.ONE_FOR_ALL ? 0 : i;
+                int to = supervision.strategy() == Supervision.Strategy.ONE_FOR_ONE ? i : n - 1;
+                for (int j = from; j <= to; j++) {
+                    if (j != i && !done[j]) cancelChild(handles.get(j));
+                    done[j] = false;
+                    results[j] = null;
+                }
+                if (!supervision.backoff().isZero()) sleep(supervision.backoff());
+                for (int j = from; j <= to; j++) handles.set(j, spawn(tasks.get(j)));
+            }
+        }
+    }
+
+    /** Cancels a child the group no longer wants. Only a live attempt acts; a replay touches nothing. */
+    private void cancelChild(ChildHandle<?> child) {
+        if (appendEnabled && childLauncher != null) childLauncher.cancel(child.id());
+    }
+
+    /**
      * Records the outcome of the first of {@code children} (in the order given) that has ended, or
      * records the wait and parks until one does. The order makes a live choice deterministic among
      * children found ended together; the choice is recorded either way.

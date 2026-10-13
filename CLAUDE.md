@@ -517,6 +517,32 @@ checkout's pom to `com.github.CajunSystems` before installing.
     - The backstop is `endedParentOf`.
     - Mutation-checked: the cascade only on cancel, and spawns missing from the unfinished set.
 
+- **Supervised groups** — `GroupSupervisionTest` (runtime, 5) + `GroupAcceptanceTest` + `Demo group`
+  (CI gate).
+  - **API and strategies:** `ctx.supervise(Supervision, tasks)`. `Supervision.Strategy` is
+    `ONE_FOR_ONE` (the default), `ONE_FOR_ALL` or `REST_FOR_ONE`, set with `.oneForAll()` or
+    `.restForOne()`. The strategy has no effect on a single `ctx.child`.
+  - **Loop (`ReplayingContext.supervise`), built on the fan-out primitives:**
+    - Spawn all the children.
+    - `awaitAny` over the pending handles, which records the order. Then `await` the winner.
+    - On a failure, the strategy picks the restart range: `[0, n)` for one-for-all,
+      `[i, n)` for rest-for-one, or `[i]` for one-for-one.
+    - `cancelChild` each child in the range that is still running, and discard the results of
+      completed ones.
+    - Sleep the backoff, then re-spawn the range fresh.
+    - Giving up cancels every child still pending, then throws `afterRestarts`.
+  - **`ChildLauncher.cancel`** (the default throws) → `Children.cancel`: drop the `childParents`
+    link, skip a never-created child, then `runtime.cancel(child)`, best-effort. **Not recorded:**
+    a resume repeats it, and cancelling an ended child is a no-op. Only a live attempt acts;
+    `cancelChild` checks `appendEnabled`.
+  - **Restart limit:** counted group-wide from recorded `ChildCompleted.at`. A sibling cancelled
+    by the group is not a failure.
+  - **Mutation-checked:**
+    - Ignoring the strategy, rest-for-one restarting everything, and no cancel on give-up each fail
+      a test.
+    - No cancel on restart is caught **only** by the give-up test. In the one-for-all test, the
+      parent's end-of-life cascade also cancels the stray child.
+
 - **Fenced runtime writes (Dist-1)** — `FencedWritesTest` (runtime: two runtimes over one log = two
   writers) + `FencedWritesAcceptanceTest` (the same over a real Gumbo log: storage refuses the zombie).
   Every runtime append goes through a `StreamCursor`: conditional when the log can fence, plain
