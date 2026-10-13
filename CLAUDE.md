@@ -553,7 +553,7 @@ checkout's pom to `com.github.CajunSystems` before installing.
     - No cancel on restart is caught **only** by the give-up test. In the one-for-all test, the
       parent's end-of-life cascade also cancels the stray child.
 
-- **Per-call retries and timeouts** — `CallPolicyTest` (runtime, 10) + `CallPolicyUnitTest` (core) +
+- **Per-call retries and timeouts** — `CallPolicyTest` (runtime, 13) + `CallPolicyUnitTest` (core) +
   `CallsAcceptanceTest` + `Demo calls` (CI gate).
   - **API:** `CallPolicy.retries(n, backoff)` (exponential ×2, `maxBackoff` default 30s),
     `.timeout(d)` / `timeoutAfter(d)`, and `.retryOn(predicate)`. The runtime-wide default is
@@ -578,8 +578,17 @@ checkout's pom to `com.github.CajunSystems` before installing.
     in 50ms slices, because a shutdown never interrupts.
     - `stoppedRetrying` turns a **cancel** into `CancellationSignal`, with the failure suppressed and
       `raisedCancellation` set. A plain failure with a cancel pending would record FAILED.
-    - An **abandon** surfaces the failure itself: Deploy-4's drain rule, which closes a model
-      request instead of leaving it in doubt.
+    - An **abandon** becomes `ExecutionAbandonedSignal` (failure suppressed, `raisedAbandon` set).
+      The caller then records the failure (tool) and `recordRetryOnRestart` appends
+      `RetryRequested(failedSeq)`: the `ToolCompleted` seq for a tool, -1 for a model, which closes
+      its request. The execution stays RUNNING, and the next start re-runs the call live with a fresh
+      budget; it counts one `retries`. This was a review finding: surfacing the raw failure instead
+      went to `recordFailed` under `RetryPolicy.none()`, ending for good a call the policy would have
+      retried.
+    - **An interrupt during `withTimeout`'s wait with a cancel pending** surfaces as
+      `CancellationSignal`, even with no retries left. With `maxAttempts == 1` it otherwise reached
+      the stop rule as a plain failure and recorded FAILED (review finding). Signals pass straight
+      through `invokeWithPolicy`.
     - Both tool paths, `runToolLive` and the in-doubt `RETRY` in `handleInDoubt`, record
       `lastRealFailure` (the suppressed cause) as the `ToolCompleted` error. The in-doubt one was a
       review finding, mutation-checked.

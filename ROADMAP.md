@@ -530,8 +530,8 @@ below give the same capability natively.
     An informational `CallRetried` is left per retry, and a replay substitutes the outcome.
   - **A timeout** runs the attempt on its own virtual thread and throws `CallTimeoutException`.
   - **Streams** are retried only before the first chunk, and get no timeout.
-  - **A cancel** cuts retries short as `CANCELLED`. A shutdown surfaces the last failure to the
-    usual drain decision.
+  - **A cancel** cuts retries short as `CANCELLED`. A shutdown records the failure plus a
+    `RetryRequested` naming it, then abandons, so the next start re-runs the call live.
   - **Exit demo:** `Demo calls`.
 - **Logging context and live metrics.** The execution id in MDC, plus counters for running
   executions, retries and lease takeovers. Today all observability is post-hoc (OTel, timeline).

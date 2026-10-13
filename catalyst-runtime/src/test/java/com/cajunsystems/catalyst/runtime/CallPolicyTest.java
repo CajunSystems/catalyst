@@ -293,6 +293,70 @@ class CallPolicyTest {
         }
     }
 
+    /** A shutdown in the middle of a call's backoff leaves the execution for the next start, which retries the call. */
+    @Test
+    void aShutdownDuringAToolsBackoffLeavesTheCallForTheNextStart() {
+        failFirst = 1;
+        EventLog log = EventLogs.inMemory();
+        ExecutionId id;
+        try (CatalystRuntime first = runtime(log, MockModel.alwaysReturn("M"), CallPolicy.retries(5, Duration.ofSeconds(5)))) {
+            var run = first.execute(new UsesToolDefault(), ExecutionOptions.none());
+            id = run.id();
+            await(() -> count(log, run.id(), CatalystEvent.CallRetried.class) == 1); // now in its 5s backoff
+        } // close(): the backoff sees the shutdown at once
+        assertThat(count(log, id, CatalystEvent.ExecutionFailed.class)).as("a shutdown never fails it").isZero();
+        assertThat(count(log, id, CatalystEvent.RetryRequested.class)).isEqualTo(1);
+        try (CatalystRuntime next = runtime(log, MockModel.alwaysReturn("M"), CallPolicy.retries(5, Duration.ofSeconds(5)))) {
+            next.recoverAll();
+            ExecutionId run = id;
+            await(() -> next.inspect(run).status() == Status.COMPLETED);
+            assertThat(next.resume(id).result()).isEqualTo("done:x");
+            assertThat(invocations.get()).isEqualTo(2);
+            assertThat(next.replay(id, new UsesToolDefault()).status()).isEqualTo(Status.COMPLETED);
+        }
+    }
+
+    @Test
+    void aShutdownDuringAModelBackoffLeavesTheCallForTheNextStart() {
+        AtomicInteger calls = new AtomicInteger();
+        Model failsOnce = request -> {
+            if (calls.incrementAndGet() == 1) throw new IllegalStateException("503 from provider");
+            return Completion.ofText("answer");
+        };
+        policy = CallPolicy.retries(5, Duration.ofSeconds(5));
+        EventLog log = EventLogs.inMemory();
+        ExecutionId id;
+        try (CatalystRuntime first = runtime(log, failsOnce, CallPolicy.none())) {
+            var run = first.execute(new UsesModel(), ExecutionOptions.none());
+            id = run.id();
+            await(() -> count(log, run.id(), CatalystEvent.CallRetried.class) == 1);
+        }
+        assertThat(count(log, id, CatalystEvent.ExecutionFailed.class)).isZero();
+        try (CatalystRuntime next = runtime(log, failsOnce, CallPolicy.none())) {
+            next.recoverAll(); // the request was closed by the RetryRequested: re-issued, not in doubt
+            ExecutionId run = id;
+            await(() -> next.inspect(run).status() == Status.COMPLETED);
+            assertThat(next.resume(id).result()).isEqualTo("answer");
+            assertThat(next.replay(id, new UsesModel()).status()).isEqualTo(Status.COMPLETED);
+            assertThat(calls.get()).isEqualTo(2);
+        }
+    }
+
+    /** With a timeout and no retries, a cancel interrupting the wait still ends the execution CANCELLED. */
+    @Test
+    void aCancelDuringATimeoutWithoutRetriesEndsCancelled() {
+        hangFirst = 1;
+        policy = CallPolicy.timeoutAfter(Duration.ofSeconds(20));
+        EventLog log = EventLogs.inMemory();
+        try (CatalystRuntime runtime = runtime(log, MockModel.alwaysReturn("M"), CallPolicy.timeoutAfter(Duration.ofSeconds(20)))) {
+            var run = runtime.execute(new UsesToolDefault(), ExecutionOptions.none());
+            await(() -> invocations.get() == 1); // hanging inside the timeout's wait
+            runtime.cancel(run.id());
+            await(() -> runtime.inspect(run.id()).isTerminal());
+            assertThat(runtime.inspect(run.id()).status()).isEqualTo(Status.CANCELLED);
+        }
+    }
+
     private static void await(BooleanSupplier condition) {
         long deadline = System.nanoTime() + TimeUnit.SECONDS.toNanos(10);
         while (!condition.getAsBoolean()) {

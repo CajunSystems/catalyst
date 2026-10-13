@@ -472,18 +472,13 @@ public final class ReplayingContext implements Context {
         CallPolicy p = policy != null ? policy : defaultCallPolicy;
         long t0 = System.nanoTime();
         Completion completion;
-        if (sink == null) {
-            completion = invokeWithPolicy(p, "model", () -> realModel.complete(request), true, () -> true);
-        } else {
-            // A retry would deliver the text again, and the task would assemble it twice: retry only
-            // while nothing has reached the sink. No timeout, so the sink stays on the task's thread.
-            java.util.concurrent.atomic.AtomicBoolean delivered = new java.util.concurrent.atomic.AtomicBoolean();
-            TokenSink guardedSink = guarded(sink);
-            TokenSink tracking = text -> {
-                delivered.set(true);
-                guardedSink.accept(text);
-            };
-            completion = invokeWithPolicy(p, "model", () -> realModel.stream(request, tracking), false, () -> !delivered.get());
+        try {
+            completion = sink == null
+                    ? invokeWithPolicy(p, "model", () -> realModel.complete(request), true, () -> true)
+                    : streamWithPolicy(p, request, sink);
+        } catch (ExecutionAbandonedSignal stop) {
+            recordRetryOnRestart(stop, -1); // the model failure recorded nothing; this closes its request
+            throw stop;
         }
         long latencyMillis = (System.nanoTime() - t0) / 1_000_000;
         append(new CompletionReceived(now(), eventMapper.valueToTree(completion),
@@ -491,6 +486,21 @@ public final class ReplayingContext implements Context {
                 latencyMillis, costModel.usd(completion.usage().promptTokens(), completion.usage().completionTokens()),
                 completion.finishReason()));
         return completion;
+    }
+
+    /**
+     * A streamed completion under its policy. A retry would deliver the text again, and the task would
+     * assemble it twice, so it is retried only while nothing has reached the sink. No timeout, so the
+     * sink stays on the task's thread.
+     */
+    private Completion streamWithPolicy(CallPolicy p, CompletionRequest request, TokenSink sink) {
+        java.util.concurrent.atomic.AtomicBoolean delivered = new java.util.concurrent.atomic.AtomicBoolean();
+        TokenSink guardedSink = guarded(sink);
+        TokenSink tracking = text -> {
+            delivered.set(true);
+            guardedSink.accept(text);
+        };
+        return invokeWithPolicy(p, "model", () -> realModel.stream(request, tracking), false, () -> !delivered.get());
     }
 
     /**
@@ -637,13 +647,15 @@ public final class ReplayingContext implements Context {
             // back to this boundary and re-run it live rather than substituting the recorded failure.
             lastToolFailureSeq = append(new ToolCompleted(now(), null, String.valueOf(lastRealFailure(ex)), latencyMillis));
             lastToolFailureException = ex;
+            recordRetryOnRestart(ex, lastToolFailureSeq);
             throw ex;
         }
     }
 
-    /** What the call actually failed with: a cancel that cut its retries short carries it as suppressed. */
+    /** What the call actually failed with: a stop that cut its retries short carries it as suppressed. */
     private static Throwable lastRealFailure(RuntimeException ex) {
-        return ex instanceof CancellationSignal && ex.getSuppressed().length > 0 ? ex.getSuppressed()[0] : ex;
+        return (ex instanceof CancellationSignal || ex instanceof ExecutionAbandonedSignal) && ex.getSuppressed().length > 0
+                ? ex.getSuppressed()[0] : ex;
     }
 
     private <I, O> O handleInDoubt(Tool<I, O> tool, I input, CallPolicy policy) {
@@ -670,6 +682,7 @@ public final class ReplayingContext implements Context {
                     long latencyMillis = (System.nanoTime() - t0) / 1_000_000;
                     lastToolFailureSeq = append(new ToolCompleted(now(), null, String.valueOf(lastRealFailure(ex)), latencyMillis));
                     lastToolFailureException = ex;
+                    recordRetryOnRestart(ex, lastToolFailureSeq);
                     throw ex;
                 }
                 long latencyMillis = (System.nanoTime() - t0) / 1_000_000;
@@ -1331,6 +1344,7 @@ public final class ReplayingContext implements Context {
                         ? withTimeout(invocation, call, policy.timeout().get())
                         : invocation.get();
             } catch (RuntimeException failure) {
+                if (failure instanceof CancellationSignal || failure instanceof ExecutionAbandonedSignal) throw failure;
                 if (!policy.retries(attempt, failure) || !retryable.getAsBoolean()) throw failure;
                 if (stopRequested()) throw stoppedRetrying(failure);
                 append(new CallRetried(now(), call, attempt, String.valueOf(failure)));
@@ -1340,11 +1354,17 @@ public final class ReplayingContext implements Context {
     }
 
     /**
-     * Retries cut short. A cancel surfaces as the cancel, so the execution ends {@code CANCELLED}, not
-     * {@code FAILED}, over a failure that was only waiting for its retry. (A tool path still records
-     * its outcome first.) A shutdown surfaces the last failure itself. Like any genuine failure while
-     * draining, it goes through the retry-or-fail decision, which closes a model request instead of
-     * leaving it in doubt for the restart.
+     * Retries cut short; the failure travels as a suppressed exception on the signal returned.
+     * <ul>
+     *   <li>A <b>cancel</b> surfaces as the cancel, so the execution ends {@code CANCELLED}, not
+     *       {@code FAILED}, over a failure that was only waiting for its retry.</li>
+     *   <li>A <b>shutdown</b> surfaces as an abandon, so the execution stays {@code RUNNING} for the
+     *       next start. Failing it would end, for good, a call the policy would still have retried.
+     *       The caller records the failure and a {@code RetryRequested} naming it
+     *       ({@link #recordRetryOnRestart}), so the request is closed rather than left in doubt, and
+     *       the resumed attempt re-runs the call live with a fresh budget.</li>
+     * </ul>
+     * The caller records the call's outcome first, with {@link #lastRealFailure} as its error.
      */
     private RuntimeException stoppedRetrying(RuntimeException failure) {
         if (cancellation != null && cancellation.isCancelled()) {
@@ -1353,7 +1373,26 @@ public final class ReplayingContext implements Context {
             signal.addSuppressed(failure);
             return signal;
         }
+        if (cancellation != null && cancellation.isAbandoned()) {
+            raisedAbandon = true;
+            ExecutionAbandonedSignal signal = new ExecutionAbandonedSignal("runtime shutting down during the retries of a"
+                    + " call; execution " + id + " is left RUNNING and the call is retried on the next start");
+            signal.addSuppressed(failure);
+            return signal;
+        }
         return failure;
+    }
+
+    /**
+     * After retries were cut short by a shutdown: names the failed call in a {@code RetryRequested}.
+     * {@code failedSeq} is its {@code ToolCompleted}, or -1 for a model call, which recorded nothing
+     * and whose request the retry closes. The next start then re-runs the call live instead of
+     * substituting the failure, or finding the request in doubt.
+     */
+    private void recordRetryOnRestart(RuntimeException stop, long failedSeq) {
+        if (stop instanceof ExecutionAbandonedSignal && stop.getSuppressed().length > 0) {
+            append(new RetryRequested(now(), String.valueOf(stop.getSuppressed()[0]), 0, failedSeq));
+        }
     }
 
     /** Cancelled, shutting down, or interrupted: retries stop. */
@@ -1386,7 +1425,7 @@ public final class ReplayingContext implements Context {
      * the thread is interrupted and {@link CallTimeoutException} thrown. If this thread is interrupted
      * while waiting (a cancel), the call is interrupted too and the interrupt is kept.
      */
-    private static <T> T withTimeout(Supplier<T> invocation, String call, java.time.Duration timeout) {
+    private <T> T withTimeout(Supplier<T> invocation, String call, java.time.Duration timeout) {
         java.util.concurrent.CompletableFuture<T> result = new java.util.concurrent.CompletableFuture<>();
         Thread worker = Thread.ofVirtual().name("catalyst-call-" + call).start(() -> {
             try {
@@ -1403,7 +1442,16 @@ public final class ReplayingContext implements Context {
         } catch (InterruptedException e) {
             worker.interrupt();
             Thread.currentThread().interrupt();
-            throw new RuntimeException(call + " was interrupted", e);
+            RuntimeException interrupted = new RuntimeException(call + " was interrupted", e);
+            // Interrupted while waiting on its own thread: that is a cancel (a shutdown never interrupts).
+            // Surfaced as the cancel even with no retries left, or the stop rule would record FAILED.
+            if (cancellation != null && cancellation.isCancelled()) {
+                raisedCancellation = true;
+                CancellationSignal signal = new CancellationSignal(cancellation.reason());
+                signal.addSuppressed(interrupted);
+                throw signal;
+            }
+            throw interrupted;
         } catch (java.util.concurrent.ExecutionException e) {
             Throwable cause = e.getCause();
             if (cause instanceof RuntimeException r) throw r;

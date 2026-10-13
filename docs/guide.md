@@ -235,7 +235,8 @@ ctx.model(CallPolicy.timeoutAfter(Duration.ofSeconds(60))).complete(request);
 - **Streamed completions** are retried only until the first chunk arrives: retrying after that would
   deliver the text twice. Timeouts don't apply to them.
 - **Cancel and shutdown stop the retries.** A cancel ends the execution `CANCELLED`. A shutdown
-  surfaces the last failure, which then goes through `RetryPolicy` as usual.
+  leaves it `RUNNING`. The next start re-runs the call with a fresh retry budget, which counts as one
+  `RetryPolicy` retry in `inspect(id).retries()`.
 - The default is `CallPolicy.none()`: one attempt and no timeout. Whatever is left after the call's
   own retries reaches the task, and `RetryPolicy` can still retry the whole task.
 
